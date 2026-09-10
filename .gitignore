@@ -38,6 +38,9 @@ data/
 
 # --- Generated evaluation artifacts (contain client KB context) ---
 eval/eval_input.jsonl
+eval/eval_input_*.jsonl
 eval/eval_results.json
+eval/eval_results_*.json
+eval/eval_summary.json
 eval/.promptflow/
 .venv/
