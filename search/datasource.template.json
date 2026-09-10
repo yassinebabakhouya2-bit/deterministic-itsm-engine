@@ -1,0 +1,11 @@
+{
+  "name": "ds-__CLIENTID__",
+  "description": "Blob source for the __CLIENTID__ client's KB records (container kb-__CLIENTID__). Connection via Search's managed identity (ResourceId, no key).",
+  "type": "azureblob",
+  "credentials": {
+    "connectionString": "ResourceId=__STORAGE_RESOURCE_ID__;"
+  },
+  "container": {
+    "name": "kb-__CLIENTID__"
+  }
+}

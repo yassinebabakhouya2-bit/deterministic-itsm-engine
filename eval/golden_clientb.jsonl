@@ -1,0 +1,8 @@
+{"query": "Helios CRM est très lent à afficher les fiches, que faire ?", "ground_truth": "Vider le cache Helios, limiter les onglets, vérifier le réseau, relancer Helios CRM."}
+{"query": "NimbusVPN se déconnecte souvent, comment stabiliser ?", "ground_truth": "Activer Maintenir la session Nimbus, passer en filaire, changer de passerelle, mettre à jour NimbusVPN."}
+{"query": "Comment suivre le statut d'un ticket dans TicketWave ?", "ground_truth": "TicketWave > Mes demandes > colonne Statut ; commenter pour relancer."}
+{"query": "BioBadge refuse l'accès à la salle serveur, pourquoi ?", "ground_truth": "Empreinte non enrôlée pour la zone sensible ; ré-enrôler l'empreinte BioBadge et retester."}
+{"query": "Que faire quand le quota CloudStore B est dépassé ?", "ground_truth": "Trier par taille, vider la corbeille CloudStore B, archiver, demander une extension si justifié."}
+{"query": "Le scanner ScanPro n'apparaît plus, comment le récupérer ?", "ground_truth": "Vérifier l'IP du ScanPro, réinstaller le pilote, ajouter par IP, numérisation test."}
+{"query": "Comment étendre l'espace de stockage CloudStore B ?", "ground_truth": "Demander une extension de quota CloudStore B à l'équipe Stockage après nettoyage."}
+{"query": "Comment enrôler une empreinte pour BioBadge ?", "ground_truth": "Via la console BioBadge, ré-enrôler l'empreinte en cochant la zone concernée."}

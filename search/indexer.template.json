@@ -1,0 +1,19 @@
+{
+  "name": "ix-__CLIENTID__",
+  "description": "Indexer: reads Blob kb-__CLIENTID__, applies the skillset (chunk + embedding + clientId), projects into the dedicated index idx-__CLIENTID__.",
+  "dataSourceName": "ds-__CLIENTID__",
+  "skillsetName": "ss-__CLIENTID__",
+  "targetIndexName": "idx-__CLIENTID__",
+  "parameters": {
+    "batchSize": 1,
+    "maxFailedItems": -1,
+    "maxFailedItemsPerBatch": -1,
+    "configuration": {
+      "dataToExtract": "contentAndMetadata",
+      "parsingMode": "default",
+      "indexStorageMetadataOnlyForOversizedDocuments": true
+    }
+  },
+  "fieldMappings": [],
+  "outputFieldMappings": []
+}

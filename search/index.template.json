@@ -1,0 +1,41 @@
+{
+  "name": "idx-__CLIENTID__",
+  "fields": [
+    { "name": "chunk_id", "type": "Edm.String", "key": true, "searchable": true, "filterable": false, "sortable": true, "facetable": false, "analyzer": "keyword" },
+    { "name": "parent_id", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "clientId", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": true, "retrievable": true },
+    { "name": "title", "type": "Edm.String", "searchable": true, "filterable": false, "retrievable": true },
+    { "name": "chunk", "type": "Edm.String", "searchable": true, "filterable": false, "retrievable": true },
+    { "name": "text_vector", "type": "Collection(Edm.Single)", "searchable": true, "retrievable": false, "dimensions": 3072, "vectorSearchProfile": "vec-profile" }
+  ],
+  "vectorSearch": {
+    "algorithms": [
+      { "name": "hnsw-1", "kind": "hnsw" }
+    ],
+    "vectorizers": [
+      {
+        "name": "aoai-vectorizer",
+        "kind": "azureOpenAI",
+        "azureOpenAIParameters": {
+          "resourceUri": "https://aif-knowledgeengine2-v9.openai.azure.com",
+          "deploymentId": "text-embedding-3-large",
+          "modelName": "text-embedding-3-large"
+        }
+      }
+    ],
+    "profiles": [
+      { "name": "vec-profile", "algorithm": "hnsw-1", "vectorizer": "aoai-vectorizer" }
+    ]
+  },
+  "semantic": {
+    "configurations": [
+      {
+        "name": "sem-config",
+        "prioritizedFields": {
+          "titleField": { "fieldName": "title" },
+          "prioritizedContentFields": [ { "fieldName": "chunk" } ]
+        }
+      }
+    ]
+  }
+}

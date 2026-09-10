@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "clientCode": { "value": "clienta" },
+    "siteId": { "value": "contoso.sharepoint.com,00000000-0000-0000-0000-000000000000,00000000-0000-0000-0000-000000000000" },
+    "containerName": { "value": "kb-clienta" },
+    "listQuery": { "value": "?$top=1" },
+    "tenantId": { "value": "<your-entra-tenant-id>" },
+    "appClientId": { "value": "<your-app-registration-client-id>" }
+  }
+}

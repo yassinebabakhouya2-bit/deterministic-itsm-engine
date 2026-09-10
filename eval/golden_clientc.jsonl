@@ -1,0 +1,8 @@
+{"query": "La clôture mensuelle Titan ERP échoue (période verrouillée), que faire ?", "ground_truth": "Vérifier l'état de la période Titan, traiter les écritures en attente, relancer l'assistant de clôture Titan."}
+{"query": "Comment installer ZephyrVPN sur un nouveau poste ?", "ground_truth": "Télécharger ZephyrVPN, installer en admin, importer le profil ZephyrVPN, tester."}
+{"query": "Comment définir une priorité Critique dans FlowDesk ?", "ground_truth": "Champ Priorité FlowDesk > Critique + justification ; notifie l'astreinte."}
+{"query": "J'ai perdu mon badge KeyCard C, quelle est la procédure ?", "ground_truth": "Désactiver l'ancien KeyCard C, émettre un nouveau avec mêmes droits, l'associer et le remettre contre signature."}
+{"query": "Comment restaurer un fichier supprimé via DataNest ?", "ground_truth": "Console DataNest > rechercher le fichier > choisir le point de restauration > restaurer vers l'origine."}
+{"query": "MegaPrint fait des bourrages papier à répétition, que faire ?", "ground_truth": "Retirer le papier coincé, vérifier le grammage 80 g/m², nettoyer les rouleaux, planifier une maintenance MegaPrint."}
+{"query": "Où télécharger le client ZephyrVPN ?", "ground_truth": "Sur le portail logiciels Client C, puis installer en administrateur."}
+{"query": "Comment obtenir un point de restauration ancien dans DataNest ?", "ground_truth": "Sélectionner la date voulue dans la console DataNest avant de lancer la restauration."}

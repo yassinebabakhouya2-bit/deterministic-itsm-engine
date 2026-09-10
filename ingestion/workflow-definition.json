@@ -1,0 +1,192 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "siteId": { "type": "string" },
+    "tenantId": { "type": "string" },
+    "appClientId": { "type": "string" },
+    "keyVaultName": { "type": "string" },
+    "secretName": { "type": "string" },
+    "storageAccountName": { "type": "string" },
+    "containerName": { "type": "string" },
+    "clientId": { "type": "string" },
+    "listQuery": { "type": "string", "defaultValue": "" }
+  },
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1
+      }
+    }
+  },
+  "actions": {
+    "Get_secret": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('keyVaultName'), '.vault.azure.net/secrets/', parameters('secretName'), '?api-version=7.4')}",
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://vault.azure.net"
+        }
+      },
+      "runAfter": {}
+    },
+    "Get_token": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "@{concat('https://login.microsoftonline.com/', parameters('tenantId'), '/oauth2/v2.0/token')}",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "body": "@{concat('client_id=', parameters('appClientId'), '&scope=https://graph.microsoft.com/.default&client_secret=', body('Get_secret')?['value'], '&grant_type=client_credentials')}"
+      },
+      "runAfter": {
+        "Get_secret": ["Succeeded"]
+      }
+    },
+    "Initialize_allFiles": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "allFiles", "type": "array", "value": [] }
+        ]
+      },
+      "runAfter": {
+        "Get_token": ["Succeeded"]
+      }
+    },
+    "Initialize_mergedFiles": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "mergedFiles", "type": "array", "value": [] }
+        ]
+      },
+      "runAfter": {
+        "Initialize_allFiles": ["Succeeded"]
+      }
+    },
+    "Initialize_nextUrl": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "nextUrl",
+            "type": "string",
+            "value": "@{concat('https://graph.microsoft.com/v1.0/sites/', parameters('siteId'), '/drive/root/children', parameters('listQuery'))}"
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_mergedFiles": ["Succeeded"]
+      }
+    },
+    "List_files_loop": {
+      "type": "Until",
+      "expression": "@equals(variables('nextUrl'), '')",
+      "limit": { "count": 60, "timeout": "PT1H" },
+      "actions": {
+        "List_files_page": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{variables('nextUrl')}",
+            "headers": {
+              "Authorization": "@{concat('Bearer ', body('Get_token')?['access_token'])}"
+            }
+          },
+          "runAfter": {}
+        },
+        "Merge_files": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "mergedFiles",
+            "value": "@union(variables('allFiles'), body('List_files_page')?['value'])"
+          },
+          "runAfter": {
+            "List_files_page": ["Succeeded"]
+          }
+        },
+        "Update_allFiles": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "allFiles",
+            "value": "@variables('mergedFiles')"
+          },
+          "runAfter": {
+            "Merge_files": ["Succeeded"]
+          }
+        },
+        "Update_nextUrl": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "nextUrl",
+            "value": "@{if(equals(body('List_files_page')?['@odata.nextLink'], null), '', body('List_files_page')?['@odata.nextLink'])}"
+          },
+          "runAfter": {
+            "Update_allFiles": ["Succeeded"]
+          }
+        }
+      },
+      "runAfter": {
+        "Initialize_nextUrl": ["Succeeded"]
+      }
+    },
+    "For_each": {
+      "type": "Foreach",
+      "foreach": "@variables('allFiles')",
+      "actions": {
+        "Get_download_url": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat('https://graph.microsoft.com/v1.0/sites/', parameters('siteId'), '/drive/items/', items('For_each')?['id'], '?$select=@microsoft.graph.downloadUrl')}",
+            "headers": {
+              "Authorization": "@{concat('Bearer ', body('Get_token')?['access_token'])}"
+            }
+          },
+          "runAfter": {}
+        },
+        "Download_content": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{body('Get_download_url')?['@microsoft.graph.downloadUrl']}"
+          },
+          "runAfter": {
+            "Get_download_url": ["Succeeded"]
+          }
+        },
+        "Write_blob": {
+          "type": "Http",
+          "inputs": {
+            "method": "PUT",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', items('For_each')?['name'])}",
+            "headers": {
+              "x-ms-blob-type": "BlockBlob",
+              "x-ms-version": "2021-08-06",
+              "Content-Type": "application/octet-stream",
+              "x-ms-meta-clientid": "@{parameters('clientId')}"
+            },
+            "body": "@body('Download_content')",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            }
+          },
+          "runAfter": {
+            "Download_content": ["Succeeded"]
+          }
+        }
+      },
+      "runAfter": {
+        "List_files_loop": ["Succeeded"]
+      }
+    }
+  },
+  "outputs": {}
+}

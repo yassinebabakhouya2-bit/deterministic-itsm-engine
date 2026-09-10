@@ -1,0 +1,8 @@
+{"query": "Comment résoudre une connexion impossible à Aurora ERP ?", "ground_truth": "Fermer Aurora, vider le cache %AppData%\\AuroraERP\\cache, relancer et vérifier le compte Aurora."}
+{"query": "Que faire si SafePass VPN refuse l'authentification (code 0x51) ?", "ground_truth": "Vérifier/renouveler le certificat SafePass, redémarrer le service, retenter."}
+{"query": "Comment créer un ticket dans DeskFlow ?", "ground_truth": "Portail DeskFlow > Nouveau ticket > catégorie + description > suivre dans Mes tickets DeskFlow."}
+{"query": "Mon badge GateKey n'ouvre plus les portes, que faire ?", "ground_truth": "Vérifier l'état dans la console GateKey, réactiver ou réémettre le badge, mettre à jour les droits de zone."}
+{"query": "La synchronisation VaultDrive est bloquée, comment la débloquer ?", "ground_truth": "Pause/reprise VaultDrive, vérifier la limite de 15 Go, redémarrer l'agent, relier le compte si besoin."}
+{"query": "Une impression reste bloquée dans PrintHub A, comment faire ?", "ground_truth": "Vérifier l'imprimante en ligne, redémarrer le spouleur, purger la file PrintHub A, retester."}
+{"query": "Où voir l'avancement de ma demande de support chez Client A ?", "ground_truth": "Dans le portail DeskFlow, onglet Mes tickets DeskFlow."}
+{"query": "Comment renouveler le profil SafePass VPN ?", "ground_truth": "Paramètres SafePass > Certificat > Renouveler le profil SafePass, puis redémarrer le service."}

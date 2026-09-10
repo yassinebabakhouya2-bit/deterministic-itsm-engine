@@ -1,0 +1,43 @@
+# --- Secrets / credentials (NEVER commit) ---
+*.env
+.env*
+*.key
+*.pem
+*.pfx
+secrets/
+**/local.settings.json
+*.publishsettings
+azureauth.json
+
+# --- Azure / Bicep build outputs ---
+*.azrm.json
+infra/**/*.json
+!infra/**/*.bicepparam
+
+# --- Python (eval scripts to come) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Node (if JS tooling later) ---
+node_modules/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Real client parameter files (NEVER commit) ---
+clients-local/
+
+# --- Client data (do not commit real records) ---
+data/
+*.kb.local
+
+# --- Generated evaluation artifacts (contain client KB context) ---
+eval/eval_input.jsonl
+eval/eval_results.json
+eval/.promptflow/
+.venv/
