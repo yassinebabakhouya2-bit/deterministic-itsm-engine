@@ -1,117 +1,74 @@
 # =====================================================================
 # RAG Evaluation — KnowledgeEngine v9 (quantified proof of reliability)
-# 1) For each client (A/B/C, dedicated index): hybrid retrieval + GPT-4o answer (temp=0)
+# 1) For each client (A/B/C, dedicated index): orchestration/answer.py's
+#    answer_query_core() -- hybrid retrieval + A3 hierarchy split (rank on
+#    @search.rerankerScore) + GPT-4o Structured Outputs answer (temp=0,
+#    seed) -- reused here, not duplicated (axiom A4; see
+#    orchestration/README.md for why direct Chat Completions calls are
+#    used instead of Foundry Agent Service/Prompt Flow/Workflows).
 # 2) Azure AI Foundry evaluators: Groundedness, Relevance, Retrieval
 # Keys retrieved at runtime via az (never stored). Requires az login.
 # Usage: python evaluate_rag.py
+#
+# Note (2026-09-10): context fed to the evaluators is now the primary +
+# annex sources only (per client's engine.yaml primaryCount/annexCount --
+# axiom A3), not a flat top-5 as before. Narrower, hierarchy-aware context
+# changes what gets scored, so these results are a NEW baseline, not
+# directly comparable to the Jalon 1 scores recorded in project memory
+# jalon1.md (those were measured before orchestration/ existed).
 # =====================================================================
 import json
-import subprocess
+import sys
+from pathlib import Path
 
-import requests
-from openai import AzureOpenAI
 from azure.ai.evaluation import (
     GroundednessEvaluator,
     RelevanceEvaluator,
     RetrievalEvaluator,
     evaluate,
 )
+from openai import AzureOpenAI
 
-# ---- Infra constants ----
-RG = "rg-knowledgeengine-v9"
-SEARCH_SERVICE = "srch-knowledgeengine2-v9"
-SEARCH_ENDPOINT = f"https://{SEARCH_SERVICE}.search.windows.net"
-CLIENTS = ["clienta", "clientb", "clientc"]   # one DEDICATED index per client (isolation M2)
-SEARCH_API_VERSION = "2024-07-01"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestration"))
+from answer import (  # noqa: E402 -- reuse orchestration logic (axiom A4), not a duplicate
+    AOAI_ACCOUNT,
+    AOAI_API_VERSION,
+    AOAI_ENDPOINT,
+    RG,
+    SEARCH_SERVICE,
+    answer_query_core,
+    az,
+)
 
-AOAI_ACCOUNT = "aif-knowledgeengine2-v9"
-AOAI_ENDPOINT = f"https://{AOAI_ACCOUNT}.openai.azure.com"
-CHAT_DEPLOY = "gpt-4o"
-AOAI_API_VERSION = "2024-08-01-preview"
-
-TOP_K = 5
-
-
-def az(cmd: str) -> str:
-    """Run an az command and return stdout (text)."""
-    out = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-    if out.returncode != 0:
-        raise RuntimeError(f"az command failed: {cmd}\n{out.stderr}")
-    return out.stdout.strip()
-
+CLIENTS = ["clienta", "clientb", "clientc"]  # one DEDICATED index per client (isolation M2)
 
 print("Retrieving keys (runtime, not stored)...")
 SEARCH_KEY = az(
-    f'az search admin-key show --service-name {SEARCH_SERVICE} '
-    f'--resource-group {RG} --query primaryKey -o tsv'
+    f"az search admin-key show --service-name {SEARCH_SERVICE} "
+    f"--resource-group {RG} --query primaryKey -o tsv"
 )
 AOAI_KEY = az(
-    f'az cognitiveservices account keys list --name {AOAI_ACCOUNT} '
-    f'--resource-group {RG} --query key1 -o tsv'
+    f"az cognitiveservices account keys list --name {AOAI_ACCOUNT} "
+    f"--resource-group {RG} --query key1 -o tsv"
 )
-
-client = AzureOpenAI(
+AOAI_CLIENT = AzureOpenAI(
     azure_endpoint=AOAI_ENDPOINT, api_key=AOAI_KEY, api_version=AOAI_API_VERSION
 )
-
-SYSTEM_PROMPT = (
-    "Tu es l'assistant de support IT du client. Reponds UNIQUEMENT a partir du CONTEXTE fourni. "
-    "Si l'information ne s'y trouve pas, dis clairement que tu ne sais pas. Sois precis et concis."
-)
-
-
-def retrieve(query: str, index: str, k: int = TOP_K) -> str:
-    """Hybrid search (BM25 + vectors + semantic reranker) -> concatenated context."""
-    body = {
-        "search": query,
-        "vectorQueries": [
-            {"kind": "text", "text": query, "fields": "text_vector", "k": k}
-        ],
-        "queryType": "semantic",
-        "semanticConfiguration": "sem-config",
-        "select": "title,chunk",
-        "top": k,
-    }
-    r = requests.post(
-        f"{SEARCH_ENDPOINT}/indexes/{index}/docs/search?api-version={SEARCH_API_VERSION}",
-        headers={"api-key": SEARCH_KEY, "Content-Type": "application/json"},
-        json=body,
-        timeout=60,
-    )
-    r.raise_for_status()
-    docs = r.json().get("value", [])
-    return "\n\n".join(f"[{d.get('title','')}]\n{d.get('chunk','')}" for d in docs)
-
-
-def answer(query: str, context: str) -> str:
-    """Generate a deterministic GPT-4o answer (temperature=0)."""
-    resp = client.chat.completions.create(
-        model=CHAT_DEPLOY,
-        temperature=0,
-        seed=42,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"CONTEXTE:\n{context}\n\nQUESTION: {query}"},
-        ],
-    )
-    return resp.choices[0].message.content
-
 
 model_config = {
     "azure_endpoint": AOAI_ENDPOINT,
     "api_key": AOAI_KEY,
-    "azure_deployment": CHAT_DEPLOY,
+    "azure_deployment": "gpt-4o",
     "api_version": AOAI_API_VERSION,
 }
 
 all_metrics = {}
 
 for CLIENT_ID in CLIENTS:
-    INDEX = f"idx-{CLIENT_ID}"
-    print(f"\n=== Client {CLIENT_ID} (index {INDEX}) ===")
+    print(f"\n=== Client {CLIENT_ID} ===")
 
-    # ---- Phase 1: generate RAG answers ----
-    print("Generating RAG answers (retrieval + GPT-4o)...")
+    # ---- Phase 1: generate RAG answers via orchestration/answer.py ----
+    print("Generating RAG answers (retrieval + A3 split + Structured Outputs)...")
     rows = []
     with open(f"golden_{CLIENT_ID}.jsonl", encoding="utf-8") as f:
         for line in f:
@@ -119,9 +76,14 @@ for CLIENT_ID in CLIENTS:
             if not line:
                 continue
             q = json.loads(line)["query"]
-            ctx = retrieve(q, INDEX)
-            ans = answer(q, ctx)
-            rows.append({"query": q, "context": ctx, "response": ans})
+            result = answer_query_core(CLIENT_ID, q, SEARCH_KEY, AOAI_CLIENT)
+            rows.append(
+                {
+                    "query": q,
+                    "context": result["_trace"]["context"],
+                    "response": result["answer"],
+                }
+            )
             print(f"  - {q[:60]}...")
 
     input_path = f"eval_input_{CLIENT_ID}.jsonl"

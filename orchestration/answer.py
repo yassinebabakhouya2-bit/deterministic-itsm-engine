@@ -235,12 +235,56 @@ def attach_sources(
     return result
 
 
-def answer_query(client_id: str, query: str) -> dict:
-    cfg = load_engine_config(client_id)
+def answer_query_core(
+    client_id: str,
+    query: str,
+    search_key: str,
+    aoai_client: AzureOpenAI,
+    cfg: Optional[dict] = None,
+) -> dict:
+    """Reusable core: no az calls, no client construction -- callers that need
+    many answers (e.g. eval/evaluate_rag.py, batch-scoring a golden dataset)
+    should fetch credentials ONCE and call this directly instead of going
+    through answer_query(), which re-fetches keys on every call (fine for a
+    single CLI invocation, wasteful in a loop). See orchestration/README.md,
+    axiom A4 (separation) -- eval/ reuses this rather than duplicating it."""
+    cfg = cfg or load_engine_config(client_id)
     index = cfg["knowledge"]["index"]
     primary_count = cfg["retrieval"]["primaryCount"]
     annex_count = cfg["retrieval"]["annexCount"]
     gen = cfg["generation"]
+
+    docs = retrieve(query, index, top=primary_count + annex_count, search_key=search_key)
+    primary, annexes = split_hierarchy(docs, primary_count, annex_count)
+    context = format_context(primary, annexes)
+
+    result = generate(query, context, aoai_client, gen["model"], gen["temperature"], gen["seed"])
+    result = attach_sources(result, primary, annexes)
+
+    # Traceability (axiom A5): attach which source was primary/annex, its real
+    # reranker score, and the raw context string (golden-dataset evaluation
+    # needs it verbatim -- see eval/evaluate_rag.py). Deliberately NOT asking
+    # the model to self-report Groundedness/Relevance/Retrieval -- a model
+    # grading its own answer is a hallucination risk. Those scores stay the
+    # job of the batch Azure AI Foundry Evaluators pipeline (eval/), run
+    # against a golden dataset, not a per-call estimate.
+    result["_trace"] = {
+        "client": client_id,
+        "index": index,
+        "context": context,
+        "primary_title": primary.get("title") if primary else None,
+        "primary_reranker_score": primary.get("@search.rerankerScore") if primary else None,
+        "annex_titles": [a.get("title") for a in annexes],
+    }
+    return result
+
+
+def answer_query(client_id: str, query: str) -> dict:
+    """Convenience one-shot wrapper for interactive/CLI use: fetches keys via
+    az and builds the AzureOpenAI client itself, then delegates to
+    answer_query_core(). For batch use (many queries), call
+    answer_query_core() directly with credentials fetched once."""
+    cfg = load_engine_config(client_id)
 
     print("Retrieving keys (runtime, not stored)...")
     search_key = az(
@@ -255,26 +299,7 @@ def answer_query(client_id: str, query: str) -> dict:
         azure_endpoint=AOAI_ENDPOINT, api_key=aoai_key, api_version=AOAI_API_VERSION
     )
 
-    docs = retrieve(query, index, top=primary_count + annex_count, search_key=search_key)
-    primary, annexes = split_hierarchy(docs, primary_count, annex_count)
-    context = format_context(primary, annexes)
-
-    result = generate(query, context, aoai_client, gen["model"], gen["temperature"], gen["seed"])
-    result = attach_sources(result, primary, annexes)
-
-    # Traceability (axiom A5): attach which source was primary/annex and its
-    # real reranker score. Deliberately NOT asking the model to self-report
-    # Groundedness/Relevance/Retrieval -- a model grading its own answer is a
-    # hallucination risk. Those scores stay the job of the batch Azure AI
-    # Foundry Evaluators pipeline (eval/), run against a golden dataset.
-    result["_trace"] = {
-        "client": client_id,
-        "index": index,
-        "primary_title": primary.get("title") if primary else None,
-        "primary_reranker_score": primary.get("@search.rerankerScore") if primary else None,
-        "annex_titles": [a.get("title") for a in annexes],
-    }
-    return result
+    return answer_query_core(client_id, query, search_key, aoai_client, cfg=cfg)
 
 
 if __name__ == "__main__":

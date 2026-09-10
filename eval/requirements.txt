@@ -1,3 +1,4 @@
 azure-ai-evaluation
 openai
 requests
+PyYAML
