@@ -29,6 +29,8 @@ python answer.py --client client-v --query "..."   # real client — config read
 
 ## Design notes
 
+- **No model-retyped titles**: the model never writes source titles — they're already known deterministically from retrieval. It only returns `primary_source_used`/`related_sources_used` (booleans); the script fills in the real titles afterwards. Added after the first live test (2026-09-10) showed the model paraphrasing "KB-A-001.md" as "KB-A-001" — an avoidable divergence.
+
 - **Axiom A2 (agnosticism)**: all client specifics come from `engine.<client>.yaml` —
   `config/` for tracked synthetic clients, `clients-local/` for real ones (git-ignored).
   This module never hardcodes a client.
