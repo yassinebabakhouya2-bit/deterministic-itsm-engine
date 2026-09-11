@@ -1,7 +1,17 @@
-# Root requirements.txt — this is what Oryx (Azure App Service's build step,
-# SCM_DO_BUILD_DURING_DEPLOYMENT=true in infra/modules/webapp.bicep) installs
-# from when the whole repo is zip-deployed. Deliberately just references the
-# two real requirements files (app/ and orchestration/) instead of
-# duplicating their contents -- keep those two as the source of truth.
--r app/requirements.txt
--r orchestration/requirements.txt
+# Root requirements.txt — installed by Oryx (Azure App Service build step,
+# SCM_DO_BUILD_DURING_DEPLOYMENT=true) when the repo is zip-deployed.
+#
+# Cannot use "-r app/requirements.txt" here: Oryx runs the pip install step
+# in an isolated temp directory that only has requirements.txt itself at
+# that point (app/ and orchestration/ aren't copied in yet) -- confirmed
+# 2026-09-11 via a failed deploy ("Could not open requirements file:
+# .../app/requirements.txt"). So this duplicates the union of
+# app/requirements.txt + orchestration/requirements.txt instead of
+# referencing them. Keep those two files as the documentation source of
+# truth for what each layer needs; update this one too if either changes.
+flask
+gunicorn
+openai
+requests
+PyYAML
+azure-identity

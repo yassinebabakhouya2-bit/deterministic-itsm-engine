@@ -44,3 +44,6 @@ eval/eval_results_*.json
 eval/eval_summary.json
 eval/.promptflow/
 .venv/
+
+# Zip deploy artifact (Jalon 4, app/) -- rebuilt locally each deploy, never committed
+deploy.zip
