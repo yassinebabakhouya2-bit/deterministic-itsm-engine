@@ -84,7 +84,14 @@ resource appSettings 'Microsoft.Web/sites/config@2023-12-01' = {
   )
 }
 
-resource authSettings 'Microsoft.Web/sites/config@2023-12-01' = if (enableEasyAuth) {
+// NOT conditional on enableEasyAuth (if (enableEasyAuth) { ... }): ARM/Bicep does
+// not delete a conditional resource when its condition later flips to true ->
+// false -- it just stops managing it, leaving the old authsettingsV2 active
+// and orphaned (hit this for real on 2026-09-11: disabling Easy Auth via
+// Bicep did nothing until the resource was patched directly with
+// `az resource update ... --set properties.platform.enabled=false`). So this
+// resource always exists; enableEasyAuth only toggles platform.enabled.
+resource authSettings 'Microsoft.Web/sites/config@2023-12-01' = {
   parent: webApp
   name: 'authsettingsV2'
   dependsOn: [
@@ -92,10 +99,10 @@ resource authSettings 'Microsoft.Web/sites/config@2023-12-01' = if (enableEasyAu
   ]
   properties: {
     platform: {
-      enabled: true
+      enabled: enableEasyAuth
     }
     globalValidation: {
-      requireAuthentication: true
+      requireAuthentication: enableEasyAuth
       unauthenticatedClientAction: 'RedirectToLoginPage'
       redirectToProvider: 'azureactivedirectory'
     }
