@@ -18,7 +18,7 @@ Prompt Flow and Foundry's visual Workflows were also ruled out: both are being r
 (Prompt Flow 2027-04-20, Workflows 2026-12-01) — see project memory
 `jalon3-orchestration.md` for sources and the full trade-off discussion.
 
-## Usage
+## Usage — CLI (admin keys via `az`)
 
 ```bash
 pip install -r requirements.txt
@@ -26,6 +26,22 @@ az login   # keys are retrieved at runtime via az, never stored (same convention
 python answer.py --client clienta --query "..."
 python answer.py --client client-v --query "..."   # real client — config read from clients-local/
 ```
+
+## Usage — keyless (RBAC), for app/app.py (Jalon 4)
+
+`answer_query_core_keyless()` + `build_aoai_client_keyless()` use
+`DefaultAzureCredential` instead of admin keys — no `az` subprocess call, no key in an
+app setting. Used by the Azure Web App (`app/`), whose system-assigned managed
+identity needs two roles (granted in `infra/modules/roles.bicep`):
+
+- `Search Index Data Reader` on the Search service
+- `Cognitive Services OpenAI User` on the Foundry account (same role Search's own
+  identity already holds there, for embeddings)
+
+`DefaultAzureCredential` also resolves through an interactive `az login` session
+locally, so the keyless path works for local dev too — it's just not what
+`answer_query()` (CLI, above) or `eval/evaluate_rag.py` use; those keep the admin-key
+path they were validated with in Jalon 3, untouched.
 
 ## Design notes
 
@@ -44,10 +60,9 @@ python answer.py --client client-v --query "..."   # real client — config read
   itself a hallucination risk. Those scores stay the job of the batch Azure AI Foundry
   Evaluators pipeline (`eval/`), run against a golden dataset, not a per-call estimate.
 
-## Not yet done
+## Status
 
-`eval/evaluate_rag.py` still has its own, separate `retrieve()`/`answer()` (predates
-this module, produced the validated Jalon 1 scores). It has **not** been refactored to
-call this module yet — deliberately, to avoid touching a validated harness without
-being able to re-run it end-to-end from this session. Refactor it once `answer.py` has
-been validated live (via Azure Cloud Shell, same as the rest of the project).
+`eval/evaluate_rag.py` has been refactored (Jalon 3, commit `eb62091`) to call
+`answer_query_core()` from this module instead of duplicating retrieval/generation
+(axiom A4) — it fetches admin keys once and reuses this module, it does not have its
+own `retrieve()`/`answer()` anymore.

@@ -12,6 +12,9 @@ param location string = 'francecentral'
 @description('Project naming prefix')
 param namePrefix string = 'knowledgeengine2'
 
+@description('Comma-separated client ids queryable from the demo Web App (stopgap before Jalon 5 real per-user auth — see infra/modules/webapp.bicep and app/README.md)')
+param webAppAllowedClients string = 'clienta,clientb,clientc,client-v,client-s'
+
 // ---------------------------------------------------------------------
 // Blob storage — hosts KB records per client (private containers)
 // ---------------------------------------------------------------------
@@ -48,7 +51,21 @@ module foundry 'modules/foundry.bicep' = {
 }
 
 // ---------------------------------------------------------------------
-// RBAC — Search's managed identity reads Blob & calls the embedding
+// Azure Web App — demo interface (Jalon 4)
+// ---------------------------------------------------------------------
+module webapp 'modules/webapp.bicep' = {
+  name: 'webapp'
+  params: {
+    planName: 'plan-${namePrefix}-v9'
+    webAppName: 'app-${namePrefix}-v9'
+    location: location
+    allowedClients: webAppAllowedClients
+  }
+}
+
+// ---------------------------------------------------------------------
+// RBAC — Search's managed identity reads Blob & calls the embedding;
+// the Web App's managed identity queries Search & calls the LLM (Jalon 4)
 // ---------------------------------------------------------------------
 module roles 'modules/roles.bicep' = {
   name: 'roles'
@@ -56,9 +73,12 @@ module roles 'modules/roles.bicep' = {
     searchPrincipalId: search.outputs.searchPrincipalId
     storageAccountName: storage.outputs.storageAccountName
     foundryName: foundry.outputs.foundryName
+    searchServiceName: search.outputs.searchServiceName
+    webAppPrincipalId: webapp.outputs.webAppPrincipalId
   }
 }
 
 output storageAccountName string = storage.outputs.storageAccountName
 output searchServiceName string = search.outputs.searchServiceName
 output foundryName string = foundry.outputs.foundryName
+output webAppHostName string = webapp.outputs.webAppHostName

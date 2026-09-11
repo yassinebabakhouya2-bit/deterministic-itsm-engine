@@ -27,8 +27,18 @@
 # booleans (which sources it actually used); this script fills in the
 # real titles from the retrieval result afterwards.
 #
-# Keys are retrieved at runtime via `az` (never stored), same convention
-# as eval/evaluate_rag.py. Requires az login.
+# Design note (2026-09-11, Jalon 4): added a keyless path
+# (answer_query_core_keyless + build_aoai_client_keyless) for callers that
+# use Azure AD RBAC instead of admin keys -- namely app/app.py, which runs
+# on an Azure Web App and has no `az login` session to fetch keys with.
+# answer_query_core(), retrieve() and answer_query() (the CLI, validated in
+# Jalon 3) are UNCHANGED in behavior: retrieve() now delegates to the new
+# _search_request() helper, but with the exact same {"api-key": ...} header
+# it always used. Nothing here required or received a live retest, by
+# design -- see project memory jalon4-app-interface.md.
+#
+# Keys are retrieved at runtime via `az` (never stored) for the CLI path,
+# same convention as eval/evaluate_rag.py. Requires az login.
 # Usage: python answer.py --client clienta --query "..."
 # =====================================================================
 import argparse
@@ -39,6 +49,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 import yaml
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AzureOpenAI
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -133,9 +144,12 @@ def load_engine_config(client_id: str) -> dict:
     raise FileNotFoundError(f"No engine.{client_id}.yaml found in: {searched}")
 
 
-def retrieve(query: str, index: str, top: int, search_key: str) -> List[Dict]:
-    """Hybrid + semantic search. Returns docs sorted by @search.rerankerScore
-    (desc) -- the real Azure-native ranking signal used for axiom A3."""
+def _search_request(query: str, index: str, top: int, headers: Dict[str, str]) -> List[Dict]:
+    """Raw Azure AI Search hybrid+semantic query -- same request body
+    regardless of auth mechanism, only the headers differ (api-key vs a
+    Bearer token). Returns docs sorted by @search.rerankerScore (desc), the
+    real Azure-native ranking signal used for axiom A3. Shared by retrieve()
+    (api-key, Jalon 3) and answer_query_core_keyless() (RBAC, Jalon 4)."""
     body = {
         "search": query,
         "vectorQueries": [{"kind": "text", "text": query, "fields": "text_vector", "k": top}],
@@ -146,13 +160,21 @@ def retrieve(query: str, index: str, top: int, search_key: str) -> List[Dict]:
     }
     r = requests.post(
         f"{SEARCH_ENDPOINT}/indexes/{index}/docs/search?api-version={SEARCH_API_VERSION}",
-        headers={"api-key": search_key, "Content-Type": "application/json"},
+        headers={**headers, "Content-Type": "application/json"},
         json=body,
         timeout=60,
     )
     r.raise_for_status()
     docs = r.json().get("value", [])
     return sorted(docs, key=lambda d: d.get("@search.rerankerScore", 0), reverse=True)
+
+
+def retrieve(query: str, index: str, top: int, search_key: str) -> List[Dict]:
+    """Hybrid + semantic search, api-key auth. Unchanged contract from Jalon 3
+    -- used by answer_query_core() (CLI, eval/evaluate_rag.py). See
+    _search_request() for the shared request logic and
+    answer_query_core_keyless() for the RBAC-based alternative (Jalon 4)."""
+    return _search_request(query, index, top, {"api-key": search_key})
 
 
 def split_hierarchy(
@@ -300,6 +322,78 @@ def answer_query(client_id: str, query: str) -> dict:
     )
 
     return answer_query_core(client_id, query, search_key, aoai_client, cfg=cfg)
+
+
+# =====================================================================
+# Keyless path (Jalon 4) -- Azure AD RBAC instead of admin keys.
+#
+# Added for app/app.py (Azure Web App), which has no `az login` session to
+# fetch keys with and should not carry admin keys as app settings (axiom
+# A5, same reasoning already applied to Search's own managed identity in
+# infra/modules/roles.bicep). DefaultAzureCredential resolves to the App
+# Service's system-assigned managed identity in Azure, and falls back to an
+# interactive `az login` session locally (AzureCliCredential) -- so this
+# also works for local dev, it is just not used by answer_query()/eval/
+# above, which are unchanged and keep using admin keys as validated in
+# Jalon 3.
+#
+# Requires the caller's identity to hold, on the target resources (see
+# infra/modules/roles.bicep):
+#   - "Search Index Data Reader" on the Search service
+#   - "Cognitive Services OpenAI User" on the Foundry account (same role
+#     already granted to Search's own identity, for embeddings)
+# =====================================================================
+
+
+def build_aoai_client_keyless(credential: DefaultAzureCredential) -> AzureOpenAI:
+    token_provider = get_bearer_token_provider(
+        credential, "https://cognitiveservices.azure.com/.default"
+    )
+    return AzureOpenAI(
+        azure_endpoint=AOAI_ENDPOINT,
+        azure_ad_token_provider=token_provider,
+        api_version=AOAI_API_VERSION,
+    )
+
+
+def answer_query_core_keyless(
+    client_id: str,
+    query: str,
+    search_bearer_token: str,
+    aoai_client: AzureOpenAI,
+    cfg: Optional[dict] = None,
+) -> dict:
+    """Same pipeline as answer_query_core(), RBAC/Bearer auth on Search
+    instead of an admin api-key. Kept as a separate function rather than
+    branching inside answer_query_core() so the validated Jalon 3 function
+    and its callers (CLI, eval/evaluate_rag.py) stay byte-for-byte
+    unchanged -- see module docstring, 2026-09-11 note."""
+    cfg = cfg or load_engine_config(client_id)
+    index = cfg["knowledge"]["index"]
+    primary_count = cfg["retrieval"]["primaryCount"]
+    annex_count = cfg["retrieval"]["annexCount"]
+    gen = cfg["generation"]
+
+    docs = _search_request(
+        query,
+        index,
+        primary_count + annex_count,
+        {"Authorization": f"Bearer {search_bearer_token}"},
+    )
+    primary, annexes = split_hierarchy(docs, primary_count, annex_count)
+    context = format_context(primary, annexes)
+
+    result = generate(query, context, aoai_client, gen["model"], gen["temperature"], gen["seed"])
+    result = attach_sources(result, primary, annexes)
+    result["_trace"] = {
+        "client": client_id,
+        "index": index,
+        "context": context,
+        "primary_title": primary.get("title") if primary else None,
+        "primary_reranker_score": primary.get("@search.rerankerScore") if primary else None,
+        "annex_titles": [a.get("title") for a in annexes],
+    }
+    return result
 
 
 if __name__ == "__main__":
