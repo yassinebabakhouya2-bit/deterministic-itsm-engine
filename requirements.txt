@@ -1,0 +1,7 @@
+# Root requirements.txt — this is what Oryx (Azure App Service's build step,
+# SCM_DO_BUILD_DURING_DEPLOYMENT=true in infra/modules/webapp.bicep) installs
+# from when the whole repo is zip-deployed. Deliberately just references the
+# two real requirements files (app/ and orchestration/) instead of
+# duplicating their contents -- keep those two as the source of truth.
+-r app/requirements.txt
+-r orchestration/requirements.txt
