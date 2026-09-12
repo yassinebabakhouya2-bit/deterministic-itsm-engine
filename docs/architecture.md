@@ -99,11 +99,11 @@ Three native Azure evaluators score every response against a *golden dataset* pe
 
 A periodic evaluation run produces a quantified reliability score per client — evaluation turns reliability from an assumption into a measured, reproducible property of the system.
 
-### Access & security — Entra ID + multi-tenant isolation
+### Access & security — Entra ID + multi-tenant isolation (Jalon 5)
 
-- **Azure Entra ID (SSO)** authenticates the user and identifies their organization.
-- **User → client resolution**: the logged-in user is mapped to their organization via their Entra group.
-- **Isolation via dedicated index + security trimming**: each client has its own Azure AI Search index; a user is only ever routed to their own organization's index, and every document additionally carries a `clientId` field (defense in depth). Isolation is enforced at the index level, not at the display level.
+- **Azure Entra ID (SSO)** authenticates the user via their own organization's tenant (App Registration is multi-tenant — any Entra tenant can complete sign-in once its admin consents, so tenant restriction is enforced explicitly, not left to Entra ID itself).
+- **User → client resolution, two levels**: (1) the token's tenant ID resolves the user's organization against every client's declared `entraTenantId` — an unrecognized tenant is denied outright; (2) within a tenant that hosts several clients (Yassine's own sandbox today, or an external organization with several of its own entities), the token's Entra group resolves the specific client. A tenant with no `entraGroup` declared for any client is treated as "whole tenant = one client" — the default for a newly onboarded external organization.
+- **Isolation via dedicated index + security trimming**: each client has its own Azure AI Search index; a user is only ever routed to their own organization's index, and the query itself additionally carries an explicit `clientId eq '...'` filter (defense in depth, on top of — not instead of — the physical per-index separation).
 
 Three possible isolation levels, in increasing order of strength:
 

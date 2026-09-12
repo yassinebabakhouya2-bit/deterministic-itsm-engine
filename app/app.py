@@ -1,5 +1,5 @@
 # =====================================================================
-# KnowledgeEngine v9 — Web interface (Jalon 4)
+# KnowledgeEngine v9 — Web interface (Jalon 4, auth updated Jalon 5)
 #
 # Thin Flask front end over orchestration/answer.py's
 # answer_query_core_keyless(): retrieval + A3 hierarchy split + Structured
@@ -14,14 +14,14 @@
 #   - Search Index Data Reader   on the Search service
 #   - Cognitive Services OpenAI User   on the Foundry account
 #
-# Client resolution (stopgap before Jalon 5 — no real per-user auth yet):
-# ALLOWED_CLIENTS env var (comma-separated client ids) is the only gate.
-# Anyone who can reach this app's URL can query any client in that list —
-# see project memory jalon4-app-interface.md for the discussion and why
-# clienta/b/c and client-v/s are currently treated the same way (all live
-# in Yassine's own sandbox tenant; there is no separate DXC-tenant
-# boundary to enforce yet). Jalon 5 replaces this env var with a real
-# Entra ID group -> clientId mapping.
+# Client resolution (Jalon 5 — replaces the Jalon 4 ALLOWED_CLIENTS
+# stopgap): the client(s) a given request may query are resolved from the
+# X-MS-CLIENT-PRINCIPAL claims Easy Auth itself attaches to every
+# authenticated request (tenant, then Entra group) — never from a value
+# the browser posted. See app/auth.py and project memory
+# jalon5-auth-isolation.md for the full design. Deny-by-default: an
+# unrecognized tenant, or a tenant with no matching group, sees no client
+# at all, not a fallback.
 # =====================================================================
 import os
 import sys
@@ -37,18 +37,26 @@ from answer import (  # noqa: E402 -- reuse orchestration logic (axiom A4), not 
     load_engine_config,
 )
 
-ALLOWED_CLIENTS = [
-    c.strip()
-    for c in os.environ.get(
-        "ALLOWED_CLIENTS", "clienta,clientb,clientc,client-v,client-s"
-    ).split(",")
-    if c.strip()
-]
+from auth import build_access_maps, parse_client_principal, resolve_allowed_clients  # noqa: E402
 
-# Built once at process start (DefaultAzureCredential caches/refreshes tokens
-# internally) -- not per-request.
+# Built once at process start:
+# - DefaultAzureCredential caches/refreshes tokens internally, not per-request.
+# - The tenant/group -> client_id maps come from engine.<client>.yaml files,
+#   which don't change without a redeploy -- no need to reload per-request.
 _credential = DefaultAzureCredential()
 _aoai_client = build_aoai_client_keyless(_credential)
+_TENANT_ONLY_MAP, _TENANT_GROUP_MAP = build_access_maps()
+
+# Local dev only: when there is NO X-MS-CLIENT-PRINCIPAL header at all (Easy
+# Auth is not in front of this process, e.g. `python app.py` without an App
+# Service), fall back to this comma-separated allowlist instead of denying
+# everyone outright. This path is NEVER taken in Azure once Easy Auth's
+# globalValidation.requireAuthentication is on: an unauthenticated request
+# never reaches Flask, so the header is always present there (even if its
+# claims resolve to zero clients, which is a real "access denied", not
+# this fallback). Empty by default -- must be set explicitly to develop
+# locally without Easy Auth.
+_LOCAL_DEV_CLIENTS = [c.strip() for c in os.environ.get("LOCAL_DEV_CLIENTS", "").split(",") if c.strip()]
 
 app = Flask(__name__)
 
@@ -79,6 +87,8 @@ PAGE = """
   button:hover{opacity:.9}
   .error{margin-top:18px;padding:12px 14px;border:1px solid #7f1d1d;background:#2a1010;
     border-radius:8px;color:#fca5a5;font-size:.9rem}
+  .denied{margin-top:18px;padding:16px;border:1px solid #7f1d1d;background:#2a1010;
+    border-radius:10px;color:#fca5a5;font-size:.9rem}
   .answer{margin-top:18px;padding:16px;border:1px solid var(--line);background:var(--panel);
     border-radius:10px}
   .answer.ambiguous{border-color:var(--warn)}
@@ -94,14 +104,20 @@ PAGE = """
 <body>
 <header>
   <h1>KnowledgeEngine v9 — Assistant support IT</h1>
-  <p>Jalon 4 — démo. Pas encore d'authentification par utilisateur (Jalon 5) :
-     le client est choisi manuellement ci-dessous.</p>
+  <p>Connecté via Entra ID — le client affiché ci-dessous est déterminé automatiquement
+     par votre organisation, pas choisi librement.</p>
 </header>
 <main>
+  {% if not allowed_clients %}
+  <div class="denied">
+    Accès refusé : aucun client n'est associé à votre compte sur cette instance.
+    Contactez votre administrateur si vous pensez que c'est une erreur.
+  </div>
+  {% else %}
   <form method="post">
     <label for="client_id">Client</label>
     <select name="client_id" id="client_id">
-      {% for c in clients %}
+      {% for c in allowed_clients %}
       <option value="{{ c }}" {% if c == client_id %}selected{% endif %}>{{ c }}</option>
       {% endfor %}
     </select>
@@ -138,6 +154,7 @@ PAGE = """
     </div>
   </div>
   {% endif %}
+  {% endif %}
 </main>
 <footer>Score reranker source primaire : {{ answer._trace.primary_reranker_score if answer else "" }}</footer>
 </body>
@@ -149,16 +166,32 @@ def get_search_bearer_token() -> str:
     return _credential.get_token("https://search.azure.com/.default").token
 
 
+def _resolve_allowed_clients_for_request() -> list:
+    """See app/auth.py module docstring for the full design. The
+    X-MS-CLIENT-PRINCIPAL header is only absent when Easy Auth is not in
+    front of this process at all (local dev) -- in Azure, with Easy Auth's
+    globalValidation.requireAuthentication on, an unauthenticated request
+    never reaches this code, so the header is always present there."""
+    header_value = request.headers.get("X-MS-CLIENT-PRINCIPAL")
+    if header_value is None:
+        return _LOCAL_DEV_CLIENTS
+    claims = parse_client_principal(header_value)
+    return resolve_allowed_clients(claims, _TENANT_ONLY_MAP, _TENANT_GROUP_MAP)
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     answer = None
     error = None
-    client_id = request.form.get("client_id") or (ALLOWED_CLIENTS[0] if ALLOWED_CLIENTS else "")
+    allowed_clients = _resolve_allowed_clients_for_request()
+    client_id = request.form.get("client_id") or (allowed_clients[0] if allowed_clients else "")
     query = request.form.get("query", "")
 
     if request.method == "POST" and query.strip():
-        if client_id not in ALLOWED_CLIENTS:
-            error = f"Client inconnu ou non autorisé sur cette instance : {client_id}"
+        if client_id not in allowed_clients:
+            # Never trust the posted value alone -- re-validated here against
+            # THIS request's own resolved set, not a global list.
+            error = f"Client inconnu ou non autorisé pour votre compte : {client_id}"
         else:
             try:
                 load_engine_config(client_id)  # fail fast with a clear error if misconfigured
@@ -168,13 +201,21 @@ def index():
                 error = str(exc)
 
     return render_template_string(
-        PAGE, clients=ALLOWED_CLIENTS, client_id=client_id, query=query, answer=answer, error=error
+        PAGE,
+        allowed_clients=allowed_clients,
+        client_id=client_id,
+        query=query,
+        answer=answer,
+        error=error,
     )
 
 
 @app.route("/healthz")
 def healthz():
-    return {"status": "ok", "allowed_clients": ALLOWED_CLIENTS}, 200
+    # Deliberately does not list client ids (unauthenticated endpoint) --
+    # just proves the app started and loaded its access maps.
+    onboarded = len(_TENANT_ONLY_MAP) + len(_TENANT_GROUP_MAP)
+    return {"status": "ok", "onboarded_clients": onboarded}, 200
 
 
 if __name__ == "__main__":

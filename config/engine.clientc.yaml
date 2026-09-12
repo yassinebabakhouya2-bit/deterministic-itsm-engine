@@ -16,8 +16,10 @@ knowledge:
   index: idx-clientc            # DEDICATED index (physical isolation, J2)
   # audio: deferred to Milestone 3 (Azure Speech)
 
-# Isolation: only members of this Entra group can access the Client C index
+# Isolation (Jalon 5): tenant match (entraTenantId) always required; group
+# match (entraGroup) required only when the tenant hosts several clients.
 access:
+  entraTenantId: "6cdc0a5a-779d-4912-a0b3-455e5fc4d9c6"   # Jalon 5 -- tenant shared by every client hosted here
   entraGroup: "TODO-group-clientc-objectId"   # to fill in via the portal (Milestone 2)
 
 # Retrieval parameters (axiom A3 — hierarchy)

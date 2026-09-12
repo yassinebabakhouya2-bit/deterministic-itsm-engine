@@ -144,12 +144,23 @@ def load_engine_config(client_id: str) -> dict:
     raise FileNotFoundError(f"No engine.{client_id}.yaml found in: {searched}")
 
 
-def _search_request(query: str, index: str, top: int, headers: Dict[str, str]) -> List[Dict]:
+def _search_request(
+    query: str, index: str, top: int, headers: Dict[str, str], client_id: Optional[str] = None
+) -> List[Dict]:
     """Raw Azure AI Search hybrid+semantic query -- same request body
     regardless of auth mechanism, only the headers differ (api-key vs a
     Bearer token). Returns docs sorted by @search.rerankerScore (desc), the
     real Azure-native ranking signal used for axiom A3. Shared by retrieve()
-    (api-key, Jalon 3) and answer_query_core_keyless() (RBAC, Jalon 4)."""
+    (api-key, Jalon 3) and answer_query_core_keyless() (RBAC, Jalon 4).
+
+    client_id (Jalon 5): when given, adds an explicit `filter: clientId eq
+    '<client_id>'` -- defense in depth on top of the physical per-client
+    index isolation (idx-<client>) already in place since Jalon 2. The
+    clientId field has been projected onto every document since the
+    skillset was built (search/skillset.template.json) but was never
+    actually queried against until now. Single quotes are doubled (OData
+    escaping) even though callers only ever pass our own known client ids,
+    never raw user input."""
     body = {
         "search": query,
         "vectorQueries": [{"kind": "text", "text": query, "fields": "text_vector", "k": top}],
@@ -158,6 +169,8 @@ def _search_request(query: str, index: str, top: int, headers: Dict[str, str]) -
         "select": "title,chunk",
         "top": top,
     }
+    if client_id:
+        body["filter"] = f"clientId eq '{client_id.replace(chr(39), chr(39) * 2)}'"
     r = requests.post(
         f"{SEARCH_ENDPOINT}/indexes/{index}/docs/search?api-version={SEARCH_API_VERSION}",
         headers={**headers, "Content-Type": "application/json"},
@@ -169,12 +182,15 @@ def _search_request(query: str, index: str, top: int, headers: Dict[str, str]) -
     return sorted(docs, key=lambda d: d.get("@search.rerankerScore", 0), reverse=True)
 
 
-def retrieve(query: str, index: str, top: int, search_key: str) -> List[Dict]:
+def retrieve(
+    query: str, index: str, top: int, search_key: str, client_id: Optional[str] = None
+) -> List[Dict]:
     """Hybrid + semantic search, api-key auth. Unchanged contract from Jalon 3
     -- used by answer_query_core() (CLI, eval/evaluate_rag.py). See
-    _search_request() for the shared request logic and
-    answer_query_core_keyless() for the RBAC-based alternative (Jalon 4)."""
-    return _search_request(query, index, top, {"api-key": search_key})
+    _search_request() for the shared request logic (incl. the optional
+    clientId filter added in Jalon 5) and answer_query_core_keyless() for
+    the RBAC-based alternative (Jalon 4)."""
+    return _search_request(query, index, top, {"api-key": search_key}, client_id=client_id)
 
 
 def split_hierarchy(
@@ -276,7 +292,9 @@ def answer_query_core(
     annex_count = cfg["retrieval"]["annexCount"]
     gen = cfg["generation"]
 
-    docs = retrieve(query, index, top=primary_count + annex_count, search_key=search_key)
+    docs = retrieve(
+        query, index, top=primary_count + annex_count, search_key=search_key, client_id=client_id
+    )
     primary, annexes = split_hierarchy(docs, primary_count, annex_count)
     context = format_context(primary, annexes)
 
@@ -379,6 +397,7 @@ def answer_query_core_keyless(
         index,
         primary_count + annex_count,
         {"Authorization": f"Bearer {search_bearer_token}"},
+        client_id=client_id,
     )
     primary, annexes = split_hierarchy(docs, primary_count, annex_count)
     context = format_context(primary, annexes)

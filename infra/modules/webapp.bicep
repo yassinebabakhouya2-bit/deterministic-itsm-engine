@@ -1,16 +1,29 @@
 // =====================================================================
-// Module: Azure Web App — demo interface (Jalon 4)
+// Module: Azure Web App — demo interface (Jalon 4, auth hardened Jalon 5)
 // Linux App Service (Python/Flask, app/), system-assigned managed
 // identity -> keyless RBAC access to Search + Foundry (see roles.bicep).
 // No secrets, no Key Vault needed for THOSE two credentials (axiom A5).
 //
-// Easy Auth (authsettingsV2, added 2026-09-11): a coarse gate in front of
-// the whole app -- "signed in to Yassine's own sandbox tenant = in", no
-// per-client mapping. This is NOT the real per-user/per-client auth of
-// Jalon 5 (which will use access.entraGroup already reserved in each
-// engine.<client>.yaml) -- it exists only because deploying the app with
-// zero protection at all (the state before this change) was judged too
-// exposed even as a stopgap. See project memory jalon4-app-interface.md.
+// Easy Auth (authsettingsV2, added 2026-09-11, extended Jalon 5): gates
+// the whole app on a valid Entra ID sign-in. Two real defenses now stack
+// on top of that gate (neither existed at Jalon 4):
+//   1. WEBSITE_AUTH_AAD_ALLOWED_TENANTS (platform-level, this file) --
+//      Microsoft-documented app setting restricting which Entra tenants
+//      may even complete sign-in, checked against the `tid` claim before
+//      the request reaches app code at all. Required as soon as
+//      easyAuthMultiTenant is true: Microsoft's own docs are explicit
+//      that a multi-tenant Easy Auth app "doesn't validate which tenant
+//      the request comes from" on its own.
+//   2. app/auth.py (code-level) -- resolves tenant+group to a client_id,
+//      deny-by-default. Still needed even with (1): (1) only says WHICH
+//      tenants may sign in, not which client each one may query, and a
+//      tenant hosting several clients (Yassine's own sandbox) still
+//      needs the group-level split.
+// ALLOWED_CLIENTS (the Jalon 4 stopgap env var) is gone -- app/app.py no
+// longer reads it. See app/README.md and project memory
+// jalon5-auth-isolation.md for the full design and the exact az commands
+// needed on the App Registration itself (groupMembershipClaims,
+// signInAudience) -- neither is a Bicep-managed resource.
 // =====================================================================
 
 @description('Name of the App Service plan')
@@ -22,24 +35,27 @@ param webAppName string
 @description('Azure region')
 param location string
 
-@description('Comma-separated client ids this instance is allowed to query (stopgap before Jalon 5 real auth)')
-param allowedClients string
-
 @description('App Service plan SKU')
 param skuName string = 'B1'
 
-@description('Enable the coarse Easy Auth gate (any signed-in user in easyAuthTenantId reaches the app). Stopgap before Jalon 5 real per-client isolation.')
+@description('Enable the Easy Auth gate (require a signed-in Entra ID user to reach the app at all). Client-level isolation beyond this is handled by app/auth.py (Jalon 5), not by this flag.')
 param enableEasyAuth bool = true
 
 @description('Entra ID App Registration (client) ID for Easy Auth -- required when enableEasyAuth is true. See app/README.md for how to create it (az ad app create).')
 param easyAuthClientId string = ''
 
-@description('Entra ID tenant ID for Easy Auth -- required when enableEasyAuth is true.')
+@description('Entra ID tenant ID for Easy Auth when easyAuthMultiTenant is false -- required in that case (single-tenant issuer). Ignored (but harmless to leave set) when easyAuthMultiTenant is true.')
 param easyAuthTenantId string = ''
 
 @description('Entra ID App Registration client secret for Easy Auth -- required when enableEasyAuth is true. Pass at deploy time only (az deployment group create --parameters), never commit it, never put it in a .bicepparam file.')
 @secure()
 param easyAuthClientSecret string = ''
+
+@description('Jalon 5: allow sign-in from any Microsoft Entra tenant (external organizations), not just easyAuthTenantId. Flipping this alone does nothing -- the App Registration itself must also be switched to multi-tenant first (az ad app update --set signInAudience=AzureADMultipleOrgs, see app/README.md). Defaults to false so existing single-tenant deployments are byte-for-byte unchanged.')
+param easyAuthMultiTenant bool = false
+
+@description('Jalon 5: Entra tenant IDs allowed to complete sign-in at all, enforced by the platform itself (WEBSITE_AUTH_AAD_ALLOWED_TENANTS, checked against the tid claim before the request reaches app code) -- Microsoft caps this at 10 tenant IDs. Always include your own tenant; add an external organization''s tenant ID here once its engine.<client>.yaml is onboarded (see app/auth.py). Leaving this empty removes the platform-level restriction entirely -- app/auth.py''s own allowlist becomes the ONLY defense, which matters a lot once easyAuthMultiTenant is true (any tenant could otherwise complete sign-in after admin consent).')
+param easyAuthAllowedTenantIds array = []
 
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
   name: planName
@@ -77,10 +93,12 @@ resource appSettings 'Microsoft.Web/sites/config@2023-12-01' = {
   name: 'appsettings'
   properties: union(
     {
-      ALLOWED_CLIENTS: allowedClients
       SCM_DO_BUILD_DURING_DEPLOYMENT: 'true' // Oryx builds from requirements.txt on push/zip-deploy
     },
-    enableEasyAuth ? { MICROSOFT_PROVIDER_AUTHENTICATION_SECRET: easyAuthClientSecret } : {}
+    enableEasyAuth ? { MICROSOFT_PROVIDER_AUTHENTICATION_SECRET: easyAuthClientSecret } : {},
+    // Platform-level tenant allowlist (Jalon 5) -- see param description above
+    // for why this matters once easyAuthMultiTenant is true.
+    !empty(easyAuthAllowedTenantIds) ? { WEBSITE_AUTH_AAD_ALLOWED_TENANTS: join(easyAuthAllowedTenantIds, ',') } : {}
   )
 }
 
@@ -112,7 +130,21 @@ resource authSettings 'Microsoft.Web/sites/config@2023-12-01' = {
         registration: {
           clientId: easyAuthClientId
           clientSecretSettingName: 'MICROSOFT_PROVIDER_AUTHENTICATION_SECRET'
-          openIdIssuer: 'https://sts.windows.net/${easyAuthTenantId}/v2.0'
+          // Jalon 5: Microsoft's documented default issuer for an "Any
+          // Microsoft Entra directory - Multitenant" App Registration is
+          // the /organizations/v2.0 endpoint below -- NOT independently
+          // verified against EasyAuth specifically (community reports are
+          // mixed; some say EasyAuth only accepts /common/v2.0 for
+          // multi-tenant and rejects /organizations/v2.0 with an issuer
+          // validation error). If login breaks after switching
+          // easyAuthMultiTenant to true, try
+          // 'https://login.microsoftonline.com/common/v2.0' instead
+          // (personal Microsoft accounts would then also technically be
+          // able to attempt sign-in, but WEBSITE_AUTH_AAD_ALLOWED_TENANTS
+          // above still blocks anyone outside easyAuthAllowedTenantIds).
+          openIdIssuer: easyAuthMultiTenant
+            ? 'https://login.microsoftonline.com/organizations/v2.0'
+            : 'https://sts.windows.net/${easyAuthTenantId}/v2.0'
         }
         validation: {
           defaultAuthorizationPolicy: {
