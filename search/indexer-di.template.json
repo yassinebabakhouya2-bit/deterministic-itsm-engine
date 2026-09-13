@@ -1,0 +1,21 @@
+{
+  "name": "ix-__CLIENTID__-di",
+  "description": "Indexeur DOCUMENT INTELLIGENCE : lit Blob kb-__CLIENTID__ (uniquement .pdf/.docx/.xlsx/.pptx/.html/images), applique le skillset Document Intelligence Layout (texte + tableaux), projette dans l'index dedie idx-__CLIENTID__.",
+  "dataSourceName": "ds-__CLIENTID__",
+  "skillsetName": "ss-__CLIENTID__-di",
+  "targetIndexName": "idx-__CLIENTID__",
+  "parameters": {
+    "batchSize": 1,
+    "maxFailedItems": -1,
+    "maxFailedItemsPerBatch": -1,
+    "configuration": {
+      "dataToExtract": "contentAndMetadata",
+      "parsingMode": "default",
+      "indexStorageMetadataOnlyForOversizedDocuments": true,
+      "allowSkillsetToReadFileData": true,
+      "indexedFileNameExtensions": ".pdf,.docx,.xlsx,.pptx,.html,.htm,.jpg,.jpeg,.png,.bmp,.tiff,.tif"
+    }
+  },
+  "fieldMappings": [],
+  "outputFieldMappings": []
+}

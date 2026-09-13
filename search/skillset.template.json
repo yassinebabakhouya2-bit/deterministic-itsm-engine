@@ -1,6 +1,6 @@
 {
-  "name": "ss-__CLIENTID__",
-  "description": "Chunking + integrated vectorization via text-embedding-3-large (managed identity). Injects clientId (defense in depth).",
+  "name": "ss-__CLIENTID__-text",
+  "description": "Pipeline TEXTE NATIF (formats sans mise en page complexe : .md, .txt, .csv, .json, etc. - tout ce qui n'est pas traite par le pipeline Document Intelligence). Chunking + vectorisation via text-embedding-3-large (managed identity). Injecte clientId (defense in depth).",
   "skills": [
     {
       "@odata.type": "#Microsoft.Skills.Text.SplitSkill",

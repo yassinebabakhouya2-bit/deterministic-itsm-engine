@@ -13,7 +13,7 @@ param(
   [string]$ResourceGroup  = "rg-knowledgeengine-v9",
   [string]$StorageAccount = "stknowledgeengine2v9",
   [string]$SubscriptionId,
-  [string]$ApiVersion     = "2024-07-01"
+  [string]$ApiVersion     = "2026-04-01"   # >= requis pour #Microsoft.Skills.Util.DocumentIntelligenceLayoutSkill + AIServicesByIdentity
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,12 +40,20 @@ function Put-Resource($collection, $name, $templateFile) {
 }
 
 Write-Host "Deploying the pipeline for client '$ClientId' on $endpoint ..."
-Put-Resource "datasources" "ds-$ClientId"  "datasource.template.json"
-Put-Resource "indexes"     "idx-$ClientId" "index.template.json"
-Put-Resource "skillsets"   "ss-$ClientId"  "skillset.template.json"
-Put-Resource "indexers"    "ix-$ClientId"  "indexer.template.json"
+Put-Resource "datasources" "ds-$ClientId"     "datasource.template.json"
+Put-Resource "indexes"     "idx-$ClientId"    "index.template.json"
+# Two skillsets / two indexers sharing the same datasource + the same target index:
+#  - "-di"   : Document Intelligence Layout (PDF/DOCX/XLSX/PPTX/HTML/images) - text + tables.
+#  - "-text" : native text pipeline (everything DI does not support: .md, .txt, .csv, .json, ...).
+# The indexer-level indexedFileNameExtensions / excludedFileNameExtensions filters make the
+# split mutually exclusive, so every blob is processed by exactly one of the two pipelines.
+Put-Resource "skillsets"   "ss-$ClientId-di"   "skillset-di.template.json"
+Put-Resource "skillsets"   "ss-$ClientId-text" "skillset.template.json"
+Put-Resource "indexers"    "ix-$ClientId-di"   "indexer-di.template.json"
+Put-Resource "indexers"    "ix-$ClientId-text" "indexer.template.json"
 
 Write-Host ""
-Write-Host "Pipeline '$ClientId' deployed. Indexer 'ix-$ClientId' starts automatically"
-Write-Host "and indexes the blobs from kb-$ClientId into the dedicated index idx-$ClientId."
+Write-Host "Pipeline '$ClientId' deployed. Indexers 'ix-$ClientId-di' and 'ix-$ClientId-text' start"
+Write-Host "automatically and index the blobs from kb-$ClientId into the dedicated index idx-$ClientId"
+Write-Host "(split by file type: DI for PDF/Office/images, native text for the rest)."
 Write-Host "Isolation: each client has ITS OWN index. clientId is also projected (defense in depth)."

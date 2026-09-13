@@ -1,8 +1,8 @@
 {
-  "name": "ix-__CLIENTID__",
-  "description": "Indexer: reads Blob kb-__CLIENTID__, applies the skillset (chunk + embedding + clientId), projects into the dedicated index idx-__CLIENTID__.",
+  "name": "ix-__CLIENTID__-text",
+  "description": "Indexeur TEXTE NATIF : lit Blob kb-__CLIENTID__ (uniquement les formats NON geres par Document Intelligence : .md, .txt, .csv, .json, etc.), applique le skillset texte natif, projette dans l'index dedie idx-__CLIENTID__.",
   "dataSourceName": "ds-__CLIENTID__",
-  "skillsetName": "ss-__CLIENTID__",
+  "skillsetName": "ss-__CLIENTID__-text",
   "targetIndexName": "idx-__CLIENTID__",
   "parameters": {
     "batchSize": 1,
@@ -11,7 +11,8 @@
     "configuration": {
       "dataToExtract": "contentAndMetadata",
       "parsingMode": "default",
-      "indexStorageMetadataOnlyForOversizedDocuments": true
+      "indexStorageMetadataOnlyForOversizedDocuments": true,
+      "excludedFileNameExtensions": ".pdf,.docx,.xlsx,.pptx,.html,.htm,.jpg,.jpeg,.png,.bmp,.tiff,.tif"
     }
   },
   "fieldMappings": [],
