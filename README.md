@@ -112,10 +112,11 @@ Onboarding a new client never touches the engine: a new `config/engine.<client>.
 | Ingestion (SharePoint → Blob) | ✅ Built |
 | Indexing (hybrid Azure AI Search) | ✅ Built |
 | Evaluation (Foundry evaluators, golden datasets) | ✅ Built |
-| Orchestration (Foundry + GPT-4o, primary/annex) | 🔜 Next |
-| Auth & isolation (Entra ID groups, security trimming) | 🔜 Next |
+| Orchestration (Foundry + GPT-4o, primary/annex) | ✅ Built |
+| Web App (demo interface) | ✅ Built |
+| Auth & isolation (Entra ID SSO, multi-tenant, groups, security trimming) | ✅ Built |
+| Copilot Studio agent | 🟢 Planned |
 | Audio (Azure AI Speech) | 🟢 Planned |
-| Web App + Copilot Studio agent | 🟢 Planned |
 | Multimodal images (verbalization + visual embeddings) | 🟢 Planned |
 | Video (Azure Video Indexer) | 🟢 Planned |
 
