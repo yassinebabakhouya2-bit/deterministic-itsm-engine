@@ -73,9 +73,13 @@ PAGE = """
   *{box-sizing:border-box}
   body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
     background:var(--bg);color:var(--txt);line-height:1.5}
-  header{padding:20px 24px;border-bottom:1px solid var(--line)}
+  header{padding:20px 24px;border-bottom:1px solid var(--line);display:flex;
+    align-items:flex-start;justify-content:space-between;gap:16px}
   header h1{margin:0;font-size:1.15rem}
   header p{margin:4px 0 0;color:var(--muted);font-size:.85rem}
+  .logout{flex-shrink:0;color:var(--muted);text-decoration:none;font-size:.85rem;
+    border:1px solid var(--line);border-radius:6px;padding:6px 12px;white-space:nowrap}
+  .logout:hover{color:var(--txt);border-color:var(--accent)}
   main{max-width:720px;margin:0 auto;padding:24px}
   form{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}
   label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}
@@ -103,9 +107,12 @@ PAGE = """
 </head>
 <body>
 <header>
-  <h1>KnowledgeEngine v9 — Assistant support IT</h1>
-  <p>Connecté via Entra ID — le client affiché ci-dessous est déterminé automatiquement
-     par votre organisation, pas choisi librement.</p>
+  <div>
+    <h1>KnowledgeEngine v9 — Assistant support IT</h1>
+    <p>Connecté via Entra ID — le client affiché ci-dessous est déterminé automatiquement
+       par votre organisation, pas choisi librement.</p>
+  </div>
+  <a class="logout" href="/.auth/logout?post_logout_redirect_uri=/">Se déconnecter</a>
 </header>
 <main>
   {% if not allowed_clients %}

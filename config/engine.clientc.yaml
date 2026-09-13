@@ -18,9 +18,10 @@ knowledge:
 
 # Isolation (Jalon 5): tenant match (entraTenantId) always required; group
 # match (entraGroup) required only when the tenant hosts several clients.
+# clientc = Organisation 2, its own external Entra tenant, whole tenant = client
+# (no entraGroup -- every user in this tenant is granted access to clientc).
 access:
-  entraTenantId: "6cdc0a5a-779d-4912-a0b3-455e5fc4d9c6"   # Jalon 5 -- tenant shared by every client hosted here
-  entraGroup: "TODO-group-clientc-objectId"   # to fill in via the portal (Milestone 2)
+  entraTenantId: "7bb131d8-9785-4b78-9f70-92d80b535162"   # Jalon 5 -- external tenant "ClientForDemo" (clientfordemo.onmicrosoft.com)
 
 # Retrieval parameters (axiom A3 — hierarchy)
 retrieval:

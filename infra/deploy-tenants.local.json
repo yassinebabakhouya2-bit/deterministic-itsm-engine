@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "easyAuthAllowedTenantIds": {
+      "value": ["6cdc0a5a-779d-4912-a0b3-455e5fc4d9c6", "7bb131d8-9785-4b78-9f70-92d80b535162"]
+    }
+  }
+}
