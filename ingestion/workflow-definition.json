@@ -2,15 +2,49 @@
   "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
   "contentVersion": "1.0.0.0",
   "parameters": {
-    "siteId": { "type": "string" },
-    "tenantId": { "type": "string" },
-    "appClientId": { "type": "string" },
-    "keyVaultName": { "type": "string" },
-    "secretName": { "type": "string" },
-    "storageAccountName": { "type": "string" },
-    "containerName": { "type": "string" },
-    "clientId": { "type": "string" },
-    "listQuery": { "type": "string", "defaultValue": "" }
+    "siteId": {
+      "type": "string"
+    },
+    "tenantId": {
+      "type": "string"
+    },
+    "appClientId": {
+      "type": "string"
+    },
+    "keyVaultName": {
+      "type": "string"
+    },
+    "secretName": {
+      "type": "string"
+    },
+    "storageAccountName": {
+      "type": "string"
+    },
+    "containerName": {
+      "type": "string"
+    },
+    "audioContainerName": {
+      "type": "string"
+    },
+    "audioExtensions": {
+      "type": "array",
+      "defaultValue": [
+        "wav",
+        "mp3",
+        "m4a",
+        "aac",
+        "flac",
+        "ogg",
+        "wma"
+      ]
+    },
+    "clientId": {
+      "type": "string"
+    },
+    "listQuery": {
+      "type": "string",
+      "defaultValue": ""
+    }
   },
   "triggers": {
     "Recurrence": {
@@ -45,29 +79,43 @@
         "body": "@{concat('client_id=', parameters('appClientId'), '&scope=https://graph.microsoft.com/.default&client_secret=', body('Get_secret')?['value'], '&grant_type=client_credentials')}"
       },
       "runAfter": {
-        "Get_secret": ["Succeeded"]
+        "Get_secret": [
+          "Succeeded"
+        ]
       }
     },
     "Initialize_allFiles": {
       "type": "InitializeVariable",
       "inputs": {
         "variables": [
-          { "name": "allFiles", "type": "array", "value": [] }
+          {
+            "name": "allFiles",
+            "type": "array",
+            "value": []
+          }
         ]
       },
       "runAfter": {
-        "Get_token": ["Succeeded"]
+        "Get_token": [
+          "Succeeded"
+        ]
       }
     },
     "Initialize_mergedFiles": {
       "type": "InitializeVariable",
       "inputs": {
         "variables": [
-          { "name": "mergedFiles", "type": "array", "value": [] }
+          {
+            "name": "mergedFiles",
+            "type": "array",
+            "value": []
+          }
         ]
       },
       "runAfter": {
-        "Initialize_allFiles": ["Succeeded"]
+        "Initialize_allFiles": [
+          "Succeeded"
+        ]
       }
     },
     "Initialize_nextUrl": {
@@ -77,18 +125,23 @@
           {
             "name": "nextUrl",
             "type": "string",
-            "value": "@{concat('https://graph.microsoft.com/v1.0/sites/', parameters('siteId'), '/drive/root/children', parameters('listQuery'))}"
+            "value": "@{concat('https://graph.microsoft.com/v1.0/sites/', parameters('siteId'), '/drive/root/delta', parameters('listQuery'))}"
           }
         ]
       },
       "runAfter": {
-        "Initialize_mergedFiles": ["Succeeded"]
+        "Initialize_mergedFiles": [
+          "Succeeded"
+        ]
       }
     },
     "List_files_loop": {
       "type": "Until",
       "expression": "@equals(variables('nextUrl'), '')",
-      "limit": { "count": 60, "timeout": "PT1H" },
+      "limit": {
+        "count": 60,
+        "timeout": "PT1H"
+      },
       "actions": {
         "List_files_page": {
           "type": "Http",
@@ -108,7 +161,9 @@
             "value": "@union(variables('allFiles'), body('List_files_page')?['value'])"
           },
           "runAfter": {
-            "List_files_page": ["Succeeded"]
+            "List_files_page": [
+              "Succeeded"
+            ]
           }
         },
         "Update_allFiles": {
@@ -118,7 +173,9 @@
             "value": "@variables('mergedFiles')"
           },
           "runAfter": {
-            "Merge_files": ["Succeeded"]
+            "Merge_files": [
+              "Succeeded"
+            ]
           }
         },
         "Update_nextUrl": {
@@ -128,18 +185,66 @@
             "value": "@{if(equals(body('List_files_page')?['@odata.nextLink'], null), '', body('List_files_page')?['@odata.nextLink'])}"
           },
           "runAfter": {
-            "Update_allFiles": ["Succeeded"]
+            "Update_allFiles": [
+              "Succeeded"
+            ]
           }
         }
       },
       "runAfter": {
-        "Initialize_nextUrl": ["Succeeded"]
+        "Initialize_nextUrl": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Filter_out_folders": {
+      "type": "Query",
+      "inputs": {
+        "from": "@variables('allFiles')",
+        "where": "@equals(item()?['folder'], null)"
+      },
+      "runAfter": {
+        "List_files_loop": [
+          "Succeeded"
+        ]
       }
     },
     "For_each": {
       "type": "Foreach",
-      "foreach": "@variables('allFiles')",
+      "foreach": "@body('Filter_out_folders')",
       "actions": {
+        "Compose_parentPath": {
+          "type": "Compose",
+          "inputs": "@{items('For_each')?['parentReference']?['path']}",
+          "runAfter": {}
+        },
+        "Compose_relativeFolder": {
+          "type": "Compose",
+          "inputs": "@{if(greater(length(outputs('Compose_parentPath')), add(indexOf(outputs('Compose_parentPath'), ':'), 2)), substring(outputs('Compose_parentPath'), add(indexOf(outputs('Compose_parentPath'), ':'), 2)), '')}",
+          "runAfter": {
+            "Compose_parentPath": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_blobName": {
+          "type": "Compose",
+          "inputs": "@{if(equals(outputs('Compose_relativeFolder'), ''), items('For_each')?['name'], concat(outputs('Compose_relativeFolder'), '/', items('For_each')?['name']))}",
+          "runAfter": {
+            "Compose_relativeFolder": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_extension": {
+          "type": "Compose",
+          "inputs": "@{toLower(last(split(items('For_each')?['name'], '.')))}",
+          "runAfter": {
+            "Compose_blobName": [
+              "Succeeded"
+            ]
+          }
+        },
         "Get_download_url": {
           "type": "Http",
           "inputs": {
@@ -149,7 +254,11 @@
               "Authorization": "@{concat('Bearer ', body('Get_token')?['access_token'])}"
             }
           },
-          "runAfter": {}
+          "runAfter": {
+            "Compose_extension": [
+              "Succeeded"
+            ]
+          }
         },
         "Download_content": {
           "type": "Http",
@@ -158,33 +267,78 @@
             "uri": "@{body('Get_download_url')?['@microsoft.graph.downloadUrl']}"
           },
           "runAfter": {
-            "Get_download_url": ["Succeeded"]
+            "Get_download_url": [
+              "Succeeded"
+            ]
           }
         },
-        "Write_blob": {
-          "type": "Http",
-          "inputs": {
-            "method": "PUT",
-            "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', items('For_each')?['name'])}",
-            "headers": {
-              "x-ms-blob-type": "BlockBlob",
-              "x-ms-version": "2021-08-06",
-              "Content-Type": "application/octet-stream",
-              "x-ms-meta-clientid": "@{parameters('clientId')}"
-            },
-            "body": "@body('Download_content')",
-            "authentication": {
-              "type": "ManagedServiceIdentity",
-              "audience": "https://storage.azure.com"
+        "Condition_is_audio": {
+          "type": "If",
+          "expression": {
+            "and": [
+              {
+                "contains": [
+                  "@parameters('audioExtensions')",
+                  "@outputs('Compose_extension')"
+                ]
+              }
+            ]
+          },
+          "actions": {
+            "Write_blob_audio": {
+              "type": "Http",
+              "inputs": {
+                "method": "PUT",
+                "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '/', outputs('Compose_blobName'))}",
+                "headers": {
+                  "x-ms-blob-type": "BlockBlob",
+                  "x-ms-version": "2021-08-06",
+                  "Content-Type": "application/octet-stream",
+                  "x-ms-meta-clientid": "@{parameters('clientId')}"
+                },
+                "body": "@body('Download_content')",
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://storage.azure.com"
+                }
+              },
+              "runAfter": {}
+            }
+          },
+          "else": {
+            "actions": {
+              "Write_blob_doc": {
+                "type": "Http",
+                "inputs": {
+                  "method": "PUT",
+                  "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', outputs('Compose_blobName'))}",
+                  "headers": {
+                    "x-ms-blob-type": "BlockBlob",
+                    "x-ms-version": "2021-08-06",
+                    "Content-Type": "application/octet-stream",
+                    "x-ms-meta-clientid": "@{parameters('clientId')}"
+                  },
+                  "body": "@body('Download_content')",
+                  "authentication": {
+                    "type": "ManagedServiceIdentity",
+                    "audience": "https://storage.azure.com"
+                  }
+                },
+                "runAfter": {}
+              }
             }
           },
           "runAfter": {
-            "Download_content": ["Succeeded"]
+            "Download_content": [
+              "Succeeded"
+            ]
           }
         }
       },
       "runAfter": {
-        "List_files_loop": ["Succeeded"]
+        "Filter_out_folders": [
+          "Succeeded"
+        ]
       }
     }
   },

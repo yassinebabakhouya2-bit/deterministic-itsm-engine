@@ -7,6 +7,16 @@
 // Reproducible & parameterized → same template deployed once per client,
 // matching axiom A2 (client-agnosticism): onboarding a new client is a
 // new parameters file, never a template change.
+//
+// UPDATED 2026-09-13 (Jalon 7 - Audio): the file listing now walks the
+// SharePoint drive recursively (/delta instead of /children, see
+// workflow-definition.json) and routes each discovered file by extension —
+// audio files go to `audioContainerName` (new), everything else keeps
+// going to `containerName` exactly as before. Blob names now preserve the
+// full relative folder path instead of just the file name — this is a
+// no-op for a file already at the drive root ([CLIENT-PARENT]/[CLIENT-PROD] today), and only
+// changes behavior for files in subfolders (newly discovered thanks to the
+// recursive walk).
 // =====================================================================
 
 @description('Client identifier, matching config/engine.<clientCode>.yaml (e.g. "clienta")')
@@ -15,8 +25,11 @@ param clientCode string
 @description('Full SharePoint site ID (format: hostname,siteCollectionId,webId)')
 param siteId string
 
-@description('Destination Blob container name')
+@description('Destination Blob container name for non-audio documents')
 param containerName string = 'kb-${clientCode}'
+
+@description('Destination Blob container name for audio files discovered anywhere in the site (Jalon 7)')
+param audioContainerName string = 'audio-raw-${clientCode}'
 
 @description('Additional query string on the Graph listing call. Empty in production; "?$top=1" to smoke-test with a single file before a full ingestion.')
 param listQuery string = ''
@@ -68,11 +81,21 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
       secretName: { value: secretName }
       storageAccountName: { value: storageAccountName }
       containerName: { value: containerName }
+      audioContainerName: { value: audioContainerName }
       clientId: { value: clientCode }
       listQuery: { value: listQuery }
     }
   }
 }
+
+// Storage RBAC (Storage Blob Data Contributor) is granted at the STORAGE
+// ACCOUNT scope below, not per-container — so the new audioContainerName
+// needs no additional role assignment, provided the container itself
+// exists before the Logic App's first run (create it once, e.g.
+// `az storage container create --name audio-raw-<client> --account-name
+// stknowledgeengine2v9 --auth-mode login`, or let the PUT blob call create
+// it implicitly — Azure Blob Storage does NOT auto-create containers on
+// PUT blob, so create it explicitly first).
 
 resource kvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (createRoleAssignments) {
   name: guid(keyVault.id, logicAppName, keyVaultSecretsUserRoleId)
