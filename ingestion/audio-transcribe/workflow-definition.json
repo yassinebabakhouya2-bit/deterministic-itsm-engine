@@ -1,0 +1,641 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "storageAccountName": { "type": "string" },
+    "audioContainerName": { "type": "string" },
+    "containerName": { "type": "string" },
+    "clientId": { "type": "string" },
+    "keyVaultName": { "type": "string" },
+    "speechSecretName": { "type": "string", "defaultValue": "speech-key" },
+    "speechEndpoint": { "type": "string" },
+    "speechApiVersion": { "type": "string", "defaultValue": "2024-11-15" },
+    "locale": { "type": "string", "defaultValue": "fr-FR" },
+    "subscriptionId": { "type": "string" },
+    "resourceGroupName": { "type": "string" },
+    "pollIntervalSeconds": { "type": "int", "defaultValue": 10 },
+    "pollMaxAttempts": { "type": "int", "defaultValue": 60 }
+  },
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1
+      }
+    }
+  },
+  "actions": {
+    "Get_speech_secret": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('keyVaultName'), '.vault.azure.net/secrets/', parameters('speechSecretName'), '?api-version=7.4')}",
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://vault.azure.net"
+        }
+      },
+      "runAfter": {}
+    },
+    "Initialize_marker": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "marker", "type": "string", "value": "" }
+        ]
+      },
+      "runAfter": {
+        "Get_speech_secret": ["Succeeded"]
+      }
+    },
+    "Initialize_blobItems": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "blobItems", "type": "array", "value": [] }
+        ]
+      },
+      "runAfter": {
+        "Initialize_marker": ["Succeeded"]
+      }
+    },
+    "Initialize_mergedBlobItems": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "mergedBlobItems", "type": "array", "value": [] }
+        ]
+      },
+      "runAfter": {
+        "Initialize_blobItems": ["Succeeded"]
+      }
+    },
+    "Initialize_pollStatus": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "pollStatus", "type": "string", "value": "" }
+        ]
+      },
+      "runAfter": {
+        "Initialize_mergedBlobItems": ["Succeeded"]
+      }
+    },
+    "Initialize_mergeIdx0": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "mergeIdx0", "type": "integer", "value": 0 }
+        ]
+      },
+      "runAfter": {
+        "Initialize_pollStatus": ["Succeeded"]
+      }
+    },
+    "Initialize_mergeIdx1": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "mergeIdx1", "type": "integer", "value": 0 }
+        ]
+      },
+      "runAfter": {
+        "Initialize_mergeIdx0": ["Succeeded"]
+      }
+    },
+    "Initialize_mergedLines": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          { "name": "mergedLines", "type": "array", "value": [] }
+        ]
+      },
+      "runAfter": {
+        "Initialize_mergeIdx1": ["Succeeded"]
+      }
+    },
+    "List_blobs_loop": {
+      "type": "Until",
+      "expression": "@equals(variables('marker'), '')",
+      "limit": { "count": 60, "timeout": "PT1H" },
+      "actions": {
+        "List_blobs_page": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '?restype=container&comp=list&include=metadata', if(equals(variables('marker'), ''), '', concat('&marker=', variables('marker'))))}",
+            "headers": {
+              "x-ms-version": "2021-08-06"
+            },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            }
+          },
+          "runAfter": {}
+        },
+        "Compose_xmlDoc": {
+          "type": "Compose",
+          "inputs": "@xml(body('List_blobs_page'))",
+          "runAfter": {
+            "List_blobs_page": ["Succeeded"]
+          }
+        },
+        "Compose_blobsJson": {
+          "type": "Compose",
+          "inputs": "@json(outputs('Compose_xmlDoc'))?['EnumerationResults']?['Blobs']?['Blob']",
+          "runAfter": {
+            "Compose_xmlDoc": ["Succeeded"]
+          }
+        },
+        "Select_blobInfo": {
+          "type": "Select",
+          "inputs": {
+            "from": "@outputs('Compose_blobsJson')",
+            "select": {
+              "name": "@item()?['Name']",
+              "transcribed": "@item()?['Metadata']?['transcribed']"
+            }
+          },
+          "runAfter": {
+            "Compose_blobsJson": ["Succeeded"]
+          }
+        },
+        "Merge_blobItems": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "mergedBlobItems",
+            "value": "@union(variables('blobItems'), body('Select_blobInfo'))"
+          },
+          "runAfter": {
+            "Select_blobInfo": ["Succeeded"]
+          }
+        },
+        "Update_blobItems": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "blobItems",
+            "value": "@variables('mergedBlobItems')"
+          },
+          "runAfter": {
+            "Merge_blobItems": ["Succeeded"]
+          }
+        },
+        "Compose_nextMarker": {
+          "type": "Compose",
+          "inputs": "@xpath(outputs('Compose_xmlDoc'), 'string(/EnumerationResults/NextMarker)')",
+          "runAfter": {
+            "Update_blobItems": ["Succeeded"]
+          }
+        },
+        "Update_marker": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "marker",
+            "value": "@outputs('Compose_nextMarker')"
+          },
+          "runAfter": {
+            "Compose_nextMarker": ["Succeeded"]
+          }
+        }
+      },
+      "runAfter": {
+        "Initialize_mergedLines": ["Succeeded"]
+      }
+    },
+    "Filter_untranscribed": {
+      "type": "Query",
+      "inputs": {
+        "from": "@variables('blobItems')",
+        "where": "@not(equals(item()?['transcribed'], 'true'))"
+      },
+      "runAfter": {
+        "List_blobs_loop": ["Succeeded"]
+      }
+    },
+    "For_each_blob": {
+      "type": "Foreach",
+      "foreach": "@body('Filter_untranscribed')",
+      "runtimeConfiguration": {
+        "concurrency": { "repetitions": 1 }
+      },
+      "actions": {
+        "Compose_blobName": {
+          "type": "Compose",
+          "inputs": "@items('For_each_blob')?['name']",
+          "runAfter": {}
+        },
+        "Select_encodedSegments": {
+          "type": "Select",
+          "inputs": {
+            "from": "@split(outputs('Compose_blobName'), '/')",
+            "select": "@uriComponent(item())"
+          },
+          "runAfter": {
+            "Compose_blobName": ["Succeeded"]
+          }
+        },
+        "Compose_encodedPath": {
+          "type": "Compose",
+          "inputs": "@join(body('Select_encodedSegments'), '/')",
+          "runAfter": {
+            "Select_encodedSegments": ["Succeeded"]
+          }
+        },
+        "Compose_canonicalResource": {
+          "type": "Compose",
+          "inputs": "@{concat('/blob/', parameters('storageAccountName'), '/', parameters('audioContainerName'), '/', outputs('Compose_blobName'))}",
+          "runAfter": {
+            "Compose_encodedPath": ["Succeeded"]
+          }
+        },
+        "Get_sas": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat('https://management.azure.com/subscriptions/', parameters('subscriptionId'), '/resourceGroups/', parameters('resourceGroupName'), '/providers/Microsoft.Storage/storageAccounts/', parameters('storageAccountName'), '/ListServiceSas?api-version=2023-05-01')}",
+            "headers": {
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "canonicalizedResource": "@outputs('Compose_canonicalResource')",
+              "signedResource": "b",
+              "signedPermission": "r",
+              "signedProtocol": "https",
+              "signedExpiry": "@{addHours(utcNow(), 2)}",
+              "keyToSign": "key1"
+            },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://management.azure.com/"
+            }
+          },
+          "runAfter": {
+            "Compose_canonicalResource": ["Succeeded"]
+          }
+        },
+        "Compose_blobReadUrl": {
+          "type": "Compose",
+          "inputs": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '/', outputs('Compose_encodedPath'), '?', body('Get_sas')?['serviceSasToken'])}",
+          "runAfter": {
+            "Get_sas": ["Succeeded"]
+          }
+        },
+        "Submit_transcription": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat(parameters('speechEndpoint'), '/speechtotext/transcriptions:submit?api-version=', parameters('speechApiVersion'))}",
+            "headers": {
+              "Ocp-Apim-Subscription-Key": "@{body('Get_speech_secret')?['value']}",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "contentUrls": ["@outputs('Compose_blobReadUrl')"],
+              "locale": "@parameters('locale')",
+              "displayName": "@outputs('Compose_blobName')",
+              "properties": {
+                "channels": [0, 1],
+                "timeToLiveHours": 6
+              }
+            }
+          },
+          "runAfter": {
+            "Compose_blobReadUrl": ["Succeeded"]
+          }
+        },
+        "Compose_jobUrl": {
+          "type": "Compose",
+          "inputs": "@body('Submit_transcription')?['self']",
+          "runAfter": {
+            "Submit_transcription": ["Succeeded"]
+          }
+        },
+        "Reset_pollStatus": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "pollStatus",
+            "value": ""
+          },
+          "runAfter": {
+            "Compose_jobUrl": ["Succeeded"]
+          }
+        },
+        "Poll_until_done": {
+          "type": "Until",
+          "expression": "@or(equals(variables('pollStatus'), 'Succeeded'), equals(variables('pollStatus'), 'Failed'))",
+          "limit": { "count": 60, "timeout": "PT2H" },
+          "actions": {
+            "Wait_before_check": {
+              "type": "Wait",
+              "inputs": {
+                "interval": {
+                  "unit": "Second",
+                  "count": "@parameters('pollIntervalSeconds')"
+                }
+              },
+              "runAfter": {}
+            },
+            "Check_status": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{concat(outputs('Compose_jobUrl'), '&_cb=', string(ticks(utcNow())))}",
+                "headers": {
+                  "Ocp-Apim-Subscription-Key": "@{body('Get_speech_secret')?['value']}",
+                  "Cache-Control": "no-cache",
+                  "Pragma": "no-cache"
+                }
+              },
+              "runAfter": {
+                "Wait_before_check": ["Succeeded"]
+              }
+            },
+            "Update_pollStatus": {
+              "type": "SetVariable",
+              "inputs": {
+                "name": "pollStatus",
+                "value": "@{body('Check_status')?['status']}"
+              },
+              "runAfter": {
+                "Check_status": ["Succeeded"]
+              }
+            }
+          },
+          "runAfter": {
+            "Reset_pollStatus": ["Succeeded"]
+          }
+        },
+        "Condition_transcription_succeeded": {
+          "type": "If",
+          "expression": {
+            "and": [
+              { "equals": ["@variables('pollStatus')", "Succeeded"] }
+            ]
+          },
+          "actions": {
+            "Compose_transcriptionId": {
+              "type": "Compose",
+              "inputs": "@{first(split(last(split(outputs('Compose_jobUrl'), '/transcriptions/')), '?'))}",
+              "runAfter": {}
+            },
+            "Get_transcription_files": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{concat(parameters('speechEndpoint'), '/speechtotext/transcriptions/', outputs('Compose_transcriptionId'), '/files?api-version=', parameters('speechApiVersion'))}",
+                "headers": {
+                  "Ocp-Apim-Subscription-Key": "@{body('Get_speech_secret')?['value']}"
+                }
+              },
+              "runAfter": {
+                "Compose_transcriptionId": ["Succeeded"]
+              }
+            },
+            "Filter_transcription_file": {
+              "type": "Query",
+              "inputs": {
+                "from": "@body('Get_transcription_files')?['values']",
+                "where": "@equals(item()?['kind'], 'Transcription')"
+              },
+              "runAfter": {
+                "Get_transcription_files": ["Succeeded"]
+              }
+            },
+            "Get_transcription_json": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{body('Filter_transcription_file')[0]?['links']?['contentUrl']}"
+              },
+              "runAfter": {
+                "Filter_transcription_file": ["Succeeded"]
+              }
+            },
+            "Filter_channel0": {
+              "type": "Query",
+              "inputs": {
+                "from": "@body('Get_transcription_json')?['recognizedPhrases']",
+                "where": "@equals(item()?['channel'], 0)"
+              },
+              "runAfter": {
+                "Get_transcription_json": ["Succeeded"]
+              }
+            },
+            "Filter_channel1": {
+              "type": "Query",
+              "inputs": {
+                "from": "@body('Get_transcription_json')?['recognizedPhrases']",
+                "where": "@equals(item()?['channel'], 1)"
+              },
+              "runAfter": {
+                "Get_transcription_json": ["Succeeded"]
+              }
+            },
+            "Reset_mergeIdx0": {
+              "type": "SetVariable",
+              "inputs": { "name": "mergeIdx0", "value": 0 },
+              "runAfter": {
+                "Filter_channel0": ["Succeeded"],
+                "Filter_channel1": ["Succeeded"]
+              }
+            },
+            "Reset_mergeIdx1": {
+              "type": "SetVariable",
+              "inputs": { "name": "mergeIdx1", "value": 0 },
+              "runAfter": {
+                "Reset_mergeIdx0": ["Succeeded"]
+              }
+            },
+            "Reset_mergedLines": {
+              "type": "SetVariable",
+              "inputs": { "name": "mergedLines", "value": [] },
+              "runAfter": {
+                "Reset_mergeIdx1": ["Succeeded"]
+              }
+            },
+            "Merge_channels_loop": {
+              "type": "Until",
+              "expression": "@and(greaterOrEquals(variables('mergeIdx0'), length(body('Filter_channel0'))), greaterOrEquals(variables('mergeIdx1'), length(body('Filter_channel1'))))",
+              "limit": { "count": 2000, "timeout": "PT1H" },
+              "actions": {
+                "Condition_channel0_exhausted": {
+                  "type": "If",
+                  "expression": {
+                    "and": [
+                      { "greaterOrEquals": ["@variables('mergeIdx0')", "@length(body('Filter_channel0'))"] }
+                    ]
+                  },
+                  "actions": {
+                    "AppendToArrayVariable_channel1_only": {
+                      "type": "AppendToArrayVariable",
+                      "inputs": {
+                        "name": "mergedLines",
+                        "value": "@{concat('Canal 1: ', body('Filter_channel1')[variables('mergeIdx1')]?['nBest'][0]?['display'])}"
+                      },
+                      "runAfter": {}
+                    },
+                    "Increment_mergeIdx1_only": {
+                      "type": "IncrementVariable",
+                      "inputs": { "name": "mergeIdx1", "value": 1 },
+                      "runAfter": {
+                        "AppendToArrayVariable_channel1_only": ["Succeeded"]
+                      }
+                    }
+                  },
+                  "else": {
+                    "actions": {
+                      "Condition_channel1_exhausted": {
+                        "type": "If",
+                        "expression": {
+                          "and": [
+                            { "greaterOrEquals": ["@variables('mergeIdx1')", "@length(body('Filter_channel1'))"] }
+                          ]
+                        },
+                        "actions": {
+                          "AppendToArrayVariable_channel0_only": {
+                            "type": "AppendToArrayVariable",
+                            "inputs": {
+                              "name": "mergedLines",
+                              "value": "@{concat('Canal 0: ', body('Filter_channel0')[variables('mergeIdx0')]?['nBest'][0]?['display'])}"
+                            },
+                            "runAfter": {}
+                          },
+                          "Increment_mergeIdx0_only": {
+                            "type": "IncrementVariable",
+                            "inputs": { "name": "mergeIdx0", "value": 1 },
+                            "runAfter": {
+                              "AppendToArrayVariable_channel0_only": ["Succeeded"]
+                            }
+                          }
+                        },
+                        "else": {
+                          "actions": {
+                            "Condition_channel0_earlier": {
+                              "type": "If",
+                              "expression": {
+                                "and": [
+                                  { "lessOrEquals": ["@body('Filter_channel0')[variables('mergeIdx0')]?['offsetInTicks']", "@body('Filter_channel1')[variables('mergeIdx1')]?['offsetInTicks']"] }
+                                ]
+                              },
+                              "actions": {
+                                "AppendToArrayVariable_channel0_both": {
+                                  "type": "AppendToArrayVariable",
+                                  "inputs": {
+                                    "name": "mergedLines",
+                                    "value": "@{concat('Canal 0: ', body('Filter_channel0')[variables('mergeIdx0')]?['nBest'][0]?['display'])}"
+                                  },
+                                  "runAfter": {}
+                                },
+                                "Increment_mergeIdx0_both": {
+                                  "type": "IncrementVariable",
+                                  "inputs": { "name": "mergeIdx0", "value": 1 },
+                                  "runAfter": {
+                                    "AppendToArrayVariable_channel0_both": ["Succeeded"]
+                                  }
+                                }
+                              },
+                              "else": {
+                                "actions": {
+                                  "AppendToArrayVariable_channel1_both": {
+                                    "type": "AppendToArrayVariable",
+                                    "inputs": {
+                                      "name": "mergedLines",
+                                      "value": "@{concat('Canal 1: ', body('Filter_channel1')[variables('mergeIdx1')]?['nBest'][0]?['display'])}"
+                                    },
+                                    "runAfter": {}
+                                  },
+                                  "Increment_mergeIdx1_both": {
+                                    "type": "IncrementVariable",
+                                    "inputs": { "name": "mergeIdx1", "value": 1 },
+                                    "runAfter": {
+                                      "AppendToArrayVariable_channel1_both": ["Succeeded"]
+                                    }
+                                  }
+                                }
+                              },
+                              "runAfter": {}
+                            }
+                          }
+                        },
+                        "runAfter": {}
+                      }
+                    }
+                  },
+                  "runAfter": {}
+                }
+              },
+              "runAfter": {
+                "Reset_mergedLines": ["Succeeded"]
+              }
+            },
+            "Compose_transcriptText": {
+              "type": "Compose",
+              "inputs": "@{concat('Fichier source: ', outputs('Compose_blobName'), decodeUriComponent('%0A%0A'), join(variables('mergedLines'), decodeUriComponent('%0A')))}",
+              "runAfter": {
+                "Merge_channels_loop": ["Succeeded"]
+              }
+            },
+            "Compose_txtBlobName": {
+              "type": "Compose",
+              "inputs": "@{concat(substring(outputs('Compose_blobName'), 0, lastIndexOf(outputs('Compose_blobName'), '.')), '.txt')}",
+              "runAfter": {
+                "Compose_transcriptText": ["Succeeded"]
+              }
+            },
+            "Write_transcript_blob": {
+              "type": "Http",
+              "inputs": {
+                "method": "PUT",
+                "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', outputs('Compose_txtBlobName'))}",
+                "headers": {
+                  "x-ms-blob-type": "BlockBlob",
+                  "x-ms-version": "2021-08-06",
+                  "Content-Type": "text/plain; charset=utf-8",
+                  "x-ms-meta-clientid": "@{parameters('clientId')}"
+                },
+                "body": "@outputs('Compose_transcriptText')",
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://storage.azure.com"
+                }
+              },
+              "runAfter": {
+                "Compose_txtBlobName": ["Succeeded"]
+              }
+            },
+            "Mark_transcribed": {
+              "type": "Http",
+              "inputs": {
+                "method": "PUT",
+                "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '/', outputs('Compose_encodedPath'), '?comp=metadata')}",
+                "headers": {
+                  "x-ms-version": "2021-08-06",
+                  "x-ms-meta-transcribed": "true"
+                },
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://storage.azure.com"
+                }
+              },
+              "runAfter": {
+                "Write_transcript_blob": ["Succeeded"]
+              }
+            }
+          },
+          "else": {
+            "actions": {}
+          },
+          "runAfter": {
+            "Poll_until_done": ["Succeeded"]
+          }
+        }
+      },
+      "runAfter": {
+        "Filter_untranscribed": ["Succeeded"]
+      }
+    }
+  },
+  "outputs": {}
+}
