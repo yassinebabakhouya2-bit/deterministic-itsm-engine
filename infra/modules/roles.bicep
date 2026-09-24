@@ -23,6 +23,7 @@ param webAppPrincipalId string
 var storageBlobDataReader = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var cognitiveServicesOpenAIUser = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
 var searchIndexDataReader = '1407120a-92aa-4202-b7e9-c0e197c71c8f' // query-only, not admin
+var storageTableDataContributor = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3' // Jalon 7+, 2026-09-18 -- saved conversations (convindex/convturns tables)
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName
@@ -78,6 +79,21 @@ resource webAppToFoundry 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
   scope: foundry
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesOpenAIUser)
+    principalId: webAppPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Web App -> read/write its own conversation tables (Jalon 7+, 2026-09-18 --
+// sidebar of saved conversations: convindex + convturns in the same storage
+// account as the KB containers, created lazily by app/app.py at startup).
+// Data-plane only, scoped to the storage account like webAppToStorage used
+// to be for Blob -- no admin/management access.
+resource webAppToStorageTables 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, webAppPrincipalId, storageTableDataContributor)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageTableDataContributor)
     principalId: webAppPrincipalId
     principalType: 'ServicePrincipal'
   }
