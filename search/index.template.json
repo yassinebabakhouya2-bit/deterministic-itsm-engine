@@ -1,16 +1,174 @@
 {
   "name": "idx-__CLIENTID__",
   "fields": [
-    { "name": "chunk_id", "type": "Edm.String", "key": true, "searchable": true, "filterable": false, "sortable": true, "facetable": false, "analyzer": "keyword" },
-    { "name": "parent_id", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
-    { "name": "clientId", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": true, "retrievable": true },
-    { "name": "title", "type": "Edm.String", "searchable": true, "filterable": false, "retrievable": true },
-    { "name": "chunk", "type": "Edm.String", "searchable": true, "filterable": false, "retrievable": true },
-    { "name": "text_vector", "type": "Collection(Edm.Single)", "searchable": true, "retrievable": false, "dimensions": 3072, "vectorSearchProfile": "vec-profile" }
+    {
+      "name": "chunk_id",
+      "type": "Edm.String",
+      "key": true,
+      "searchable": true,
+      "filterable": false,
+      "sortable": true,
+      "facetable": false,
+      "analyzer": "keyword"
+    },
+    {
+      "name": "parent_id",
+      "type": "Edm.String",
+      "searchable": false,
+      "filterable": true,
+      "sortable": false,
+      "facetable": false,
+      "retrievable": true
+    },
+    {
+      "name": "clientId",
+      "type": "Edm.String",
+      "searchable": false,
+      "filterable": true,
+      "sortable": false,
+      "facetable": true,
+      "retrievable": true
+    },
+    {
+      "name": "title",
+      "type": "Edm.String",
+      "searchable": true,
+      "filterable": false,
+      "retrievable": true,
+      "synonymMaps": [
+        "syn-clienta"
+      ]
+    },
+    {
+      "name": "chunk",
+      "type": "Edm.String",
+      "searchable": true,
+      "filterable": false,
+      "retrievable": true,
+      "synonymMaps": [
+        "syn-clienta"
+      ]
+    },
+    {
+      "name": "sourceType",
+      "type": "Edm.String",
+      "searchable": false,
+      "filterable": true,
+      "facetable": true,
+      "retrievable": true
+    },
+    {
+      "name": "entities",
+      "type": "Collection(Edm.String)",
+      "searchable": true,
+      "filterable": true,
+      "facetable": true,
+      "retrievable": true
+    },
+    {
+      "name": "entity_types",
+      "type": "Collection(Edm.String)",
+      "searchable": false,
+      "filterable": true,
+      "facetable": true,
+      "retrievable": true
+    },
+    {
+      "name": "aliases",
+      "type": "Collection(Edm.String)",
+      "searchable": false,
+      "filterable": false,
+      "sortable": false,
+      "facetable": false,
+      "retrievable": true
+    },
+    {
+      "name": "linked_kb_ids",
+      "type": "Collection(Edm.String)",
+      "searchable": false,
+      "filterable": true,
+      "facetable": false,
+      "retrievable": true
+    },
+    {
+      "name": "audience",
+      "type": "Edm.String",
+      "searchable": false,
+      "filterable": true,
+      "facetable": true,
+      "retrievable": true
+    },
+    {
+      "name": "call_problem",
+      "type": "Edm.String",
+      "searchable": true,
+      "filterable": false,
+      "retrievable": true
+    },
+    {
+      "name": "call_resolution",
+      "type": "Edm.String",
+      "searchable": true,
+      "filterable": false,
+      "retrievable": true
+    },
+    {
+      "name": "call_outcome",
+      "type": "Edm.String",
+      "searchable": false,
+      "filterable": true,
+      "facetable": true,
+      "retrievable": true
+    },
+    {
+      "name": "image_references",
+      "type": "Collection(Edm.ComplexType)",
+      "fields": [
+        {
+          "name": "image_id",
+          "type": "Edm.String",
+          "searchable": false,
+          "filterable": true,
+          "retrievable": true
+        },
+        {
+          "name": "image_url",
+          "type": "Edm.String",
+          "searchable": false,
+          "filterable": false,
+          "retrievable": true
+        },
+        {
+          "name": "ocr_text",
+          "type": "Edm.String",
+          "searchable": true,
+          "filterable": false,
+          "retrievable": true
+        },
+        {
+          "name": "figure_caption",
+          "type": "Edm.String",
+          "searchable": true,
+          "filterable": false,
+          "retrievable": true
+        }
+      ]
+    },
+    {
+      "name": "text_vector",
+      "type": "Collection(Edm.Single)",
+      "searchable": true,
+      "retrievable": false,
+      "dimensions": 3072,
+      "vectorSearchProfile": "vec-profile"
+    }
   ],
   "vectorSearch": {
     "algorithms": [
-      { "name": "hnsw-1", "kind": "hnsw" }
+      {
+        "name": "hnsw-1",
+        "kind": "hnsw"
+      }
     ],
     "vectorizers": [
       {
@@ -24,7 +182,11 @@
       }
     ],
     "profiles": [
-      { "name": "vec-profile", "algorithm": "hnsw-1", "vectorizer": "aoai-vectorizer" }
+      {
+        "name": "vec-profile",
+        "algorithm": "hnsw-1",
+        "vectorizer": "aoai-vectorizer"
+      }
     ]
   },
   "semantic": {
@@ -32,10 +194,45 @@
       {
         "name": "sem-config",
         "prioritizedFields": {
-          "titleField": { "fieldName": "title" },
-          "prioritizedContentFields": [ { "fieldName": "chunk" } ]
+          "titleField": {
+            "fieldName": "title"
+          },
+          "prioritizedContentFields": [
+            {
+              "fieldName": "chunk"
+            }
+          ],
+          "prioritizedKeywordsFields": [
+            {
+              "fieldName": "entities"
+            }
+          ]
         }
       }
     ]
-  }
+  },
+  "scoringProfiles": [
+    {
+      "name": "entity-boost",
+      "text": {
+        "weights": {
+          "title": 3.0,
+          "entities": 5.0,
+          "chunk": 1.0
+        }
+      },
+      "functions": [
+        {
+          "type": "tag",
+          "fieldName": "entities",
+          "boost": 4.0,
+          "interpolation": "linear",
+          "tag": {
+            "tagsParameter": "queryEntities"
+          }
+        }
+      ],
+      "functionAggregation": "sum"
+    }
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "ss-__CLIENTID__-text",
-  "description": "Pipeline TEXTE NATIF (formats sans mise en page complexe : .md, .txt, .csv, .json, etc. - tout ce qui n'est pas traite par le pipeline Document Intelligence). Chunking + vectorisation via text-embedding-3-large (managed identity). Injecte clientId (defense in depth).",
+  "description": "Pipeline TEXTE NATIF (formats sans mise en page complexe : .md, .txt, .csv, .json, etc. - tout ce qui n'est pas traite par le pipeline Document Intelligence). Chunking + vectorisation via text-embedding-3-large (managed identity). Injecte clientId (defense in depth). Etape 3 : ajoute l'enrichissement semantique (fiches ET transcriptions audio/video, distinguees par sourceType -- meme conteneur, meme indexeur).",
   "skills": [
     {
       "@odata.type": "#Microsoft.Skills.Text.SplitSkill",
@@ -11,10 +11,16 @@
       "maximumPageLength": 2000,
       "pageOverlapLength": 500,
       "inputs": [
-        { "name": "text", "source": "/document/content" }
+        {
+          "name": "text",
+          "source": "/document/content"
+        }
       ],
       "outputs": [
-        { "name": "textItems", "targetName": "pages" }
+        {
+          "name": "textItems",
+          "targetName": "pages"
+        }
       ]
     },
     {
@@ -27,10 +33,76 @@
       "modelName": "text-embedding-3-large",
       "dimensions": 3072,
       "inputs": [
-        { "name": "text", "source": "/document/pages/*" }
+        {
+          "name": "text",
+          "source": "/document/pages/*"
+        }
       ],
       "outputs": [
-        { "name": "embedding", "targetName": "text_vector" }
+        {
+          "name": "embedding",
+          "targetName": "text_vector"
+        }
+      ]
+    },
+    {
+      "@odata.type": "#Microsoft.Skills.Custom.WebApiSkill",
+      "name": "enrich",
+      "description": "Extraction semantique via fn-knowledgeengine2-v9/api/enrich. Contexte document entier (pas par chunk) : le prompt raisonne sur le texte complet, pas un fragment. Un seul point d'entree qui route en interne selon sourceType -- fiche (entites/alias/triplets/audience) ou appel/video (probleme/resolution/issue). Echec = warning, jamais une erreur qui ferait tomber l'indexation (voir enrichment/README.md).",
+      "uri": "https://fn-knowledgeengine2-v9.azurewebsites.net/api/enrich",
+      "httpMethod": "POST",
+      "timeout": "PT90S",
+      "context": "/document",
+      "httpHeaders": {
+        "x-functions-key": "__FN_ENRICH_KEY__"
+      },
+      "inputs": [
+        {
+          "name": "text",
+          "source": "/document/content"
+        },
+        {
+          "name": "title",
+          "source": "/document/metadata_storage_name"
+        },
+        {
+          "name": "clientId",
+          "source": "/document/clientid"
+        },
+        {
+          "name": "sourceType",
+          "source": "/document/sourcetype"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "entities",
+          "targetName": "entities"
+        },
+        {
+          "name": "entity_types",
+          "targetName": "entity_types"
+        },
+        {
+          "name": "aliases",
+          "targetName": "aliases"
+        },
+        {
+          "name": "audience",
+          "targetName": "audience"
+        },
+        {
+          "name": "call_problem",
+          "targetName": "call_problem"
+        },
+        {
+          "name": "call_resolution",
+          "targetName": "call_resolution"
+        },
+        {
+          "name": "call_outcome",
+          "targetName": "call_outcome"
+        }
       ]
     }
   ],
@@ -41,10 +113,54 @@
         "parentKeyFieldName": "parent_id",
         "sourceContext": "/document/pages/*",
         "mappings": [
-          { "name": "chunk", "source": "/document/pages/*" },
-          { "name": "text_vector", "source": "/document/pages/*/text_vector" },
-          { "name": "title", "source": "/document/metadata_storage_name" },
-          { "name": "clientId", "source": "/document/clientid" }
+          {
+            "name": "chunk",
+            "source": "/document/pages/*"
+          },
+          {
+            "name": "text_vector",
+            "source": "/document/pages/*/text_vector"
+          },
+          {
+            "name": "title",
+            "source": "/document/metadata_storage_name"
+          },
+          {
+            "name": "clientId",
+            "source": "/document/clientid"
+          },
+          {
+            "name": "sourceType",
+            "source": "/document/sourcetype"
+          },
+          {
+            "name": "entities",
+            "source": "/document/entities"
+          },
+          {
+            "name": "entity_types",
+            "source": "/document/entity_types"
+          },
+          {
+            "name": "aliases",
+            "source": "/document/aliases"
+          },
+          {
+            "name": "audience",
+            "source": "/document/audience"
+          },
+          {
+            "name": "call_problem",
+            "source": "/document/call_problem"
+          },
+          {
+            "name": "call_resolution",
+            "source": "/document/call_resolution"
+          },
+          {
+            "name": "call_outcome",
+            "source": "/document/call_outcome"
+          }
         ]
       }
     ],
