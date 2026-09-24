@@ -1,40 +1,108 @@
 {
   "name": "ss-__CLIENTID__-di",
-  "description": "Pipeline DOCUMENT INTELLIGENCE (formats a mise en page complexe : .pdf, .docx, .xlsx, .pptx, .html, images). Extraction universelle du texte ET des tableaux + chunking integre + vectorisation via text-embedding-3-large (managed identity). Injecte clientId (defense in depth).",
+  "description": "Pipeline DOCUMENT INTELLIGENCE (formats a mise en page complexe : .pdf, .docx, .xlsx, .pptx, .html, images). Extraction universelle du texte ET des tableaux + chunking integre + vectorisation via text-embedding-3-large (managed identity). Injecte clientId (defense in depth). Etape 3 : ajoute l'enrichissement semantique. Ce pipeline ne traite que des fiches (PDF/Office/images) -- jamais d'appels/videos, qui arrivent en texte brut via le pipeline natif -- donc toujours la branche FICHE.",
   "skills": [
     {
       "@odata.type": "#Microsoft.Skills.Util.DocumentIntelligenceLayoutSkill",
       "name": "layout",
-      "description": "Extrait le contenu structure (texte + tableaux) depuis PDF/Office/images. Chunking integre.",
+      "description": "Extrait le contenu structure (texte + tableaux) depuis PDF/Office/images. Chunking integre. Design note (2026-09-24, Jalon 9): outputFormat=text laissait 'markdown_document' (alors nomme text_sections) absent en projection -- 'Cannot iterate over non-array' -- pour certains documents courts/simples, jamais une erreur d'indexeur (0 error) donc invisible sauf a lire les warnings ; confirme en direct sur KB0320/KB0339/KB0341 (client-s, motif central de la demo), touche aussi bien .docx/.pptx que .pdf. Jamais reellement teste avant : l'essai precedent (markdownHeaderDepth sur client-v) n'avait aucun effet possible, ce parametre n'existant qu'en sortie markdown -- celui-ci bascule reellement vers outputFormat=markdown.",
       "context": "/document",
       "outputMode": "oneToMany",
-      "outputFormat": "text",
-      "chunkingProperties": {
-        "unit": "characters",
-        "maximumLength": 2000,
-        "overlapLength": 500
-      },
+      "outputFormat": "markdown",
+      "markdownHeaderDepth": "h3",
       "inputs": [
-        { "name": "file_data", "source": "/document/file_data" }
+        {
+          "name": "file_data",
+          "source": "/document/file_data"
+        }
       ],
       "outputs": [
-        { "name": "text_sections", "targetName": "text_sections" }
+        {
+          "name": "markdown_document",
+          "targetName": "markdown_document"
+        }
       ]
     },
     {
       "@odata.type": "#Microsoft.Skills.Text.AzureOpenAIEmbeddingSkill",
       "name": "embed",
       "description": "Vectorise chaque chunk",
-      "context": "/document/text_sections/*",
+      "context": "/document/markdown_document/*",
       "resourceUri": "https://aif-knowledgeengine2-v9.openai.azure.com",
       "deploymentId": "text-embedding-3-large",
       "modelName": "text-embedding-3-large",
       "dimensions": 3072,
       "inputs": [
-        { "name": "text", "source": "/document/text_sections/*/content" }
+        {
+          "name": "text",
+          "source": "/document/markdown_document/*/content"
+        }
       ],
       "outputs": [
-        { "name": "embedding", "targetName": "text_vector" }
+        {
+          "name": "embedding",
+          "targetName": "text_vector"
+        }
+      ]
+    },
+    {
+      "@odata.type": "#Microsoft.Skills.Custom.WebApiSkill",
+      "name": "enrich",
+      "description": "Extraction semantique via fn-knowledgeengine2-v9/api/enrich. Contexte document entier (pas par chunk) : le prompt raisonne sur le texte complet, pas un fragment. Un seul point d'entree qui route en interne selon sourceType -- fiche (entites/alias/triplets/audience) ou appel/video (probleme/resolution/issue). Echec = warning, jamais une erreur qui ferait tomber l'indexation (voir enrichment/README.md).",
+      "uri": "https://fn-knowledgeengine2-v9.azurewebsites.net/api/enrich",
+      "httpMethod": "POST",
+      "timeout": "PT90S",
+      "context": "/document",
+      "httpHeaders": {
+        "x-functions-key": "__FN_ENRICH_KEY__"
+      },
+      "inputs": [
+        {
+          "name": "text",
+          "source": "/document/content"
+        },
+        {
+          "name": "title",
+          "source": "/document/metadata_storage_name"
+        },
+        {
+          "name": "clientId",
+          "source": "/document/clientid"
+        },
+        {
+          "name": "sourceType",
+          "source": "/document/sourcetype"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "entities",
+          "targetName": "entities"
+        },
+        {
+          "name": "entity_types",
+          "targetName": "entity_types"
+        },
+        {
+          "name": "aliases",
+          "targetName": "aliases"
+        },
+        {
+          "name": "audience",
+          "targetName": "audience"
+        },
+        {
+          "name": "call_problem",
+          "targetName": "call_problem"
+        },
+        {
+          "name": "call_resolution",
+          "targetName": "call_resolution"
+        },
+        {
+          "name": "call_outcome",
+          "targetName": "call_outcome"
+        }
       ]
     }
   ],
@@ -49,12 +117,52 @@
       {
         "targetIndexName": "idx-__CLIENTID__",
         "parentKeyFieldName": "parent_id",
-        "sourceContext": "/document/text_sections/*",
+        "sourceContext": "/document/markdown_document/*",
         "mappings": [
-          { "name": "chunk", "source": "/document/text_sections/*/content" },
-          { "name": "text_vector", "source": "/document/text_sections/*/text_vector" },
-          { "name": "title", "source": "/document/metadata_storage_name" },
-          { "name": "clientId", "source": "/document/clientid" }
+          {
+            "name": "chunk",
+            "source": "/document/markdown_document/*/content"
+          },
+          {
+            "name": "text_vector",
+            "source": "/document/markdown_document/*/text_vector"
+          },
+          {
+            "name": "title",
+            "source": "/document/metadata_storage_name"
+          },
+          {
+            "name": "clientId",
+            "source": "/document/clientid"
+          },
+          {
+            "name": "entities",
+            "source": "/document/entities"
+          },
+          {
+            "name": "entity_types",
+            "source": "/document/entity_types"
+          },
+          {
+            "name": "aliases",
+            "source": "/document/aliases"
+          },
+          {
+            "name": "audience",
+            "source": "/document/audience"
+          },
+          {
+            "name": "call_problem",
+            "source": "/document/call_problem"
+          },
+          {
+            "name": "call_resolution",
+            "source": "/document/call_resolution"
+          },
+          {
+            "name": "call_outcome",
+            "source": "/document/call_outcome"
+          }
         ]
       }
     ],

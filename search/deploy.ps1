@@ -12,6 +12,7 @@ param(
   [string]$Service        = "srch-knowledgeengine2-v9",
   [string]$ResourceGroup  = "rg-knowledgeengine-v9",
   [string]$StorageAccount = "stknowledgeengine2v9",
+  [string]$FunctionApp    = "fn-knowledgeengine2-v9",   # Etape 3 : Function d'enrichissement (voir enrichment/)
   [string]$SubscriptionId,
   [string]$ApiVersion     = "2026-04-01"   # >= requis pour #Microsoft.Skills.Util.DocumentIntelligenceLayoutSkill + AIServicesByIdentity
 )
@@ -31,15 +32,59 @@ if (-not $key) { throw "Could not retrieve the admin key. Check az login and the
 
 $headers = @{ "api-key" = $key; "Content-Type" = "application/json" }
 
+# Cle de la Function d'enrichissement (etape 3) : un secret de PLAN DE DONNEES,
+# jamais une ressource ARM -- donc jamais dans le Bicep, recuperee ici au
+# moment du deploiement comme la cle admin ci-dessus, jamais affichee, jamais
+# committee. Injectee dans les skillsets via le placeholder __FN_ENRICH_KEY__.
+Write-Host "Retrieving the enrichment function key (runtime, not stored)..."
+$fnKey = az functionapp keys list --resource-group $ResourceGroup --name $FunctionApp --query "functionKeys.default" -o tsv
+if (-not $fnKey) { throw "Could not retrieve the enrichment function key. Check that $FunctionApp is deployed (see enrichment/README.md)." }
+
+# Le synonym map est reference par les champs title/chunk de l'index : il doit
+# exister AVANT la creation de l'index, sinon la reference echoue. Son contenu
+# reel est genere automatiquement APRES l'indexation, a partir des alias
+# d'entites extraits du corpus (axiome A2 : aucun vocabulaire saisi a la main,
+# quel que soit le client). On ne cree donc ici qu'un contenu neutre, et
+# UNIQUEMENT s'il n'existe pas deja -- sinon un simple redeploiement ecraserait
+# le vocabulaire genere.
+# Design note (2026-09-23, Jalon 9): one synonym map per client (syn-$ClientId)
+# hit a hard Azure AI Search Basic-tier quota -- 3 synonym maps per service, period,
+# not raisable without a tier migration (confirmed live: clientc's deploy failed with
+# "Synonym map quota of 3 has been exceeded" after clienta/clientb/client-s alone).
+# Fix: every client now references the SAME physical map ("syn-clienta", kept as the
+# name to avoid migrating already-generated content) instead of one map each -- this is
+# safe because synonym vocabulary ("mot de passe"/SSPR, MFA, VPN, imprimante, ...) is
+# generic IT service-desk terminology, not per-client confidential content, unlike the
+# index/skillset isolation (axiome A2), which stays fully per-client.
+function Ensure-SynonymMap($name) {
+  $uri = "$endpoint/synonymmaps/$name`?api-version=$ApiVersion"
+  try {
+    Invoke-RestMethod -Method Get -Uri $uri -Headers $headers | Out-Null
+    Write-Host "  OK -> synonymmaps/$name (existant, contenu preserve)"
+    return
+  } catch {
+    if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+  }
+  $seed = @{
+    name    = $name
+    format  = "solr"
+    # Regle neutre : ces jetons ne peuvent apparaitre dans aucun corpus reel.
+    synonyms = "__ke_placeholder_a__, __ke_placeholder_b__`n"
+  } | ConvertTo-Json -Depth 3
+  Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -Body $seed | Out-Null
+  Write-Host "  OK -> synonymmaps/$name (cree, vide en attente de generation)"
+}
+
 function Put-Resource($collection, $name, $templateFile) {
   $body = Get-Content (Join-Path $PSScriptRoot $templateFile) -Raw
-  $body = $body.Replace("__CLIENTID__", $ClientId).Replace("__STORAGE_RESOURCE_ID__", $storageResourceId)
+  $body = $body.Replace("__CLIENTID__", $ClientId).Replace("__STORAGE_RESOURCE_ID__", $storageResourceId).Replace("__FN_ENRICH_KEY__", $fnKey)
   $uri  = "$endpoint/$collection/$name`?api-version=$ApiVersion"
   Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -Body $body | Out-Null
   Write-Host "  OK -> $collection/$name"
 }
 
 Write-Host "Deploying the pipeline for client '$ClientId' on $endpoint ..."
+Ensure-SynonymMap "syn-clienta"
 Put-Resource "datasources" "ds-$ClientId"     "datasource.template.json"
 Put-Resource "indexes"     "idx-$ClientId"    "index.template.json"
 # Two skillsets / two indexers sharing the same datasource + the same target index:
