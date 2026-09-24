@@ -112,6 +112,7 @@
 # what actually makes the audio pipeline worth having: real information
 # from the call, never the call's own words.
 # =====================================================================
+import base64
 import json
 import os
 import sys
@@ -129,6 +130,7 @@ from flask import Flask, redirect, render_template_string, request, url_for
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestration"))
 from answer import (  # noqa: E402 -- reuse orchestration logic (axiom A4), not a duplicate
+    analyze_screenshot_query_core_keyless,
     answer_query_core_keyless,
     build_aoai_client_keyless,
     load_engine_config,
@@ -321,6 +323,8 @@ def _append_turn(conv_id: str, entry: dict) -> int:
             "modality_summary": entry.get("modality_summary") or "",
             "primary_source_json": json.dumps(entry.get("primary_source")),
             "related_sources_json": json.dumps(entry.get("related_sources") or []),
+            "screen_reading": entry.get("screen_reading") or "",
+            "detected_error_codes_json": json.dumps(entry.get("detected_error_codes") or []),
             "createdAt": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -374,6 +378,8 @@ def _load_turns(conv_id: str):
                 "modality_summary": e.get("modality_summary"),
                 "primary_source": json.loads(e.get("primary_source_json") or "null"),
                 "related_sources": json.loads(e.get("related_sources_json") or "[]"),
+                "screen_reading": e.get("screen_reading") or None,
+                "detected_error_codes": json.loads(e.get("detected_error_codes_json") or "[]"),
             }
         )
     return turns
@@ -530,6 +536,13 @@ PAGE = """
     padding:9px 18px;font-weight:650;cursor:pointer;font-size:.86rem;align-self:flex-end;
     transition:opacity .15s}
   .send-btn:hover{opacity:.88}
+  .screenshot-btn{flex-shrink:0;align-self:flex-end;cursor:pointer;font-size:1.1rem;
+    padding:9px 10px;border-radius:10px;border:1px solid var(--line);background:var(--panel-2);
+    transition:opacity .15s;line-height:1}
+  .screenshot-btn:hover{opacity:.85}
+  .screenshot-input{position:absolute;width:1px;height:1px;overflow:hidden;opacity:0}
+  .screen-reading-note{margin:0 0 8px;font-size:.8rem;color:var(--muted);font-style:italic;
+    background:var(--panel-2);border-radius:8px;padding:7px 10px}
 </style>
 </head>
 <body>
@@ -600,6 +613,9 @@ PAGE = """
       </div>
       <div class="turn-a {% if t.ambiguous %}ambiguous{% endif %}">
         <div class="turn-a-label">Assistant</div>
+        {% if t.screen_reading %}
+        <div class="screen-reading-note">📷 Capture lue : {{ t.screen_reading }}{% if t.detected_error_codes %} — codes detectes : {{ t.detected_error_codes | join(", ") }}{% endif %}</div>
+        {% endif %}
         <div class="answer-text">{{ t.answer_html | safe }}</div>
         {% if t.ambiguous %}
         <div class="ambiguous-note">⚠ Réponse ambiguë{% if t.unanswerable_reason %} — {{ t.unanswerable_reason }}{% endif %}</div>
@@ -692,7 +708,7 @@ PAGE = """
     {% endfor %}
   </div></div>
 
-  <form method="post" class="composer">
+  <form method="post" class="composer" enctype="multipart/form-data">
     <input type="hidden" name="conversation_id" value="{{ active_conversation_id or '' }}">
     <div class="composer-inner">
       <div class="composer-row">
@@ -702,6 +718,9 @@ PAGE = """
           {% endfor %}
         </select>
         <textarea name="query" rows="2" placeholder="Pose ta question..." required>{{ query }}</textarea>
+        <label class="screenshot-btn" title="Joindre une capture d'ecran">
+          📷<input type="file" name="screenshot" accept="image/*" class="screenshot-input">
+        </label>
         <button type="submit" class="send-btn">Envoyer</button>
       </div>
     </div>
@@ -769,7 +788,25 @@ def _handle(conversation_id):
             try:
                 load_engine_config(client_id)  # fail fast with a clear error if misconfigured
                 token = get_search_bearer_token()
-                raw = answer_query_core_keyless(client_id, query, token, _aoai_client)
+
+                # Design note (2026-09-24, Jalon 9 -- diagnostic screenshot
+                # upload, layer 1): a screenshot attached to the question
+                # routes to analyze_screenshot_query_core_keyless() instead
+                # of answer_query_core_keyless() -- same retrieval/sources
+                # contract (primary_source/related_sources), plus
+                # screen_reading/detected_error_codes. Processed in memory
+                # only: the image itself is never written to blob storage or
+                # to the conversation table, only the model's own textual
+                # reading of it -- no new retention/PII surface to manage.
+                screenshot = request.files.get("screenshot")
+                if screenshot and screenshot.filename:
+                    image_b64 = base64.b64encode(screenshot.read()).decode("ascii")
+                    image_mime = screenshot.mimetype or "image/png"
+                    raw = analyze_screenshot_query_core_keyless(
+                        client_id, query, image_b64, image_mime, token, _aoai_client
+                    )
+                else:
+                    raw = answer_query_core_keyless(client_id, query, token, _aoai_client)
 
                 primary = raw.get("primary_source")
                 related = raw.get("related_sources", [])
@@ -786,6 +823,8 @@ def _handle(conversation_id):
                     "modality_summary": _modality_summary(primary, related),
                     "primary_source": primary,
                     "related_sources": related,
+                    "screen_reading": raw.get("screen_reading"),
+                    "detected_error_codes": raw.get("detected_error_codes"),
                 }
 
                 persisted_id = None
