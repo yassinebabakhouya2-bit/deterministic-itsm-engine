@@ -1,0 +1,5 @@
+azure-functions
+azure-identity>=1.17
+azure-data-tables>=12.5
+openai>=1.40
+requests>=2.32

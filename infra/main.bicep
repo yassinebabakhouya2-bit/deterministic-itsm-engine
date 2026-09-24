@@ -31,6 +31,12 @@ param easyAuthMultiTenant bool = false
 @description('Jalon 5: Entra tenant IDs allowed to complete sign-in at all (platform-enforced, WEBSITE_AUTH_AAD_ALLOWED_TENANTS) — max 10. Always include your own sandbox tenant.')
 param easyAuthAllowedTenantIds array = []
 
+@description('Deploiement de modele utilise par la Function d\'enrichissement. Epingle : changer de modele change les sorties extraites, donc le contenu de l\'index.')
+param enrichDeployment string = 'gpt-4o-enrich'
+
+@description('Creer le deploiement de modele gpt-4o-enrich. Mettre a false pour un premier passage si la validation preflight refuse le quota (voir infra/modules/foundry.bicep).')
+param deployEnrichModel bool = true
+
 // ---------------------------------------------------------------------
 // Blob storage — hosts KB records per client (private containers)
 // ---------------------------------------------------------------------
@@ -63,6 +69,7 @@ module foundry 'modules/foundry.bicep' = {
     foundryName: 'aif-${namePrefix}-v9'
     projectName: 'proj-${namePrefix}-v9'
     location: location
+    deployEnrichModel: deployEnrichModel
   }
 }
 
@@ -85,6 +92,31 @@ module webapp 'modules/webapp.bicep' = {
 }
 
 // ---------------------------------------------------------------------
+// Function d'enrichissement semantique (entites, alias, triplets, audience)
+// Appelee par AI Search pendant l'indexation via WebApiSkill -- jamais sur
+// le chemin d'une requete utilisateur. Hebergee sur le plan B1 existant
+// (voir l'historique de ce choix en tete de enrich-function.bicep : Flex
+// Consumption a ete tente et abandonne). Elle depend donc du module webapp,
+// qui cree ce plan.
+// RBAC porte par le module lui-meme (identite managee systeme).
+// ---------------------------------------------------------------------
+module enrichFunction 'modules/enrich-function.bicep' = {
+  name: 'enrichFunction'
+  dependsOn: [
+    webapp
+  ]
+  params: {
+    functionAppName: 'fn-${namePrefix}-v9'
+    hostingPlanName: 'plan-${namePrefix}-v9'
+    location: location
+    storageAccountName: storage.outputs.storageAccountName
+    foundryName: foundry.outputs.foundryName
+    searchServiceName: search.outputs.searchServiceName
+    enrichDeployment: enrichDeployment
+  }
+}
+
+// ---------------------------------------------------------------------
 // RBAC — Search's managed identity reads Blob & calls the embedding;
 // the Web App's managed identity queries Search & calls the LLM (Jalon 4)
 // ---------------------------------------------------------------------
@@ -103,3 +135,4 @@ output storageAccountName string = storage.outputs.storageAccountName
 output searchServiceName string = search.outputs.searchServiceName
 output foundryName string = foundry.outputs.foundryName
 output webAppHostName string = webapp.outputs.webAppHostName
+output enrichFunctionHostName string = enrichFunction.outputs.functionAppHostName
