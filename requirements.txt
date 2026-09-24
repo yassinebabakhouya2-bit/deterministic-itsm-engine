@@ -15,3 +15,6 @@ openai
 requests
 PyYAML
 azure-identity
+markdown
+nh3
+azure-data-tables
