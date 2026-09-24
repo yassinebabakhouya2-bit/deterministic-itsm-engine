@@ -92,6 +92,7 @@
 # Usage: python answer.py --client clienta --query "..."
 # =====================================================================
 import argparse
+import base64
 import json
 import re
 import subprocess
@@ -344,6 +345,71 @@ ANSWER_SCHEMA = {
     ],
     "additionalProperties": False,
 }
+
+
+# =====================================================================
+# Design note (2026-09-24, Jalon 9 -- diagnostic screenshot upload, layer 1
+# of the iterative-diagnostic feature): an agent can attach a screenshot of
+# what they see on the client's machine to their question. Deliberately a
+# SIBLING of answer_query_core()/generate(), never calling into it and never
+# called by it -- same retrieval (retrieve_hierarchy/select_primaries/
+# format_context) but its own prompt (SCREENSHOT_SYSTEM_PROMPT) and schema
+# (SCREENSHOT_ANSWER_SCHEMA, = ANSWER_SCHEMA plus screen_reading). Nothing
+# in this block is imported or called by answer_query_core,
+# answer_query_core_keyless, generate() or ANSWER_SCHEMA/SYSTEM_PROMPT --
+# the existing single-shot path (CLI, eval/evaluate_rag.py, app.py's normal
+# question flow) is byte-for-byte unaffected.
+#
+# Uses GPT-4o's own multimodal vision input (image_url content part with a
+# base64 data URI) rather than a separate Azure AI Vision Read resource --
+# one fewer Azure resource/auth surface to provision under time pressure,
+# at the cost of Read's exact-character-offset guarantees. Backstopped by
+# _ERROR_CODE_PATTERNS: the model is asked to transcribe visible text
+# verbatim into screen_reading, and detected_error_codes is extracted from
+# THAT text by regex after the call, never trusted as a separate model
+# claim -- same spirit as _looks_sensitive() below (regex backstop on model
+# output, not a replacement for the prompt instruction).
+# =====================================================================
+SCREENSHOT_SYSTEM_PROMPT = (
+    "Tu es l'assistant de support IT du client, en session de diagnostic avec "
+    "un agent service desk qui vient de joindre une capture d'ecran de ce "
+    "qu'il voit sur le poste du client, avec sa question. Le CONTEXTE (extrait "
+    "de la base de connaissances) reste la SEULE base autorisee pour la "
+    "procedure -- memes regles que d'habitude : choisis explicitement la "
+    "SOURCE PRIMAIRE qui traite reellement du sujet (primary_source_index), "
+    "ambiguous=true si aucune ne correspond, jamais d'invention, jamais de "
+    "resume qui deforme la procedure de la source primaire choisie.\n\n"
+    "LECTURE DE LA CAPTURE -- avant de repondre, decris PRECISEMENT et "
+    "LITTERALEMENT ce que tu lis sur l'image dans screen_reading : texte "
+    "visible (messages d'erreur, codes, numeros), nom de la fenetre ou de "
+    "l'application si identifiable. Ne l'invente jamais, ne le devine pas -- "
+    "si l'image ne contient aucun texte exploitable ou n'est pas lisible, "
+    "ecris exactement 'aucun texte lisible sur cette image'. Utilise ensuite "
+    "cette lecture pour relier le probleme observe a la bonne procedure du "
+    "CONTEXTE, exactement comme si l'agent avait decrit ce texte dans sa "
+    "question."
+)
+
+SCREENSHOT_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **ANSWER_SCHEMA["properties"],
+        "screen_reading": {
+            "type": "string",
+            "description": (
+                "Description precise et litterale de ce qui est lisible sur la "
+                "capture d'ecran jointe (texte, code d'erreur, nom de fenetre). "
+                "'aucun texte lisible sur cette image' si rien d'exploitable."
+            ),
+        },
+    },
+    "required": ANSWER_SCHEMA["required"] + ["screen_reading"],
+    "additionalProperties": False,
+}
+
+_ERROR_CODE_PATTERNS = re.compile(
+    r"\b\d{4}\b|0x[0-9A-Fa-f]{6,8}|Event ID \d+", re.IGNORECASE
+)
 
 
 # Defense-in-depth backstop for primary_safe_summaries / annex_safe_summaries
@@ -1283,11 +1349,222 @@ def answer_query_core_keyless(
     return result
 
 
+def analyze_screenshot_query(client_id: str, query: str, image_path: str) -> dict:
+    """Convenience one-shot wrapper for interactive/CLI use, mirroring
+    answer_query() (2026-09-24 screenshot-upload design note) -- fetches
+    keys via az, reads+base64-encodes the local image file, delegates to
+    analyze_screenshot_query_core()."""
+    import mimetypes
+
+    cfg = load_engine_config(client_id)
+
+    print("Retrieving keys (runtime, not stored)...")
+    search_key = az(
+        f"az search admin-key show --service-name {SEARCH_SERVICE} "
+        f"--resource-group {RG} --query primaryKey -o tsv"
+    )
+    aoai_key = az(
+        f"az cognitiveservices account keys list --name {AOAI_ACCOUNT} "
+        f"--resource-group {RG} --query key1 -o tsv"
+    )
+    aoai_client = AzureOpenAI(
+        azure_endpoint=AOAI_ENDPOINT, api_key=aoai_key, api_version=AOAI_API_VERSION
+    )
+
+    image_bytes = Path(image_path).read_bytes()
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    image_mime = mimetypes.guess_type(image_path)[0] or "image/png"
+
+    return analyze_screenshot_query_core(
+        client_id, query, image_b64, image_mime, search_key, aoai_client, cfg=cfg
+    )
+
+
+def _generate_screenshot(
+    query: str,
+    context: str,
+    image_b64: str,
+    image_mime: str,
+    client: AzureOpenAI,
+    model: str,
+    seed: int,
+) -> dict:
+    """Vision-enabled sibling of generate() -- see the 2026-09-24 design note
+    above SCREENSHOT_SYSTEM_PROMPT. temperature=0 + seed, same determinism
+    axiom (A1) as generate(), but NOT the same function: generate() has no
+    image content part and must stay that way for the CLI/eval/normal-app
+    path to remain byte-for-byte unchanged."""
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        seed=seed,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "screenshot_diagnostic",
+                "strict": True,
+                "schema": SCREENSHOT_ANSWER_SCHEMA,
+            },
+        },
+        messages=[
+            {"role": "system", "content": SCREENSHOT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"CONTEXTE:\n{context}\n\nQUESTION DE L'AGENT: {query}",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{image_mime};base64,{image_b64}"},
+                    },
+                ],
+            },
+        ],
+    )
+    result = json.loads(resp.choices[0].message.content)
+    result["detected_error_codes"] = sorted(
+        set(_ERROR_CODE_PATTERNS.findall(result.get("screen_reading") or ""))
+    )
+    return result
+
+
+def analyze_screenshot_query_core(
+    client_id: str,
+    query: str,
+    image_b64: str,
+    image_mime: str,
+    search_key: str,
+    aoai_client: AzureOpenAI,
+    cfg: Optional[dict] = None,
+) -> dict:
+    """Screenshot-upload sibling of answer_query_core() (api-key path) --
+    see the 2026-09-24 design note above SCREENSHOT_SYSTEM_PROMPT. Retrieval
+    is byte-for-byte the same call sequence as answer_query_core(); only the
+    generation step differs (_generate_screenshot instead of generate)."""
+    cfg = cfg or load_engine_config(client_id)
+    index = cfg["knowledge"]["index"]
+    primary_count = cfg["retrieval"]["primaryCount"]
+    annex_count = cfg["retrieval"]["annexCount"]
+    gen = cfg["generation"]
+
+    search_headers = {"api-key": search_key}
+    candidates, annexes = retrieve_hierarchy(
+        query, index, primary_count, annex_count, search_headers, client_id=client_id
+    )
+    chosen, selection_reason = select_primaries(
+        query, candidates, aoai_client, gen["model"], gen["seed"]
+    )
+    chosen = chosen[:primary_count]
+    if chosen:
+        primaries = _expand_to_full_documents(
+            [candidates[i] for i in chosen], index, search_headers, client_id=client_id
+        )
+        _keys = {d.get("parent_id") or d.get("title") for d in primaries}
+        annexes = [a for a in annexes if (a.get("parent_id") or a.get("title")) not in _keys]
+    else:
+        primaries = candidates[:1]
+    context = format_context(primaries, annexes)
+
+    result = _generate_screenshot(query, context, image_b64, image_mime, aoai_client, gen["model"], gen["seed"])
+    selected = _selected_primary_index(result, primaries)
+    result = attach_sources(result, primaries, annexes)
+    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    result["_trace"] = {
+        "client": client_id,
+        "index": index,
+        "context": context,
+        "primary_title": base_primary.get("title") if base_primary else None,
+        "primary_reranker_score": (
+            base_primary.get("@search.rerankerScore") if base_primary else None
+        ),
+        "primary_selected_by_model": selected is not None,
+        "primary_selection_reason": selection_reason,
+        "primary_candidates": [
+            {"title": d.get("title"), "score": d.get("@search.rerankerScore")}
+            for d in candidates
+        ],
+        "annex_titles": [a.get("title") for a in annexes],
+    }
+    return result
+
+
+def analyze_screenshot_query_core_keyless(
+    client_id: str,
+    query: str,
+    image_b64: str,
+    image_mime: str,
+    search_bearer_token: str,
+    aoai_client: AzureOpenAI,
+    cfg: Optional[dict] = None,
+) -> dict:
+    """Same as analyze_screenshot_query_core(), RBAC/Bearer auth on Search
+    instead of an admin api-key -- for app/app.py, mirroring the
+    answer_query_core / answer_query_core_keyless split (2026-09-11 note)."""
+    cfg = cfg or load_engine_config(client_id)
+    index = cfg["knowledge"]["index"]
+    primary_count = cfg["retrieval"]["primaryCount"]
+    annex_count = cfg["retrieval"]["annexCount"]
+    gen = cfg["generation"]
+
+    search_headers = {"Authorization": f"Bearer {search_bearer_token}"}
+    candidates, annexes = retrieve_hierarchy(
+        query, index, primary_count, annex_count, search_headers, client_id=client_id
+    )
+    chosen, selection_reason = select_primaries(
+        query, candidates, aoai_client, gen["model"], gen["seed"]
+    )
+    chosen = chosen[:primary_count]
+    if chosen:
+        primaries = _expand_to_full_documents(
+            [candidates[i] for i in chosen], index, search_headers, client_id=client_id
+        )
+        _keys = {d.get("parent_id") or d.get("title") for d in primaries}
+        annexes = [a for a in annexes if (a.get("parent_id") or a.get("title")) not in _keys]
+    else:
+        primaries = candidates[:1]
+    context = format_context(primaries, annexes)
+
+    result = _generate_screenshot(query, context, image_b64, image_mime, aoai_client, gen["model"], gen["seed"])
+    selected = _selected_primary_index(result, primaries)
+    result = attach_sources(result, primaries, annexes)
+    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    result["_trace"] = {
+        "client": client_id,
+        "index": index,
+        "context": context,
+        "primary_title": base_primary.get("title") if base_primary else None,
+        "primary_reranker_score": (
+            base_primary.get("@search.rerankerScore") if base_primary else None
+        ),
+        "primary_selected_by_model": selected is not None,
+        "primary_selection_reason": selection_reason,
+        "primary_candidates": [
+            {"title": d.get("title"), "score": d.get("@search.rerankerScore")}
+            for d in candidates
+        ],
+        "annex_titles": [a.get("title") for a in annexes],
+    }
+    return result
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="KnowledgeEngine v9 -- orchestration layer")
     parser.add_argument("--client", required=True, help="client id, e.g. clienta or client-v")
     parser.add_argument("--query", required=True)
+    parser.add_argument(
+        "--image",
+        help=(
+            "Path to a local screenshot (2026-09-24 design note): routes to "
+            "analyze_screenshot_query() instead of answer_query() -- diagnostic "
+            "screenshot-upload path, does not affect the default flow."
+        ),
+    )
     args = parser.parse_args()
 
-    result = answer_query(args.client, args.query)
+    if args.image:
+        result = analyze_screenshot_query(args.client, args.query, args.image)
+    else:
+        result = answer_query(args.client, args.query)
     print(json.dumps(result, ensure_ascii=False, indent=2))
