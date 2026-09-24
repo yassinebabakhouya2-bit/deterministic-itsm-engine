@@ -245,51 +245,81 @@
             ]
           }
         },
-        "Get_download_url": {
-          "type": "Http",
-          "inputs": {
-            "method": "GET",
-            "uri": "@{concat('https://graph.microsoft.com/v1.0/sites/', parameters('siteId'), '/drive/items/', items('For_each')?['id'], '?$select=@microsoft.graph.downloadUrl')}",
-            "headers": {
-              "Authorization": "@{concat('Bearer ', body('Get_token')?['access_token'])}"
-            }
-          },
+        "Compose_destContainer": {
+          "type": "Compose",
+          "inputs": "@{if(contains(parameters('audioExtensions'), outputs('Compose_extension')), parameters('audioContainerName'), parameters('containerName'))}",
           "runAfter": {
             "Compose_extension": [
               "Succeeded"
             ]
           }
         },
-        "Download_content": {
-          "type": "Http",
-          "inputs": {
-            "method": "GET",
-            "uri": "@{body('Get_download_url')?['@microsoft.graph.downloadUrl']}"
-          },
+        "Compose_destUri": {
+          "type": "Compose",
+          "inputs": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', outputs('Compose_destContainer'), '/', outputs('Compose_blobName'))}",
           "runAfter": {
-            "Get_download_url": [
+            "Compose_destContainer": [
               "Succeeded"
             ]
           }
         },
-        "Condition_is_audio": {
+        "Check_blob_exists": {
+          "type": "Http",
+          "inputs": {
+            "method": "HEAD",
+            "uri": "@{outputs('Compose_destUri')}",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            }
+          },
+          "runAfter": {
+            "Compose_destUri": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Condition_blob_missing": {
           "type": "If",
           "expression": {
-            "and": [
+            "not": [
               {
-                "contains": [
-                  "@parameters('audioExtensions')",
-                  "@outputs('Compose_extension')"
+                "equals": [
+                  "@outputs('Check_blob_exists')['statusCode']",
+                  200
                 ]
               }
             ]
           },
           "actions": {
-            "Write_blob_audio": {
+            "Get_download_url": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{concat('https://graph.microsoft.com/v1.0/sites/', parameters('siteId'), '/drive/items/', items('For_each')?['id'], '?$select=@microsoft.graph.downloadUrl')}",
+                "headers": {
+                  "Authorization": "@{concat('Bearer ', body('Get_token')?['access_token'])}"
+                }
+              },
+              "runAfter": {}
+            },
+            "Download_content": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{body('Get_download_url')?['@microsoft.graph.downloadUrl']}"
+              },
+              "runAfter": {
+                "Get_download_url": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Write_blob": {
               "type": "Http",
               "inputs": {
                 "method": "PUT",
-                "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '/', outputs('Compose_blobName'))}",
+                "uri": "@{outputs('Compose_destUri')}",
                 "headers": {
                   "x-ms-blob-type": "BlockBlob",
                   "x-ms-version": "2021-08-06",
@@ -302,35 +332,20 @@
                   "audience": "https://storage.azure.com"
                 }
               },
-              "runAfter": {}
-            }
-          },
-          "else": {
-            "actions": {
-              "Write_blob_doc": {
-                "type": "Http",
-                "inputs": {
-                  "method": "PUT",
-                  "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', outputs('Compose_blobName'))}",
-                  "headers": {
-                    "x-ms-blob-type": "BlockBlob",
-                    "x-ms-version": "2021-08-06",
-                    "Content-Type": "application/octet-stream",
-                    "x-ms-meta-clientid": "@{parameters('clientId')}"
-                  },
-                  "body": "@body('Download_content')",
-                  "authentication": {
-                    "type": "ManagedServiceIdentity",
-                    "audience": "https://storage.azure.com"
-                  }
-                },
-                "runAfter": {}
+              "runAfter": {
+                "Download_content": [
+                  "Succeeded"
+                ]
               }
             }
           },
+          "else": {
+            "actions": {}
+          },
           "runAfter": {
-            "Download_content": [
-              "Succeeded"
+            "Check_blob_exists": [
+              "Succeeded",
+              "Failed"
             ]
           }
         }

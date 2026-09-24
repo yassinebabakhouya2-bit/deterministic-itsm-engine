@@ -40,6 +40,12 @@ from answer import CONFIG_DIRS, load_engine_config  # noqa: E402 -- reuse, not a
 # style URIs also show up depending on token version/config — check both.
 _TENANT_CLAIM_TYPES = {"tid", "http://schemas.microsoft.com/identity/claims/tenantid"}
 _GROUP_CLAIM_TYPES = {"groups", "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups"}
+# Stable per-user identifier (Entra object id) -- Jalon 7+, 2026-09-18, used
+# ONLY to scope saved conversations (Table Storage PartitionKey below a
+# client/tenant that's already been authorized -- see resolve_user_id).
+# Never involved in the access decision itself, which stays entirely
+# resolve_allowed_clients()'s job.
+_USER_CLAIM_TYPES = {"http://schemas.microsoft.com/identity/claims/objectidentifier", "oid"}
 
 # Known limitation (not handled here): Entra only emits `groups` inline
 # below ~200 groups per user; beyond that it emits a "groups overage"
@@ -146,6 +152,16 @@ def parse_client_principal(header_value: Optional[str]) -> List[dict]:
 
 def _claim_values(claims: List[dict], claim_types: set) -> List[str]:
     return [c.get("val") for c in claims if c.get("typ") in claim_types and c.get("val")]
+
+
+def resolve_user_id(claims: List[dict]) -> Optional[str]:
+    """Stable per-user identifier for scoping saved conversations (Jalon 7+,
+    2026-09-18) -- the Entra object id (`oid`), unique per user per tenant.
+    Returns None if absent (should not happen for a real AAD token once
+    resolve_allowed_clients has already found a tenant claim, but callers
+    must not assume it's always present)."""
+    ids = _claim_values(claims, _USER_CLAIM_TYPES)
+    return ids[0] if ids else None
 
 
 def resolve_allowed_clients(

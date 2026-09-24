@@ -1,6 +1,6 @@
 # =====================================================================
 # RAG Evaluation — KnowledgeEngine v9 (quantified proof of reliability)
-# 1) For each client (A/B/C, dedicated index): orchestration/answer.py's
+# 1) For each client (dedicated index): orchestration/answer.py's
 #    answer_query_core() -- hybrid retrieval + A3 hierarchy split (rank on
 #    @search.rerankerScore) + GPT-4o Structured Outputs answer (temp=0,
 #    seed) -- reused here, not duplicated (axiom A4; see
@@ -16,6 +16,24 @@
 # changes what gets scored, so these results are a NEW baseline, not
 # directly comparable to the Jalon 1 scores recorded in project memory
 # jalon1.md (those were measured before orchestration/ existed).
+#
+# Design note (2026-09-21, Jalon 7 follow-up -- measure before redesign):
+# Yassine reported the deployed engine underperforming a comparable
+# production tool on a real client and asked for a "refonte" (redesign)
+# for determinism/accuracy. Before any architectural change, this script
+# is extended to actually MEASURE that client (axiom A5 -- reliability is
+# measured, not promised) instead of only ever scoring the synthetic demo
+# clients. Real clients (client-s, and any added later) keep their golden
+# dataset + every generated eval artifact entirely under clients-local/ --
+# NEVER under eval/ -- per the isolation rule in clients-local/README.md
+# ("nothing in this folder is ever git add'ed... or referenced by name in
+# any file tracked by git"): eval/.gitignore only excludes GENERATED
+# artifacts (eval_input_*.jsonl, eval_results_*.json, eval_summary.json),
+# not golden_*.jsonl, so a real client's golden dataset must never be
+# placed in eval/ -- it would be tracked by git. clients-local/ is
+# git-ignored in full, so it's always safe there. Synthetic demo clients
+# (clienta/b/c) are unchanged: golden sets tracked in eval/, 100%
+# synthetic per eval/README.md.
 # =====================================================================
 import json
 import sys
@@ -40,7 +58,22 @@ from answer import (  # noqa: E402 -- reuse orchestration logic (axiom A4), not 
     az,
 )
 
-CLIENTS = ["clienta", "clientb", "clientc"]  # one DEDICATED index per client (isolation M2)
+EVAL_DIR = Path(__file__).resolve().parent
+CLIENTS_LOCAL_DIR = EVAL_DIR.parent / "clients-local"
+
+# Synthetic demo clients: golden set tracked in eval/, 100% synthetic (isolation M2).
+CLIENTS = ["clienta", "clientb", "clientc"]
+
+# Real clients: golden set + every generated artifact live in clients-local/
+# (git-ignored in full) -- never in eval/. Add a client code here once its
+# clients-local/golden_<id>.jsonl exists; a missing golden file is skipped,
+# not a hard failure, so onboarding a new real client never breaks this run.
+REAL_CLIENTS = ["client-s"]
+
+
+def client_base_dir(client_id: str) -> Path:
+    return CLIENTS_LOCAL_DIR if client_id in REAL_CLIENTS else EVAL_DIR
+
 
 print("Retrieving keys (runtime, not stored)...")
 SEARCH_KEY = az(
@@ -64,13 +97,19 @@ model_config = {
 
 all_metrics = {}
 
-for CLIENT_ID in CLIENTS:
+for CLIENT_ID in CLIENTS + REAL_CLIENTS:
+    base_dir = client_base_dir(CLIENT_ID)
+    golden_path = base_dir / f"golden_{CLIENT_ID}.jsonl"
+    if not golden_path.exists():
+        print(f"\n=== Client {CLIENT_ID} -- skipped (no {golden_path}) ===")
+        continue
+
     print(f"\n=== Client {CLIENT_ID} ===")
 
     # ---- Phase 1: generate RAG answers via orchestration/answer.py ----
     print("Generating RAG answers (retrieval + A3 split + Structured Outputs)...")
     rows = []
-    with open(f"golden_{CLIENT_ID}.jsonl", encoding="utf-8") as f:
+    with open(golden_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -86,7 +125,7 @@ for CLIENT_ID in CLIENTS:
             )
             print(f"  - {q[:60]}...")
 
-    input_path = f"eval_input_{CLIENT_ID}.jsonl"
+    input_path = base_dir / f"eval_input_{CLIENT_ID}.jsonl"
     with open(input_path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -94,7 +133,7 @@ for CLIENT_ID in CLIENTS:
     # ---- Phase 2: Azure AI Foundry evaluation ----
     print("Evaluating (Groundedness, Relevance, Retrieval)...")
     result = evaluate(
-        data=input_path,
+        data=str(input_path),
         evaluators={
             "groundedness": GroundednessEvaluator(model_config),
             "relevance": RelevanceEvaluator(model_config),
@@ -121,13 +160,25 @@ for CLIENT_ID in CLIENTS:
                 }
             },
         },
-        output_path=f"eval_results_{CLIENT_ID}.json",
+        output_path=str(base_dir / f"eval_results_{CLIENT_ID}.json"),
     )
 
     all_metrics[CLIENT_ID] = result["metrics"]
 
-with open("eval_summary.json", "w", encoding="utf-8") as f:
-    json.dump(all_metrics, f, ensure_ascii=False, indent=2)
+# Synthetic clients' summary stays in eval/ (tracked dir, but the summary
+# itself is git-ignored -- eval/eval_summary.json -- same as before).
+# Real clients' summary is kept entirely separate, in clients-local/, so
+# no real-client entry is ever written under eval/ (defense-in-depth on
+# top of the .gitignore rules, per clients-local/README.md).
+synthetic_metrics = {c: m for c, m in all_metrics.items() if c in CLIENTS}
+real_metrics = {c: m for c, m in all_metrics.items() if c in REAL_CLIENTS}
+
+with open(EVAL_DIR / "eval_summary.json", "w", encoding="utf-8") as f:
+    json.dump(synthetic_metrics, f, ensure_ascii=False, indent=2)
+
+if real_metrics:
+    with open(CLIENTS_LOCAL_DIR / "eval_summary.json", "w", encoding="utf-8") as f:
+        json.dump(real_metrics, f, ensure_ascii=False, indent=2)
 
 print("\n===== CONSOLIDATED RELIABILITY SCORE (KnowledgeEngineV9, averages /5) =====")
 for CLIENT_ID, metrics in all_metrics.items():
@@ -135,4 +186,6 @@ for CLIENT_ID, metrics in all_metrics.items():
     for k, v in metrics.items():
         print(f"  {k}: {round(v, 3)}")
 
-print("\nFull detail: eval_results_<client>.json, summary: eval_summary.json")
+print("\nFull detail: eval_results_<client>.json (eval/ for demo clients, "
+      "clients-local/ for real clients). Summary: eval/eval_summary.json "
+      "(demo) and clients-local/eval_summary.json (real, if any).")
