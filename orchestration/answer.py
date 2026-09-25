@@ -384,8 +384,11 @@ SCREENSHOT_SYSTEM_PROMPT = (
     "visible (messages d'erreur, codes, numeros), nom de la fenetre ou de "
     "l'application si identifiable. Ne l'invente jamais, ne le devine pas -- "
     "si l'image ne contient aucun texte exploitable ou n'est pas lisible, "
-    "ecris exactement 'aucun texte lisible sur cette image'. Utilise ensuite "
-    "cette lecture pour relier le probleme observe a la bonne procedure du "
+    "ecris exactement 'aucun texte lisible sur cette image'. EXCEPTION "
+    "STRICTE -- si un mot de passe, code ou identifiant PRECIS est visible "
+    "sur la capture, ne le recopie JAMAIS tel quel dans screen_reading -- "
+    "decris ce fait en termes generaux uniquement. Utilise ensuite cette "
+    "lecture pour relier le probleme observe a la bonne procedure du "
     "CONTEXTE, exactement comme si l'agent avait decrit ce texte dans sa "
     "question."
 )
@@ -410,6 +413,140 @@ SCREENSHOT_ANSWER_SCHEMA = {
 _ERROR_CODE_PATTERNS = re.compile(
     r"\b\d{4}\b|0x[0-9A-Fa-f]{6,8}|Event ID \d+", re.IGNORECASE
 )
+
+# Design note (2026-09-25 -- backstop for a live-tested leak, layer 1+2): a
+# real diagnostic-conversation test on client-s showed the model can still
+# transcribe a password verbatim into screen_reading despite the prompt
+# instruction above (a password-reset tool's generated temporary password,
+# visible as plain text on the uploaded screenshot, was copied
+# character-for-character: "Mot de passe temporaire: NEKA18023526_mdp").
+# The existing CONFIDENTIALITE DES APPELS rule only ever covered a password
+# SPELLED OUT in a call transcript -- nothing covered a password simply
+# VISIBLE as text on a screenshot. Same "prompt instruction first, regex
+# backstop second" posture as _looks_sensitive()/_SPELLING_MARKERS/_DIGIT_RUN
+# below (which cover the call case) -- narrow and pattern-specific, not a
+# general secrets scanner, but it catches the exact shape just observed.
+_VISIBLE_PASSWORD_PATTERN = re.compile(
+    r"(mot de passe(?:\s+temporaire)?|password|mdp|pwd)\s*[:=]\s*"
+    r"([A-Za-z0-9_@#.\-]{6,})",
+    re.IGNORECASE,
+)
+
+
+def _redact_visible_password(text: Optional[str]) -> Optional[str]:
+    """Backstop for screen_reading -- see design note above. Replaces the
+    captured value after a 'mot de passe : ...'/'password: ...' style label
+    with a fixed placeholder, leaves everything else untouched."""
+    if not text:
+        return text
+    return _VISIBLE_PASSWORD_PATTERN.sub(
+        lambda m: f"{m.group(1)} : [valeur masquee]", text
+    )
+
+
+
+# =====================================================================
+# Design note (2026-09-24, later same day -- diagnostic layer 2: persistent
+# multi-turn state). Layer 1 above answers every question in isolation --
+# app/app.py persisted each turn for DISPLAY only, never fed prior turns
+# back into generation, so a follow-up question had no memory of what was
+# already served or already tried in the SAME conversation. This closes
+# that gap WITHOUT a second state store: the state is derived
+# deterministically from the turns app/app.py already persists (see
+# _build_diagnostic_state_block) -- same "reproductible depuis la source,
+# jamais un state parallele" posture as _detect_query_entities() above, no
+# new Azure resource, no new table. Retrieval is UNCHANGED (still grounded
+# in the current question only, like every other path here) -- only
+# generation gains an ETAT DU DIAGNOSTIC block. DIAGNOSTIC_ANSWER_SCHEMA
+# unifies the plain and screenshot cases (screen_reading is always present,
+# reading 'aucune capture fournie a ce tour' when no image was attached
+# THIS turn) so app/app.py has a single call for every turn of a
+# conversation -- see diagnostic_query_core_keyless below, which replaces
+# BOTH answer_query_core_keyless and analyze_screenshot_query_core_keyless
+# in app/app.py. Those two, and the plain generate()/ANSWER_SCHEMA path,
+# are untouched -- CLI/eval/evaluate_rag.py stay byte-for-byte unaffected
+# (module docstring, 2026-09-11 note).
+# =====================================================================
+DIAGNOSTIC_SYSTEM_PROMPT = (
+    "Tu es l'assistant de support IT du client, en session de diagnostic "
+    "iterative avec un agent service desk : la conversation peut compter "
+    "plusieurs tours, chacun affinant le precedent. Le CONTEXTE (extrait de "
+    "la base de connaissances) reste la SEULE base autorisee pour la "
+    "procedure -- memes regles que d'habitude : choisis explicitement la "
+    "SOURCE PRIMAIRE qui traite reellement du sujet (primary_source_index), "
+    "ambiguous=true si aucune ne correspond, jamais d'invention.\n\n"
+    "REDACTION ET CONFIDENTIALITE -- memes regles strictes que d'habitude : "
+    "reprends fidelement la procedure de la SOURCE PRIMAIRE, enrichis-la des "
+    "SOURCES ANNEXES pertinentes, et si une SOURCE est un appel qui contient "
+    "un mot de passe/code/identifiant epele, cette valeur ne doit JAMAIS "
+    "apparaitre dans ta reponse ni dans les resumes -- decris le fait en "
+    "termes generaux uniquement.\n\n"
+    "LECTURE DE CAPTURE D'ECRAN -- si une image est jointe A CE TOUR, decris "
+    "PRECISEMENT et LITTERALEMENT ce qui y est lisible dans screen_reading "
+    "(texte, code d'erreur, nom de fenetre) ; si elle n'est pas lisible, "
+    "ecris exactement 'aucun texte lisible sur cette image'. Si AUCUNE image "
+    "n'est jointe a ce tour, ecris exactement 'aucune capture fournie a ce "
+    "tour' -- ne decris jamais une capture d'un tour precedent comme si elle "
+    "etait nouvelle. EXCEPTION STRICTE -- si un mot de passe, code ou "
+    "identifiant PRECIS est visible sur la capture (par exemple un mot de "
+    "passe temporaire genere par un outil de reinitialisation), ne le "
+    "recopie JAMAIS tel quel dans screen_reading ni ailleurs -- decris ce "
+    "fait en termes generaux uniquement (ex: 'un mot de passe temporaire "
+    "est visible mais non retranscrit ici'), exactement comme pour un mot "
+    "de passe epele dans un appel.\n\n"
+    "SUIVI MULTI-TOURS -- si un bloc ETAT DU DIAGNOSTIC est fourni ci-dessous, "
+    "il resume ce qui a deja ete etabli dans cette conversation (fiches deja "
+    "servies, codes d'erreur deja releves, entites deja identifiees, tours "
+    "precedents). Utilise-le pour CONTINUER le diagnostic, pas pour repartir "
+    "de zero : ne reproduis jamais une reponse deja donnee a l'identique, ne "
+    "repropose jamais une fiche deja servie sauf si un element nouveau "
+    "(capture, precision de l'agent) la rend a nouveau pertinente, et ne "
+    "repropose jamais une etape que l'agent a explicitement signalee comme "
+    "deja tentee sans succes dans un tour precedent -- passe a l'etape "
+    "suivante ou recommande l'escalade. Termine par UNE verification "
+    "concrete a demander avant le prochain tour (prochaine_verification), "
+    "vide si aucune n'est necessaire. Mets diagnostic_termine=true seulement "
+    "si le probleme semble resolu ou si le point d'escalade recommande dans "
+    "ta reponse est atteint."
+)
+
+DIAGNOSTIC_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **ANSWER_SCHEMA["properties"],
+        "screen_reading": {
+            "type": "string",
+            "description": (
+                "Description precise et litterale de ce qui est lisible sur la "
+                "capture d'ecran jointe A CE TOUR. Exactement 'aucune capture "
+                "fournie a ce tour' si aucune image n'est jointe cette fois-ci, "
+                "'aucun texte lisible sur cette image' si l'image jointe n'a "
+                "rien d'exploitable."
+            ),
+        },
+        "prochaine_verification": {
+            "type": "string",
+            "description": (
+                "Action ou verification concrete a demander a l'agent avant le "
+                "prochain tour (ex: 'Demande au client si le mode hors ligne "
+                "est actif'). Chaine vide si aucune verification n'est "
+                "necessaire ou si diagnostic_termine=true."
+            ),
+        },
+        "diagnostic_termine": {
+            "type": "boolean",
+            "description": (
+                "true si le probleme semble resolu par cette reponse, ou si le "
+                "point d'escalade recommande est atteint (plus rien a "
+                "diagnostiquer cote assistant). false tant que le diagnostic "
+                "peut continuer."
+            ),
+        },
+    },
+    "required": ANSWER_SCHEMA["required"]
+    + ["screen_reading", "prochaine_verification", "diagnostic_termine"],
+    "additionalProperties": False,
+}
 
 
 # Defense-in-depth backstop for primary_safe_summaries / annex_safe_summaries
@@ -1424,6 +1561,7 @@ def _generate_screenshot(
         ],
     )
     result = json.loads(resp.choices[0].message.content)
+    result["screen_reading"] = _redact_visible_password(result.get("screen_reading"))
     result["detected_error_codes"] = sorted(
         set(_ERROR_CODE_PATTERNS.findall(result.get("screen_reading") or ""))
     )
@@ -1549,6 +1687,338 @@ def analyze_screenshot_query_core_keyless(
     return result
 
 
+def _build_diagnostic_state_block(prior_turns: List[Dict], vocab: Dict[str, str]) -> str:
+    """Deterministic text block summarizing prior turns of THIS conversation
+    -- fiches deja servies (par titre : the only identifier already
+    available without new plumbing -- primary_source has no separate kb_id
+    field, see attach_sources()), codes d'erreur deja detectes (already
+    regex-validated by _ERROR_CODE_PATTERNS when that turn ran), entites du
+    vocabulaire controle mentionnees (same deterministic detection as
+    _detect_query_entities, applied here to prior queries AND prior screen
+    readings). Returns "" for an empty prior_turns (new conversation) -- the
+    caller then omits the block from the prompt entirely rather than
+    sending an empty section.
+
+    prior_turns: list of plain dicts shaped like app/app.py's _load_turns()
+    output (query, answer_text, primary_source, detected_error_codes,
+    screen_reading) -- deliberately duck-typed, this module never imports
+    app/app.py."""
+    if not prior_turns:
+        return ""
+    fiches: List[str] = []
+    codes: List[str] = []
+    entites: List[str] = []
+    captures = 0
+    for t in prior_turns:
+        ps = t.get("primary_source")
+        if ps and ps.get("title") and ps.get("used") and ps["title"] not in fiches:
+            fiches.append(ps["title"])
+        for c in t.get("detected_error_codes") or []:
+            if c not in codes:
+                codes.append(c)
+        probe_text = f"{t.get('query') or ''} {t.get('screen_reading') or ''}"
+        for e in _detect_query_entities(probe_text, vocab):
+            if e not in entites:
+                entites.append(e)
+        if t.get("screen_reading") and t["screen_reading"] not in (
+            "aucune capture fournie a ce tour",
+            "aucun texte lisible sur cette image",
+        ):
+            captures += 1
+    lines = ["ETAT DU DIAGNOSTIC (accumule sur cette conversation) :"]
+    lines.append("- Fiches deja servies : " + (", ".join(fiches) if fiches else "aucune"))
+    lines.append("- Codes d'erreur deja releves : " + (", ".join(codes) if codes else "aucun"))
+    lines.append("- Entites deja identifiees : " + (", ".join(entites) if entites else "aucune"))
+    if captures:
+        lines.append(f"- {captures} capture(s) d'ecran deja fournie(s) plus tot dans cette conversation.")
+    lines.append("- Tours precedents de cette conversation, du plus ancien au plus recent :")
+    for i, t in enumerate(prior_turns, 1):
+        q = (t.get("query") or "").strip()
+        a = (t.get("answer_text") or "").strip()
+        if len(a) > 600:
+            a = a[:600].rstrip() + "…"
+        lines.append(f"  Tour {i} -- Q: {q}")
+        lines.append(f"  Tour {i} -- R: {a}")
+    return "\n".join(lines)
+
+
+def _generate_diagnostic(
+    query: str,
+    context: str,
+    state_block: str,
+    image_b64: Optional[str],
+    image_mime: Optional[str],
+    client: AzureOpenAI,
+    model: str,
+    seed: int,
+) -> dict:
+    """Generation step for a diagnostic-conversation turn -- sibling of
+    generate()/_generate_screenshot(), unifying both: always uses
+    DIAGNOSTIC_ANSWER_SCHEMA/DIAGNOSTIC_SYSTEM_PROMPT, attaches an image
+    content part only when one was actually provided THIS turn (image_b64
+    not None), and prepends state_block (from
+    _build_diagnostic_state_block) to the user message when non-empty."""
+    user_text = f"CONTEXTE:\n{context}\n"
+    if state_block:
+        user_text += f"\n{state_block}\n"
+    user_text += f"\nMESSAGE COURANT DE L'AGENT: {query}"
+    content = [{"type": "text", "text": user_text}]
+    if image_b64:
+        content.append(
+            {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}}
+        )
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        seed=seed,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "diagnostic_turn",
+                "strict": True,
+                "schema": DIAGNOSTIC_ANSWER_SCHEMA,
+            },
+        },
+        messages=[
+            {"role": "system", "content": DIAGNOSTIC_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+    )
+    result = json.loads(resp.choices[0].message.content)
+    result["screen_reading"] = _redact_visible_password(result.get("screen_reading"))
+    result["detected_error_codes"] = sorted(
+        set(_ERROR_CODE_PATTERNS.findall(result.get("screen_reading") or ""))
+    )
+    return result
+
+
+def _build_retrieval_query(query: str, prior_turns: List[Dict], window: int = 2) -> str:
+    """Design note (2026-09-25, found live-testing layer 2): retrieval was
+    grounded on the CURRENT turn's raw query text only -- fine for a
+    standalone question, but a short elliptical follow-up in a diagnostic
+    conversation ("comment le faire") carries no topic signal on its own.
+    Observed live: after a turn about "AUTHENTICATOR", "comment le faire"
+    alone retrieved an unrelated document (LogMeIn) -- Yassine's call:
+    unacceptable, the engine has to know the topic is still Authenticator.
+    Folds the last `window` prior queries into the text handed to
+    retrieve_hierarchy()/select_primaries() (never into the text shown to
+    generation -- _generate_diagnostic still gets the raw current `query`,
+    the model already has the full prior turns via state_block). This also
+    feeds _detect_query_entities() inside retrieve_hierarchy() (same text),
+    so a controlled-vocabulary term mentioned in a recent turn (e.g.
+    'AUTHENTICATOR') keeps triggering the entity-boost scoringProfile even
+    when the current turn doesn't restate it -- no extra model call, same
+    deterministic mechanism already used for a single turn."""
+    if not prior_turns:
+        return query
+    recent = " ".join((t.get("query") or "").strip() for t in prior_turns[-window:])
+    return f"{recent} {query}".strip()
+
+
+def diagnostic_query_core(
+    client_id: str,
+    query: str,
+    prior_turns: List[Dict],
+    search_key: str,
+    aoai_client: AzureOpenAI,
+    image_b64: Optional[str] = None,
+    image_mime: Optional[str] = None,
+    cfg: Optional[dict] = None,
+) -> dict:
+    """Diagnostic-conversation sibling of answer_query_core() (api-key
+    path) -- see the 2026-09-24 (later) design note above
+    DIAGNOSTIC_SYSTEM_PROMPT. CLI/testing use (diagnostic_query()); the app
+    uses the RBAC/keyless twin below."""
+    cfg = cfg or load_engine_config(client_id)
+    index = cfg["knowledge"]["index"]
+    primary_count = cfg["retrieval"]["primaryCount"]
+    annex_count = cfg["retrieval"]["annexCount"]
+    gen = cfg["generation"]
+
+    search_headers = {"api-key": search_key}
+    retrieval_query = _build_retrieval_query(query, prior_turns)
+    candidates, annexes = retrieve_hierarchy(
+        retrieval_query, index, primary_count, annex_count, search_headers, client_id=client_id
+    )
+    chosen, selection_reason = select_primaries(
+        retrieval_query, candidates, aoai_client, gen["model"], gen["seed"]
+    )
+    chosen = chosen[:primary_count]
+    if chosen:
+        primaries = _expand_to_full_documents(
+            [candidates[i] for i in chosen], index, search_headers, client_id=client_id
+        )
+        _keys = {d.get("parent_id") or d.get("title") for d in primaries}
+        annexes = [a for a in annexes if (a.get("parent_id") or a.get("title")) not in _keys]
+    else:
+        primaries = candidates[:1]
+    context = format_context(primaries, annexes)
+
+    vocab = _client_entity_vocabulary(index, search_headers, client_id)
+    state_block = _build_diagnostic_state_block(prior_turns, vocab)
+
+    result = _generate_diagnostic(
+        query, context, state_block, image_b64, image_mime, aoai_client, gen["model"], gen["seed"]
+    )
+    selected = _selected_primary_index(result, primaries)
+    result = attach_sources(result, primaries, annexes)
+    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    result["_trace"] = {
+        "client": client_id,
+        "index": index,
+        "context": context,
+        "state_block": state_block,
+        "retrieval_query": retrieval_query,
+        "primary_title": base_primary.get("title") if base_primary else None,
+        "primary_reranker_score": (
+            base_primary.get("@search.rerankerScore") if base_primary else None
+        ),
+        "primary_selected_by_model": selected is not None,
+        "primary_selection_reason": selection_reason,
+        "primary_candidates": [
+            {"title": d.get("title"), "score": d.get("@search.rerankerScore")}
+            for d in candidates
+        ],
+        "annex_titles": [a.get("title") for a in annexes],
+    }
+    return result
+
+
+def diagnostic_query_core_keyless(
+    client_id: str,
+    query: str,
+    prior_turns: List[Dict],
+    search_bearer_token: str,
+    aoai_client: AzureOpenAI,
+    image_b64: Optional[str] = None,
+    image_mime: Optional[str] = None,
+    cfg: Optional[dict] = None,
+) -> dict:
+    """Same as diagnostic_query_core(), RBAC/Bearer auth on Search instead
+    of an admin api-key -- app/app.py calls this for EVERY turn of a
+    diagnostic conversation now (prior_turns=[] for a brand-new one),
+    replacing both answer_query_core_keyless and
+    analyze_screenshot_query_core_keyless in that file. Those two functions
+    (and answer_query_core/analyze_screenshot_query_core) are kept
+    unchanged for the CLI/eval paths."""
+    cfg = cfg or load_engine_config(client_id)
+    index = cfg["knowledge"]["index"]
+    primary_count = cfg["retrieval"]["primaryCount"]
+    annex_count = cfg["retrieval"]["annexCount"]
+    gen = cfg["generation"]
+
+    search_headers = {"Authorization": f"Bearer {search_bearer_token}"}
+    retrieval_query = _build_retrieval_query(query, prior_turns)
+    candidates, annexes = retrieve_hierarchy(
+        retrieval_query, index, primary_count, annex_count, search_headers, client_id=client_id
+    )
+    chosen, selection_reason = select_primaries(
+        retrieval_query, candidates, aoai_client, gen["model"], gen["seed"]
+    )
+    chosen = chosen[:primary_count]
+    if chosen:
+        primaries = _expand_to_full_documents(
+            [candidates[i] for i in chosen], index, search_headers, client_id=client_id
+        )
+        _keys = {d.get("parent_id") or d.get("title") for d in primaries}
+        annexes = [a for a in annexes if (a.get("parent_id") or a.get("title")) not in _keys]
+    else:
+        primaries = candidates[:1]
+    context = format_context(primaries, annexes)
+
+    vocab = _client_entity_vocabulary(index, search_headers, client_id)
+    state_block = _build_diagnostic_state_block(prior_turns, vocab)
+
+    result = _generate_diagnostic(
+        query, context, state_block, image_b64, image_mime, aoai_client, gen["model"], gen["seed"]
+    )
+    selected = _selected_primary_index(result, primaries)
+    result = attach_sources(result, primaries, annexes)
+    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    result["_trace"] = {
+        "client": client_id,
+        "index": index,
+        "context": context,
+        "state_block": state_block,
+        "retrieval_query": retrieval_query,
+        "primary_title": base_primary.get("title") if base_primary else None,
+        "primary_reranker_score": (
+            base_primary.get("@search.rerankerScore") if base_primary else None
+        ),
+        "primary_selected_by_model": selected is not None,
+        "primary_selection_reason": selection_reason,
+        "primary_candidates": [
+            {"title": d.get("title"), "score": d.get("@search.rerankerScore")}
+            for d in candidates
+        ],
+        "annex_titles": [a.get("title") for a in annexes],
+    }
+    return result
+
+
+def diagnostic_query(
+    client_id: str,
+    query: str,
+    prior_turns_path: Optional[str] = None,
+    image_path: Optional[str] = None,
+) -> dict:
+    """CLI convenience for testing layer 2 without the web app:
+    prior_turns_path points to a JSON file holding a list of turn dicts
+    (same shape app/app.py's _load_turns() returns -- see
+    _build_diagnostic_state_block's docstring), letting Yassine simulate a
+    follow-up turn from the terminal. Fetches keys via az, like
+    analyze_screenshot_query()."""
+    import mimetypes
+
+    cfg = load_engine_config(client_id)
+
+    print("Retrieving keys (runtime, not stored)...")
+    search_key = az(
+        f"az search admin-key show --service-name {SEARCH_SERVICE} "
+        f"--resource-group {RG} --query primaryKey -o tsv"
+    )
+    aoai_key = az(
+        f"az cognitiveservices account keys list --name {AOAI_ACCOUNT} "
+        f"--resource-group {RG} --query key1 -o tsv"
+    )
+    aoai_client = AzureOpenAI(
+        azure_endpoint=AOAI_ENDPOINT, api_key=aoai_key, api_version=AOAI_API_VERSION
+    )
+
+    prior_turns = []
+    if prior_turns_path:
+        # utf-8-sig (2026-09-24 later note): Windows PowerShell's
+        # `Set-Content -Encoding utf8` writes a BOM -- plain utf-8 here
+        # would leave it in the string and break json.loads(). -sig
+        # strips a BOM if present, harmless if absent (recurring
+        # Windows/PowerShell encoding theme, see project memory).
+        loaded = json.loads(Path(prior_turns_path).read_text(encoding="utf-8-sig"))
+        # Defensive (2026-09-24 later): a common PowerShell pitfall is a
+        # single-element array collapsing to a bare object through the
+        # pipeline (`@($x) | ConvertTo-Json` only unwraps when $x is
+        # itself already an array) -- accept either shape rather than
+        # failing deep inside _build_diagnostic_state_block with a
+        # confusing AttributeError.
+        prior_turns = loaded if isinstance(loaded, list) else [loaded]
+
+    image_b64 = image_mime = None
+    if image_path:
+        image_bytes = Path(image_path).read_bytes()
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        image_mime = mimetypes.guess_type(image_path)[0] or "image/png"
+
+    return diagnostic_query_core(
+        client_id,
+        query,
+        prior_turns,
+        search_key,
+        aoai_client,
+        image_b64=image_b64,
+        image_mime=image_mime,
+        cfg=cfg,
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="KnowledgeEngine v9 -- orchestration layer")
     parser.add_argument("--client", required=True, help="client id, e.g. clienta or client-v")
@@ -1558,12 +2028,26 @@ if __name__ == "__main__":
         help=(
             "Path to a local screenshot (2026-09-24 design note): routes to "
             "analyze_screenshot_query() instead of answer_query() -- diagnostic "
-            "screenshot-upload path, does not affect the default flow."
+            "screenshot-upload path, does not affect the default flow. Combined "
+            "with --prior-turns, routes to diagnostic_query() instead (layer 2)."
+        ),
+    )
+    parser.add_argument(
+        "--prior-turns",
+        help=(
+            "Path to a JSON file of prior turns (2026-09-24 later, layer 2 "
+            "design note above DIAGNOSTIC_SYSTEM_PROMPT): routes to "
+            "diagnostic_query() instead of answer_query()/analyze_screenshot_query() "
+            "-- simulates a follow-up turn in a diagnostic conversation, with or "
+            "without --image. Pass an empty JSON array ([]) to test diagnostic_query() "
+            "on a first turn (no prior state, same as a brand-new conversation)."
         ),
     )
     args = parser.parse_args()
 
-    if args.image:
+    if args.prior_turns is not None:
+        result = diagnostic_query(args.client, args.query, args.prior_turns, args.image)
+    elif args.image:
         result = analyze_screenshot_query(args.client, args.query, args.image)
     else:
         result = answer_query(args.client, args.query)

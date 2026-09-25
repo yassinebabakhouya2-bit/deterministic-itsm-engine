@@ -2,9 +2,11 @@
 # KnowledgeEngine v9 — Web interface (Jalon 4, auth updated Jalon 5)
 #
 # Thin Flask front end over orchestration/answer.py's
-# answer_query_core_keyless(): retrieval + A3 hierarchy split + Structured
-# Outputs generation, unchanged from Jalon 3 — this file adds nothing to
-# the RAG pipeline itself, only a form and an HTTP entry point.
+# diagnostic_query_core_keyless() (2026-09-24 later, layer 2 -- was
+# answer_query_core_keyless()/analyze_screenshot_query_core_keyless() before
+# the multi-turn state work): retrieval + A3 hierarchy split + Structured
+# Outputs generation, largely unchanged from Jalon 3 -- this file adds
+# nothing to the RAG pipeline itself, only a form and an HTTP entry point.
 #
 # Credentials: no admin keys, no secrets anywhere in this app. Auth is
 # Azure AD RBAC via DefaultAzureCredential, which resolves to the App
@@ -130,9 +132,8 @@ from flask import Flask, redirect, render_template_string, request, url_for
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestration"))
 from answer import (  # noqa: E402 -- reuse orchestration logic (axiom A4), not a duplicate
-    analyze_screenshot_query_core_keyless,
-    answer_query_core_keyless,
     build_aoai_client_keyless,
+    diagnostic_query_core_keyless,
     load_engine_config,
 )
 
@@ -323,8 +324,11 @@ def _append_turn(conv_id: str, entry: dict) -> int:
             "modality_summary": entry.get("modality_summary") or "",
             "primary_source_json": json.dumps(entry.get("primary_source")),
             "related_sources_json": json.dumps(entry.get("related_sources") or []),
+            "answer_text": entry.get("answer_text") or "",
             "screen_reading": entry.get("screen_reading") or "",
             "detected_error_codes_json": json.dumps(entry.get("detected_error_codes") or []),
+            "prochaine_verification": entry.get("prochaine_verification") or "",
+            "diagnostic_termine": bool(entry.get("diagnostic_termine")),
             "createdAt": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -378,8 +382,11 @@ def _load_turns(conv_id: str):
                 "modality_summary": e.get("modality_summary"),
                 "primary_source": json.loads(e.get("primary_source_json") or "null"),
                 "related_sources": json.loads(e.get("related_sources_json") or "[]"),
+                "answer_text": e.get("answer_text") or "",
                 "screen_reading": e.get("screen_reading") or None,
                 "detected_error_codes": json.loads(e.get("detected_error_codes_json") or "[]"),
+                "prochaine_verification": e.get("prochaine_verification") or None,
+                "diagnostic_termine": bool(e.get("diagnostic_termine")),
             }
         )
     return turns
@@ -543,6 +550,10 @@ PAGE = """
   .screenshot-input{position:absolute;width:1px;height:1px;overflow:hidden;opacity:0}
   .screen-reading-note{margin:0 0 8px;font-size:.8rem;color:var(--muted);font-style:italic;
     background:var(--panel-2);border-radius:8px;padding:7px 10px}
+  .next-check-note{margin:10px 0 0;font-size:.82rem;color:var(--accent);
+    background:var(--accent-dim);border-radius:8px;padding:8px 10px}
+  .diagnostic-done-badge{margin:10px 0 0;font-size:.82rem;color:var(--ok);
+    border:1px solid var(--ok);border-radius:8px;padding:6px 10px;display:inline-block}
 </style>
 </head>
 <body>
@@ -624,6 +635,11 @@ PAGE = """
           <span class="confidence confidence-{{ t.confidence_level }}"><span class="dot"></span>Confiance {{ t.confidence_label }}</span>
           {% if t.modality_summary %}<span class="modality-summary">{{ t.modality_summary }}</span>{% endif %}
         </div>
+        {% if t.diagnostic_termine %}
+        <div class="diagnostic-done-badge">✅ Diagnostic considéré comme terminé</div>
+        {% elif t.prochaine_verification %}
+        <div class="next-check-note">🔎 Prochaine vérification : {{ t.prochaine_verification }}</div>
+        {% endif %}
 
         {% if t.primary_source or t.related_sources %}
         <div class="sources">
@@ -712,7 +728,8 @@ PAGE = """
     <input type="hidden" name="conversation_id" value="{{ active_conversation_id or '' }}">
     <div class="composer-inner">
       <div class="composer-row">
-        <select name="client_id" class="client-select" title="Client">
+        <select name="client_id" class="client-select" title="Client"
+          onchange="document.querySelectorAll('.examples input[name=client_id]').forEach(i=>i.value=this.value)">
           {% for c in allowed_clients %}
           <option value="{{ c }}" {% if c == client_id %}selected{% endif %}>{{ c }}</option>
           {% endfor %}
@@ -789,24 +806,40 @@ def _handle(conversation_id):
                 load_engine_config(client_id)  # fail fast with a clear error if misconfigured
                 token = get_search_bearer_token()
 
-                # Design note (2026-09-24, Jalon 9 -- diagnostic screenshot
-                # upload, layer 1): a screenshot attached to the question
-                # routes to analyze_screenshot_query_core_keyless() instead
-                # of answer_query_core_keyless() -- same retrieval/sources
-                # contract (primary_source/related_sources), plus
-                # screen_reading/detected_error_codes. Processed in memory
-                # only: the image itself is never written to blob storage or
+                # Design note (2026-09-24, later same day -- diagnostic
+                # layer 2: persistent multi-turn state). Every turn of a
+                # conversation now goes through diagnostic_query_core_keyless
+                # -- a screenshot attached THIS turn is still optional
+                # (image_b64=None otherwise), but the call is the same one
+                # whether or not an image is attached and whether or not
+                # this is the first turn: `turns` (loaded above from
+                # _load_turns when conversation_id was given, [] for a new
+                # conversation) is passed as prior_turns so the model gets
+                # the deterministic ETAT DU DIAGNOSTIC block built from
+                # everything already established in this conversation
+                # (fiches servies, codes d'erreur, entites, tours precedents)
+                # -- see orchestration/answer.py's design note above
+                # DIAGNOSTIC_SYSTEM_PROMPT. Replaces the separate
+                # answer_query_core_keyless / analyze_screenshot_query_core_keyless
+                # branching from layer 1. Screenshot handling is unchanged:
+                # processed in memory only, never written to blob storage or
                 # to the conversation table, only the model's own textual
-                # reading of it -- no new retention/PII surface to manage.
+                # reading of it.
                 screenshot = request.files.get("screenshot")
+                image_b64 = image_mime = None
                 if screenshot and screenshot.filename:
                     image_b64 = base64.b64encode(screenshot.read()).decode("ascii")
                     image_mime = screenshot.mimetype or "image/png"
-                    raw = analyze_screenshot_query_core_keyless(
-                        client_id, query, image_b64, image_mime, token, _aoai_client
-                    )
-                else:
-                    raw = answer_query_core_keyless(client_id, query, token, _aoai_client)
+
+                raw = diagnostic_query_core_keyless(
+                    client_id,
+                    query,
+                    turns,
+                    token,
+                    _aoai_client,
+                    image_b64=image_b64,
+                    image_mime=image_mime,
+                )
 
                 primary = raw.get("primary_source")
                 related = raw.get("related_sources", [])
@@ -815,6 +848,7 @@ def _handle(conversation_id):
                 )
                 entry = {
                     "query": query,
+                    "answer_text": raw.get("answer") or "",
                     "answer_html": _render_answer_html(raw.get("answer")),
                     "ambiguous": raw.get("ambiguous"),
                     "unanswerable_reason": raw.get("unanswerable_reason"),
@@ -825,6 +859,8 @@ def _handle(conversation_id):
                     "related_sources": related,
                     "screen_reading": raw.get("screen_reading"),
                     "detected_error_codes": raw.get("detected_error_codes"),
+                    "prochaine_verification": raw.get("prochaine_verification"),
+                    "diagnostic_termine": raw.get("diagnostic_termine"),
                 }
 
                 persisted_id = None

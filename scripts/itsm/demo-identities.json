@@ -1,0 +1,23 @@
+{
+  "_comment": "Jalon 10 - fictional demo identities for the ITSM action module. ASCII only (PowerShell 5.1 encoding pitfall, see runbook 9.1).",
+  "usageLocation": "FR",
+  "companyName": "Demo BTP",
+  "groups": [
+    { "name": "SG-SP-Projets",   "description": "Access to the Projets SharePoint site (scenario 3: access request)" },
+    { "name": "SG-VPN-Users",    "description": "VPN access (scenario 5: departure - to be removed)" },
+    { "name": "SG-App-Planning", "description": "Planning application users (scenario 5: departure - to be removed)" }
+  ],
+  "users": [
+    { "nick": "claire.dubois",  "displayName": "Claire Dubois",  "jobTitle": "Responsable Travaux",   "department": "Travaux",      "manager": null,            "groups": ["SG-SP-Projets","SG-VPN-Users"],                   "entraRole": null,               "scenario": "manager of the demo users" },
+    { "nick": "amine.elidrissi","displayName": "Amine El Idrissi","jobTitle": "Conducteur de travaux", "department": "Travaux",      "manager": "claire.dubois", "groups": ["SG-VPN-Users"],                                   "entraRole": null,               "scenario": "1 - MFA reset (new phone) -> delete Authenticator + TAP + revoke sessions" },
+    { "nick": "sophie.martin",  "displayName": "Sophie Martin",  "jobTitle": "Assistante de chantier","department": "Travaux",      "manager": "claire.dubois", "groups": [],                                                 "entraRole": null,               "scenario": "2 - password reset / forgot password" },
+    { "nick": "karim.benali",   "displayName": "Karim Benali",   "jobTitle": "Chef de projet",        "department": "Etudes",       "manager": "claire.dubois", "groups": [],                                                 "entraRole": null,               "scenario": "3 - access request (RITM) -> add to SG-SP-Projets" },
+    { "nick": "julie.bernard",  "displayName": "Julie Bernard",  "jobTitle": "Dessinatrice",          "department": "Etudes",       "manager": "claire.dubois", "groups": [],                                                 "entraRole": null,               "scenario": "4 - licence request (RITM) - only if a spare licence exists in the tenant" },
+    { "nick": "thomas.leroy",   "displayName": "Thomas Leroy",   "jobTitle": "Technicien methodes",   "department": "Methodes",     "manager": "claire.dubois", "groups": ["SG-SP-Projets","SG-VPN-Users","SG-App-Planning"], "entraRole": null,               "scenario": "5 - departure (RITM) -> disable + revoke + remove groups/licences" },
+    { "nick": "nadia.admin",    "displayName": "Nadia Admin",    "jobTitle": "Administratrice IT",    "department": "DSI",          "manager": null,            "groups": [],                                                 "entraRole": "User Administrator","scenario": "guardrail - privileged account: reset must be REFUSED (Helpdesk Administrator cannot reset a User Administrator)" }
+  ],
+  "servicenow": {
+    "assignmentGroup": "KE-Automation",
+    "assignmentGroupDescription": "Queue polled by the KnowledgeEngine ITSM action module (Jalon 10)"
+  }
+}
