@@ -35,8 +35,10 @@
 # (clienta/b/c) are unchanged: golden sets tracked in eval/, 100%
 # synthetic per eval/README.md.
 # =====================================================================
+import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from azure.ai.evaluation import (
@@ -59,6 +61,21 @@ from answer import (  # noqa: E402 -- reuse orchestration logic (axiom A4), not 
 )
 
 EVAL_DIR = Path(__file__).resolve().parent
+
+# Azure AI Foundry project that receives each run (portal > Evaluation tab).
+# Auth = the signed-in az identity (DefaultAzureCredential), no key.
+# Only SYNTHETIC clients are uploaded: real clients' questions/answers never
+# leave clients-local/ (same isolation rule as the golden sets).
+FOUNDRY_PROJECT_ENDPOINT = (
+    "https://aif-knowledgeengine2-v9.services.ai.azure.com/api/projects/proj-knowledgeengine2-v9"
+)
+
+_parser = argparse.ArgumentParser(description="KnowledgeEngine v9 RAG evaluation")
+_parser.add_argument("--client", action="append",
+                     help="evaluate only this client (repeatable); default = all")
+_parser.add_argument("--no-upload", action="store_true",
+                     help="keep results local, do not log the run to Azure AI Foundry")
+ARGS = _parser.parse_args()
 CLIENTS_LOCAL_DIR = EVAL_DIR.parent / "clients-local"
 
 # Synthetic demo clients: golden set tracked in eval/, 100% synthetic (isolation M2).
@@ -97,7 +114,10 @@ model_config = {
 
 all_metrics = {}
 
+RUN_STAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 for CLIENT_ID in CLIENTS + REAL_CLIENTS:
+    if ARGS.client and CLIENT_ID not in ARGS.client:
+        continue
     base_dir = client_base_dir(CLIENT_ID)
     golden_path = base_dir / f"golden_{CLIENT_ID}.jsonl"
     if not golden_path.exists():
@@ -161,9 +181,19 @@ for CLIENT_ID in CLIENTS + REAL_CLIENTS:
             },
         },
         output_path=str(base_dir / f"eval_results_{CLIENT_ID}.json"),
+        **(
+            {
+                "azure_ai_project": FOUNDRY_PROJECT_ENDPOINT,
+                "evaluation_name": f"KE-v9 {CLIENT_ID} {RUN_STAMP}",
+            }
+            if CLIENT_ID in CLIENTS and not ARGS.no_upload
+            else {}
+        ),
     )
 
     all_metrics[CLIENT_ID] = result["metrics"]
+    if result.get("studio_url"):
+        print(f"  Foundry portal: {result['studio_url']}")
 
 # Synthetic clients' summary stays in eval/ (tracked dir, but the summary
 # itself is git-ignored -- eval/eval_summary.json -- same as before).
@@ -173,12 +203,23 @@ for CLIENT_ID in CLIENTS + REAL_CLIENTS:
 synthetic_metrics = {c: m for c, m in all_metrics.items() if c in CLIENTS}
 real_metrics = {c: m for c, m in all_metrics.items() if c in REAL_CLIENTS}
 
-with open(EVAL_DIR / "eval_summary.json", "w", encoding="utf-8") as f:
-    json.dump(synthetic_metrics, f, ensure_ascii=False, indent=2)
+def _merge_summary(path: Path, metrics: dict) -> None:
+    """Update only the clients evaluated in this run (--client keeps the others)."""
+    merged = {}
+    if path.exists():
+        try:
+            merged = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            merged = {}
+    merged.update(metrics)
+    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+if synthetic_metrics:
+    _merge_summary(EVAL_DIR / "eval_summary.json", synthetic_metrics)
 
 if real_metrics:
-    with open(CLIENTS_LOCAL_DIR / "eval_summary.json", "w", encoding="utf-8") as f:
-        json.dump(real_metrics, f, ensure_ascii=False, indent=2)
+    _merge_summary(CLIENTS_LOCAL_DIR / "eval_summary.json", real_metrics)
 
 print("\n===== CONSOLIDATED RELIABILITY SCORE (KnowledgeEngineV9, averages /5) =====")
 for CLIENT_ID, metrics in all_metrics.items():

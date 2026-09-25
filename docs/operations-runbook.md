@@ -790,7 +790,7 @@ them to `-Exclude` until this is root-caused.
 ## §10. Video pipeline (Jalon 8) — Video Indexer account setup & API auth chain
 
 Context: Jalon 8 scoped 2026-09-20 for client-s (transcript + OCR + topics,
-new SharePoint folder on the [CLIENT-PROD] site). Research done before writing any
+new SharePoint folder on the client-s site). Research done before writing any
 Bicep/Logic App — captured here per CLAUDE.md so the next session doesn't
 redo it. Nothing deployed yet; this is the auth/API chain to build against.
 
@@ -897,7 +897,7 @@ Reste à récupérer avant le test API (§10.2) : le `principalId` de l'identit�
 - **Entra ID (personal tenant only)**: 7 fictional users (`claire.dubois` manager, `amine.elidrissi` MFA reset, `sophie.martin` password reset, `karim.benali` access request, `julie.bernard` licence request, `thomas.leroy` departure, `nadia.admin` = User Administrator, the guardrail persona whose reset must be refused), 3 security groups (`SG-SP-Projets`, `SG-VPN-Users`, `SG-App-Planning`), manager links, memberships, and the directory role.
 - **ServiceNow dev instance**: assignment group `KE-Automation` and matching `sys_user` records. Link key between the two systems: ServiceNow `email` = Entra `userPrincipalName`.
 
-Run from the repo root, after `az login --tenant <personal tenant>` (the script asks for an explicit `YES` after showing the signed-in tenant, to avoid hitting a DXC/[CLIENT-PARENT] tenant):
+Run from the repo root, after `az login --tenant <personal tenant>` (the script asks for an explicit `YES` after showing the signed-in tenant, to avoid hitting an employer or client tenant):
 
 ```powershell
 .\scripts\itsm\seed-demo-identities.ps1 -SnInstance dev123456
@@ -1068,3 +1068,12 @@ az deployment group create --name itsm-execute --resource-group rg-knowledgeengi
 - 2026-09-25 05:45 **bug on the first live reveal** (INC0010002): the row was marked "remis" but no password was displayed → **root cause** the reveal route claimed the row (secretRevealedAtUtc) BEFORE reading the vault, so a vault read failure burnt the one-time reveal silently (the page only showed "remis ... Supprimé du coffre"). **Fix** (`app/itsm.py`): read the vault first, then claim (If-Match), then delete + show; a failure before the claim now shows the HTTP status and stays retryable. Smoke test added (vault 403 → nothing burnt, no delete). Underlying vault read failure still to identify from the new message after redeploy. Recovery for a burnt row: Storage browser → edit the row → delete `secretRevealedAtUtc` and `secretRevealedByName` (the secret stays in the delivery vault until its 1 h expiry).
 - 2026-09-25 05:52 retry of the INC0010002 reveal after the fix → "Code introuvable (HTTP 404)": the secret was already gone from the delivery vault, i.e. the first click (old code) had read AND deleted it — the one-time page was consumed without the agent seeing the value. Decision: replay via `reset-demo.ps1`. Executor hardened before the replay: `mfa_reset` now deletes any existing Temporary Access Pass before creating a new one (only one TAP per user — a replay within the hour would otherwise fail).
 - 2026-09-25 06:00 replay after executor redeploy + `reset-demo.ps1` → **step 10.4b validated live** (per Yassine: "c'est tout bon"): INC0010001 `mfa_reset` (old TAP cleared, one-time TAP 60 min) and INC0010002 `password_reset` executed, one-time reveal displayed to the validating agent and deleted from the delivery vault. **Jalon 10 functional scope complete**: poll → GPT-4o proposal + deterministic guards → agent review → execution (group_add, offboarding, password_reset, mfa_reset) → ServiceNow closure/resolution, demo replayable with `reset-demo.ps1`.
+
+### 11.10 Evaluation runs logged to Azure AI Foundry (2026-09-25)
+
+`eval/evaluate_rag.py` now passes `azure_ai_project` (project endpoint `https://aif-knowledgeengine2-v9.services.ai.azure.com/api/projects/proj-knowledgeengine2-v9`) + `evaluation_name` to `evaluate()`, so each run of a **synthetic** client (clienta/b/c) appears in the Foundry portal, Evaluation tab, with per-question scores. Real clients (client-s) are never uploaded — their results stay in `clients-local/` only. Auth = the signed-in `az` identity (DefaultAzureCredential), no key. New flags: `--client <id>` (repeatable, run a subset — fewer gpt-4o calls, less 429 risk) and `--no-upload` (local only). `eval_summary.json` is now merged per client instead of overwritten, so a `--client` run keeps the other clients' scores.
+
+```powershell
+py -X utf8 eval\evaluate_rag.py --client clienta
+```
+Not yet run live at time of writing — if the upload fails with 403, the signed-in user needs the **Azure AI User** role on the Foundry project.
