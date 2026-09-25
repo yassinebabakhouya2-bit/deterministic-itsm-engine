@@ -956,3 +956,37 @@ az deployment group create --resource-group rg-knowledgeengine-v9 --template-fil
 - 2026-09-25 03:04 first run → `Get_sn_secret` **Forbidden**: the run fired the very second the deployment finished, before the new Key Vault Secrets User assignment had propagated (expected, not a config error). 03:09 run → **Succeeded** (2.6 s).
 - Verified in Storage browser: `itsmtickets` holds 7 rows (PartitionKey `itsm-demo`, RowKey INC0010001…RITM0010003); both points flagged "verify on first run" are confirmed: MERGE-over-POST upsert with OAuth works, and dot-walked fields come back as flat keys (`subjectEmail` / `openedByEmail` = `amine.elidrissi@KnowledgeEngineV9.onmicrosoft.com` on INC0010001). The 100-char Key Vault secret is correct (ServiceNow-generated password).
 - Cost note: Consumption plan, 288 runs/day × ~20 actions — disable the Logic App (`az logic workflow update ... --state Disabled` or Portal → Disable) between demo periods.
+
+### 11.5 Proposal Logic App (step 10.2) — `itsm/propose/`
+
+Design: `logic-itsm-propose-itsm-demo`, every 5 min, picks `itsmtickets` rows without `proposalStatus`; per ticket: Graph facts (subject user, directory roles, groups, manager, licences, tenant SKU seats — read-only, managed identity) → GPT-4o (`gpt-4o` deployment, temperature 0, strict `json_schema`, closed action enum) → deterministic guards (Logic App expressions) → MERGE `proposalStatus` (`pending_review` / `refused` / `needs_human`), `proposalAction`, `proposalJson`, `proposalRationale`, `guardReasons`, `subjectPrivilegedRoles`, `managerEmail`… into the same row. Nothing is executed on Entra/ServiceNow. Guard list and statuses are documented at the top of `itsm/propose/main.bicep`. The workflow JSON is generated: edit `itsm/propose/gen_workflow.py`, run `python itsm/propose/gen_workflow.py`, redeploy.
+
+1. Deploy (the Logic App is created **Disabled** on purpose):
+```powershell
+az deployment group create --name itsm-propose --resource-group rg-knowledgeengine-v9 --template-file itsm/propose/main.bicep --query properties.outputs.managedIdentityPrincipalId.value -o tsv
+```
+2. Grant Graph read permission to its managed identity (not possible from Bicep):
+```powershell
+.\scripts\itsm\grant-graph-app-roles.ps1 -PrincipalId <principalId from step 1> -Roles Directory.Read.All
+```
+3. Wait ~5 min (RBAC + Graph token cache), then enable: Portal → `logic-itsm-propose-itsm-demo` → Enable (or Run trigger).
+4. Expected on the 7 demo tickets: INC0010001 `mfa_reset`/pending_review; INC0010002 `password_reset`/pending_review; INC0010003 refused (`target_privileged_role`); INC0010004 refused (`target_is_not_requester`, `secret_requested_for_third_party`); RITM0010001 `group_add` SG-SP-Projets/pending_review; RITM0010002 needs_human (`no_free_license_seat`, unless the tenant has a free Visio seat); RITM0010003 `offboarding`/pending_review (opened by the manager claire.dubois).
+5. To re-run a proposal on a row: delete its `proposalStatus` property in Storage browser (or all proposal fields), the next run picks it up again.
+- 2026-09-25 03:34: `itsm-propose` deployment Succeeded (MI principal `b5043764-193c-49f0-a7c8-6baa10968226`); 03:35 `grant-graph-app-roles.ps1 ... -Roles Directory.Read.All` → granted. Pitfall: the runbook placeholder `<principalId ...>` must be replaced — PowerShell parses `<` as a redirection operator.
+- 2026-09-25 03:37 first runs (Enable + manual Run → **two overlapping runs**): Graph lookups, GPT-4o call and JSON parsing all OK; **failed** at `Compose_reasons` → `InvalidTemplate: 'createArray' expects a comma separated list of parameters. The function was invoked with no parameters` → **root cause** `createArray()` with no argument is not valid in Logic Apps expressions → **fix** use `json('[]')` for an empty array (gen_workflow.py). Also added trigger concurrency = 1 (no overlapping runs) and a `startEnabled` Bicep param so a redeploy does not disable the Logic App again. Rows were not modified by the failed runs (the MERGE never ran), so they are picked up again automatically.
+- Redeploy after a workflow change (roles already granted):
+```powershell
+az deployment group create --name itsm-propose --resource-group rg-knowledgeengine-v9 --template-file itsm/propose/main.bicep --parameters startEnabled=true -o none
+```
+- 2026-09-25 03:43 run after the fix → **Succeeded** (14.8 s, 7 tickets). Result = **7/7 match the expected golden set** (`scripts/itsm/demo-tickets.json`):
+```
+RowKey       GuardReasons                                              ProposalAction    ProposalStatus
+INC0010001                                                             mfa_reset         pending_review
+INC0010002                                                             password_reset    pending_review
+INC0010003   target_privileged_role                                    password_reset    refused
+INC0010004   target_is_not_requester,secret_requested_for_third_party  password_reset    refused
+RITM0010001                                                            group_add         pending_review
+RITM0010002  no_free_license_seat                                      license_assign    needs_human
+RITM0010003                                                            offboarding       pending_review
+```
+Quick check command: `az storage entity query --account-name stknowledgeengine2v9 --table-name itsmtickets --select RowKey proposalAction proposalStatus guardReasons --query items -o table`
