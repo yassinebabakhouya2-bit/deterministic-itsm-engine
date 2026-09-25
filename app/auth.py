@@ -46,6 +46,15 @@ _GROUP_CLAIM_TYPES = {"groups", "http://schemas.microsoft.com/ws/2008/06/identit
 # Never involved in the access decision itself, which stays entirely
 # resolve_allowed_clients()'s job.
 _USER_CLAIM_TYPES = {"http://schemas.microsoft.com/identity/claims/objectidentifier", "oid"}
+# Display name / username claims (2026-09-... profile avatar in the header)
+# -- purely cosmetic, never involved in the access decision. Same
+# short-name/long-URI belt-and-suspenders as the other claim sets here.
+_NAME_CLAIM_TYPES = {"name", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"}
+_USERNAME_CLAIM_TYPES = {
+    "preferred_username",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+}
 
 # Known limitation (not handled here): Entra only emits `groups` inline
 # below ~200 groups per user; beyond that it emits a "groups overage"
@@ -164,6 +173,18 @@ def resolve_user_id(claims: List[dict]) -> Optional[str]:
     return ids[0] if ids else None
 
 
+def resolve_display_name(claims: List[dict]) -> Optional[str]:
+    """Human-readable name for the header's profile avatar/dropdown --
+    display name first, falling back to the username/UPN/email claim.
+    Purely cosmetic (see _NAME_CLAIM_TYPES note above); None if neither is
+    present, same "caller must not assume" posture as resolve_user_id."""
+    names = _claim_values(claims, _NAME_CLAIM_TYPES)
+    if names:
+        return names[0]
+    usernames = _claim_values(claims, _USERNAME_CLAIM_TYPES)
+    return usernames[0] if usernames else None
+
+
 def resolve_allowed_clients(
     claims: List[dict],
     tenant_only: TenantOnlyMap,
@@ -190,3 +211,15 @@ def resolve_allowed_clients(
         if client_id and client_id not in allowed:
             allowed.append(client_id)
     return allowed
+
+
+def has_tenant_and_group(claims: List[dict], tenant_id: Optional[str], group_id: Optional[str]) -> bool:
+    """Jalon 10 (ITSM review tab, app/itsm.py): True only if the validated
+    token comes from `tenant_id` AND carries `group_id` in its `groups`
+    claim. Deny-by-default: a missing or placeholder ('TODO-...') tenant or
+    group in config/itsm.yaml matches nobody. Same claims-only posture as
+    resolve_allowed_clients -- never anything the browser posted."""
+    if _is_placeholder(tenant_id) or _is_placeholder(group_id):
+        return False
+    return (tenant_id in _claim_values(claims, _TENANT_CLAIM_TYPES)
+            and group_id in _claim_values(claims, _GROUP_CLAIM_TYPES))

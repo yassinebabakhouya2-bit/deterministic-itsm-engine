@@ -115,8 +115,10 @@
 # from the call, never the call's own words.
 # =====================================================================
 import base64
+import html
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -141,6 +143,7 @@ from auth import (  # noqa: E402
     build_access_maps,
     parse_client_principal,
     resolve_allowed_clients,
+    resolve_display_name,
     resolve_user_id,
 )
 
@@ -194,6 +197,12 @@ _conv_turns_client = _table_service.get_table_client(_CONV_TURNS_TABLE)
 
 app = Flask(__name__)
 
+# Jalon 10 (step 10.3): ITSM review tab -- separate module/blueprint, see app/itsm.py.
+# Records agent decisions only; never executes anything on Entra ID / ServiceNow.
+from itsm import create_itsm_blueprint, itsm_access_for_request  # noqa: E402
+
+app.register_blueprint(create_itsm_blueprint(_table_service))
+
 HISTORY_MAX = 30  # conversations listed in the sidebar
 
 EXAMPLE_QUESTIONS = [
@@ -217,14 +226,51 @@ def _source_badge(source_type):
 
 app.jinja_env.filters["badge"] = _source_badge
 
+
+def _initials(name):
+    parts = [p for p in re.split(r"[\s._@-]+", (name or "").strip()) if p]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[1][0]).upper()
+
+
+app.jinja_env.filters["initials"] = _initials
+# clean_excerpt filter is registered right after _clean_excerpt is defined (below):
+# registering it here raised NameError at import -> the site failed to start (2026-09-25).
+
 # Allowlist for the sanitized answer HTML -- deliberately no attributes at
 # all (no href/src/on*), see module docstring.
 _MD_ALLOWED_TAGS = {"p", "strong", "em", "ul", "ol", "li", "br", "code", "pre", "blockquote", "h3", "h4"}
 
 
 def _render_answer_html(text):
-    html = _markdown_lib.markdown(text or "", extensions=["nl2br", "sane_lists"])
-    return nh3.clean(html, tags=_MD_ALLOWED_TAGS, attributes={})
+    rendered = _markdown_lib.markdown(text or "", extensions=["nl2br", "sane_lists"])
+    return nh3.clean(rendered, tags=_MD_ALLOWED_TAGS, attributes={})
+
+
+_EXCERPT_HTML_HINT_RE = re.compile(
+    r"</?(?:table|tr|td|th|thead|tbody|p|div|br|li|ul|ol|h[1-6])\b", re.IGNORECASE
+)
+_EXCERPT_BLOCK_BREAK_RE = re.compile(
+    r"</?(?:tr|td|th|table|thead|tbody|p|div|br|li|ul|ol|h[1-6])\b[^>]*>", re.IGNORECASE
+)
+_EXCERPT_ANY_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _clean_excerpt(text):
+    """See module note above _EXCERPT_HTML_HINT_RE's definition site."""
+    if not text or not _EXCERPT_HTML_HINT_RE.search(text):
+        return text
+    spaced = _EXCERPT_BLOCK_BREAK_RE.sub("\n", text)
+    stripped = _EXCERPT_ANY_TAG_RE.sub("", spaced)
+    unescaped = html.unescape(stripped)
+    lines = [ln.strip() for ln in unescaped.splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+app.jinja_env.filters["clean_excerpt"] = _clean_excerpt
 
 
 def _confidence(score):
@@ -392,6 +438,26 @@ def _load_turns(conv_id: str):
     return turns
 
 
+def _delete_conversation(client_id: str, user_id: str, conv_id: str) -> bool:
+    """Deletes a conversation's index entry and all of its turn rows. Same
+    ownership check as _get_conversation_meta -- a conversation that
+    doesn't exist or belongs to someone else is silently a no-op, never a
+    distinct error either way."""
+    if _get_conversation_meta(client_id, user_id, conv_id) is None:
+        return False
+    try:
+        for row in _conv_turns_client.query_entities(
+            query_filter="PartitionKey eq @pk", parameters={"pk": conv_id}, select=["RowKey"]
+        ):
+            _conv_turns_client.delete_entity(partition_key=conv_id, row_key=row["RowKey"])
+        _conv_index_client.delete_entity(
+            partition_key=_user_partition(client_id, user_id), row_key=conv_id
+        )
+        return True
+    except Exception:
+        return False
+
+
 PAGE = """
 <!DOCTYPE html>
 <html lang="fr">
@@ -401,9 +467,11 @@ PAGE = """
 <title>KnowledgeEngine v9 — Démo</title>
 <style>
   :root{
-    --bg:#0b1120; --panel:#161f33; --panel-2:#101827; --line:#26314a;
-    --txt:#e7edf7; --muted:#8b98b3; --accent:#38bdf8; --accent-dim:#0c4a6e;
-    --ok:#34d399; --warn:#fbbf24; --danger:#f87171;
+    --bg:#f7f4ef; --panel:#ffffff; --panel-2:#faf3ea; --line:#e8ddd0;
+    --txt:#20211f; --muted:#7a7267; --accent:#e2703a; --accent-soft:#eda374;
+    --accent-tint:#fbe9dc; --accent-blue:#5c85cf; --accent-blue-tint:#e9f0fb;
+    --ok:#1f9d76; --ok-tint:#e3f5ee; --warn:#8a6a3f; --warn-tint:#fdf0c6;
+    --danger:#b3372a; --danger-tint:#fbe4e0; --btn-bg:#14172a; --btn-text:#ffffff;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
@@ -414,31 +482,50 @@ PAGE = """
     align-items:center;justify-content:space-between;gap:16px;background:var(--panel-2)}
   header .brand{display:flex;align-items:center;gap:10px}
   header .brand-dot{width:9px;height:9px;border-radius:50%;background:var(--accent);
-    box-shadow:0 0 10px var(--accent)}
+    box-shadow:0 0 0 3px var(--accent-tint)}
   header h1{margin:0;font-size:1.02rem;font-weight:650;letter-spacing:.01em}
   header p{margin:2px 0 0;color:var(--muted);font-size:.78rem}
-  .logout{flex-shrink:0;color:var(--muted);text-decoration:none;font-size:.8rem;
-    border:1px solid var(--line);border-radius:7px;padding:6px 12px;white-space:nowrap;
-    transition:color .15s,border-color .15s}
-  .logout:hover{color:var(--txt);border-color:var(--accent)}
+  .profile-menu{position:relative;flex-shrink:0}
+  .profile-avatar{width:34px;height:34px;border-radius:50%;border:0;cursor:pointer;
+    background:var(--btn-bg);color:var(--btn-text);font-size:.76rem;font-weight:650;
+    letter-spacing:.02em;display:flex;align-items:center;justify-content:center;
+    font-family:inherit;transition:opacity .15s}
+  .profile-avatar:hover{opacity:.85}
+  .profile-dropdown{position:absolute;top:calc(100% + 8px);right:0;min-width:190px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    box-shadow:0 10px 28px rgba(32,25,15,.16);padding:8px;z-index:40}
+  .profile-dropdown[hidden]{display:none}
+  .profile-dropdown-name{font-size:.82rem;color:var(--txt);font-weight:600;
+    padding:5px 8px 9px;border-bottom:1px solid var(--line);margin-bottom:6px;
+    overflow-wrap:anywhere}
+  .profile-dropdown-logout{display:block;padding:8px;border-radius:7px;
+    color:var(--danger);text-decoration:none;font-size:.82rem;transition:background .15s}
+  .profile-dropdown-logout:hover{background:var(--danger-tint)}
   .layout{display:flex;flex:1;min-height:0;overflow:hidden}
   .sidebar{width:250px;flex-shrink:0;padding:16px 10px;border-right:1px solid var(--line);
-    background:var(--panel-2);overflow-y:auto;display:flex;flex-direction:column}
+    background:var(--panel);overflow-y:auto;display:flex;flex-direction:column}
   .sidebar-new{display:flex;align-items:center;justify-content:center;gap:6px;
-    background:var(--accent);color:#04121f;font-weight:650;text-decoration:none;
+    background:var(--btn-bg);color:var(--btn-text);font-weight:650;text-decoration:none;
     border-radius:8px;padding:10px 12px;font-size:.85rem;margin-bottom:12px;
     transition:opacity .15s;flex-shrink:0}
   .sidebar-new:hover{opacity:.88}
   .sidebar-section-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
     color:var(--muted);padding:4px 10px 6px}
   .conv-list{display:flex;flex-direction:column;gap:2px}
-  .conv-link{display:block;padding:9px 10px;border-radius:8px;color:var(--muted);
+  .conv-row{display:flex;align-items:center;gap:2px}
+  .conv-link{flex:1;min-width:0;display:block;padding:9px 10px;border-radius:8px;color:var(--muted);
     text-decoration:none;border-left:2px solid transparent;transition:background .15s,color .15s}
   .conv-link-title{font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
     color:inherit;font-weight:500}
   .conv-link-meta{font-size:.7rem;color:var(--muted);margin-top:1px;opacity:.8}
-  .conv-link:hover{background:var(--panel);color:var(--txt)}
-  .conv-link.active{background:var(--panel);color:var(--txt);border-left-color:var(--accent)}
+  .conv-link:hover{background:var(--panel-2);color:var(--txt)}
+  .conv-link.active{background:var(--panel-2);color:var(--txt);border-left-color:var(--accent)}
+  .conv-delete-form{margin:0;flex-shrink:0}
+  .conv-delete-btn{background:none;border:0;cursor:pointer;font-size:.8rem;line-height:1;
+    padding:7px 8px;border-radius:6px;color:var(--muted);opacity:.5;
+    transition:opacity .15s,color .15s,background .15s}
+  .conv-row:hover .conv-delete-btn{opacity:.85}
+  .conv-delete-btn:hover{opacity:1;color:var(--danger);background:var(--danger-tint)}
   .conv-empty{color:var(--muted);font-size:.78rem;padding:8px 10px}
   .chat{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
   .messages{flex:1;overflow-y:auto;padding:22px 24px 12px}
@@ -451,10 +538,10 @@ PAGE = """
     .messages{overflow:visible}
     .composer{position:sticky;bottom:0}
   }
-  .denied{padding:16px;border:1px solid #7f1d1d;background:#2a1010;
-    border-radius:10px;color:#fca5a5;font-size:.9rem;max-width:760px;margin:0 auto}
-  .error{padding:12px 14px;border:1px solid #7f1d1d;background:#2a1010;
-    border-radius:8px;color:#fca5a5;font-size:.88rem;margin-bottom:16px}
+  .denied{padding:16px;border:1px solid var(--danger);background:var(--danger-tint);
+    border-radius:10px;color:var(--danger);font-size:.9rem;max-width:760px;margin:0 auto}
+  .error{padding:12px 14px;border:1px solid var(--danger);background:var(--danger-tint);
+    border-radius:8px;color:var(--danger);font-size:.88rem;margin-bottom:16px}
   .welcome{padding:40px 8px 20px;text-align:center}
   .welcome-title{font-size:1.3rem;font-weight:650;margin-bottom:8px}
   .welcome-sub{color:var(--muted);font-size:.9rem;max-width:480px;margin:0 auto;line-height:1.6}
@@ -473,7 +560,7 @@ PAGE = """
     color:var(--muted);flex-shrink:0}
   .turn-q p{margin:0;font-weight:600;font-size:.98rem;color:var(--txt)}
   .turn-a{padding:16px 18px;border:1px solid var(--line);background:var(--panel);
-    border-radius:12px;border-left:3px solid var(--accent-dim)}
+    border-radius:12px;border-left:3px solid var(--accent-soft)}
   .turn-a.ambiguous{border-left-color:var(--warn)}
   .turn-a-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
     color:var(--accent);margin-bottom:8px;font-weight:650}
@@ -482,18 +569,18 @@ PAGE = """
   .answer-text ul,.answer-text ol{margin:6px 0 10px;padding-left:22px}
   .answer-text li{margin:3px 0}
   .answer-text code{background:var(--panel-2);padding:1px 5px;border-radius:4px;font-size:.85em}
-  .ambiguous-note{margin-top:10px;padding:8px 10px;border-radius:7px;background:#3a2e05;
+  .ambiguous-note{margin-top:10px;padding:8px 10px;border-radius:7px;background:var(--warn-tint);
     color:var(--warn);font-size:.83rem}
   .meta-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px;font-size:.8rem}
   .confidence{display:inline-flex;align-items:center;gap:5px;padding:3px 11px;border-radius:999px;
     font-weight:600;font-size:.74rem;white-space:nowrap}
   .confidence .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
-  .confidence-high{background:#052e1e;color:#34d399}
-  .confidence-high .dot{background:#34d399}
-  .confidence-medium{background:#3a2e05;color:#fbbf24}
-  .confidence-medium .dot{background:#fbbf24}
-  .confidence-low{background:#3a0d0d;color:#fca5a5}
-  .confidence-low .dot{background:#fca5a5}
+  .confidence-high{background:var(--ok-tint);color:var(--ok)}
+  .confidence-high .dot{background:var(--ok)}
+  .confidence-medium{background:var(--warn-tint);color:var(--warn)}
+  .confidence-medium .dot{background:var(--warn)}
+  .confidence-low{background:var(--danger-tint);color:var(--danger)}
+  .confidence-low .dot{background:var(--danger)}
   .confidence-unknown{background:var(--panel-2);color:var(--muted)}
   .confidence-unknown .dot{background:var(--muted)}
   .modality-summary{color:var(--muted)}
@@ -501,29 +588,29 @@ PAGE = """
   .source-group-label{display:flex;align-items:center;gap:6px;font-size:.72rem;
     text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:6px}
   .glabel-icon{font-size:.9rem}
-  .group-primary .source-group-label{color:#7dd3fc}
+  .group-primary .source-group-label{color:var(--accent-blue)}
   .group-media-annex .source-group-label{color:var(--muted)}
   .src-card{padding:9px 11px;border:1px solid var(--line);border-radius:9px;margin-top:6px;
     font-size:.85rem;background:var(--panel-2)}
   .src-card:first-child{margin-top:0}
-  .src-card.primary{border-color:var(--accent-dim);background:#0c1c2e}
+  .src-card.primary{border-color:var(--accent);background:var(--accent-tint)}
   .src-card.secondary{opacity:.85}
   .src-card-title{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
   .src-title{flex:1;min-width:0}
   .src-card.used .src-title{color:var(--ok)}
   .tag.used-tag{display:inline-block;font-size:.68rem;padding:1px 7px;border-radius:999px;
-    background:#052e1e;color:var(--ok)}
+    background:var(--ok-tint);color:var(--ok)}
   .excerpt{margin-top:7px}
   .excerpt summary{cursor:pointer;font-size:.8rem;color:var(--accent);list-style:none}
   .excerpt summary::-webkit-details-marker{display:none}
   .excerpt summary:hover{opacity:.85}
   .excerpt-hidden{margin-top:7px;font-size:.78rem;color:var(--muted);font-style:italic;
     display:flex;align-items:center;gap:5px}
-  .safe-summary{margin-top:7px;padding:9px 11px;border-radius:8px;background:#0c1c2e;
-    border:1px solid var(--accent-dim);color:var(--txt);font-size:.83rem;line-height:1.5}
-  .excerpt pre{white-space:pre-wrap;word-break:break-word;margin:7px 0 0;padding:10px 12px;
-    background:var(--bg);border:1px solid var(--line);border-radius:7px;font-size:.8rem;
-    color:var(--txt);max-height:240px;overflow:auto}
+  .safe-summary{margin-top:7px;padding:9px 11px;border-radius:8px;background:var(--accent-tint);
+    border:1px solid var(--accent-soft);color:var(--txt);font-size:.83rem;line-height:1.5}
+  .excerpt-text{white-space:pre-wrap;word-break:break-word;margin:7px 0 0;padding:10px 12px;
+    background:var(--bg);border:1px solid var(--line);border-radius:7px;font-size:.85rem;
+    color:var(--txt);max-height:240px;overflow:auto;font-family:inherit;line-height:1.55}
   .no-sources{margin-top:14px;color:var(--muted);font-size:.8rem;font-style:italic}
   .composer{flex-shrink:0;border-top:1px solid var(--line);background:var(--panel-2);
     padding:14px 24px 18px}
@@ -539,7 +626,7 @@ PAGE = """
     resize:vertical;font-size:.94rem;font-family:inherit;padding:8px 0;max-height:220px;
     min-height:44px;overflow-y:auto}
   .composer textarea:focus{outline:none}
-  .send-btn{flex-shrink:0;background:var(--accent);color:#04121f;border:none;border-radius:10px;
+  .send-btn{flex-shrink:0;background:var(--btn-bg);color:var(--btn-text);border:none;border-radius:10px;
     padding:9px 18px;font-weight:650;cursor:pointer;font-size:.86rem;align-self:flex-end;
     transition:opacity .15s}
   .send-btn:hover{opacity:.88}
@@ -550,10 +637,24 @@ PAGE = """
   .screenshot-input{position:absolute;width:1px;height:1px;overflow:hidden;opacity:0}
   .screen-reading-note{margin:0 0 8px;font-size:.8rem;color:var(--muted);font-style:italic;
     background:var(--panel-2);border-radius:8px;padding:7px 10px}
-  .next-check-note{margin:10px 0 0;font-size:.82rem;color:var(--accent);
-    background:var(--accent-dim);border-radius:8px;padding:8px 10px}
+  .next-check-note{margin:10px 0 0;font-size:.82rem;color:var(--accent-blue);
+    background:var(--accent-blue-tint);border-radius:8px;padding:8px 10px}
   .diagnostic-done-badge{margin:10px 0 0;font-size:.82rem;color:var(--ok);
-    border:1px solid var(--ok);border-radius:8px;padding:6px 10px;display:inline-block}
+    background:var(--ok-tint);border:1px solid var(--ok);border-radius:8px;padding:6px 10px;display:inline-block}
+  .modal-overlay{position:fixed;inset:0;background:rgba(32,28,20,.45);
+    display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+  .modal-overlay[hidden]{display:none}
+  .modal-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:20px 22px;max-width:340px;width:100%;box-shadow:0 16px 40px rgba(32,25,15,.2)}
+  .modal-title{font-size:.96rem;font-weight:650;color:var(--txt)}
+  .modal-sub{margin-top:6px;font-size:.82rem;color:var(--muted);line-height:1.5}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+  .modal-btn{border:0;border-radius:9px;padding:8px 16px;font-size:.84rem;font-weight:600;
+    cursor:pointer;transition:opacity .15s;font-family:inherit}
+  .modal-btn-cancel{background:var(--panel-2);color:var(--txt);border:1px solid var(--line)}
+  .modal-btn-cancel:hover{opacity:.8}
+  .modal-btn-danger{background:var(--danger);color:#fff}
+  .modal-btn-danger:hover{opacity:.88}
 </style>
 </head>
 <body>
@@ -565,7 +666,15 @@ PAGE = """
       <p>Connecté via Entra ID — le client affiché ci-dessous est déterminé automatiquement par votre organisation.</p>
     </div>
   </div>
-  <a class="logout" href="/.auth/logout?post_logout_redirect_uri=/">Se déconnecter</a>
+  {% if itsm_enabled %}<a href="/itsm" style="margin-left:auto;margin-right:14px;color:var(--txt);font-size:.85rem;font-weight:600;text-decoration:none">Tickets ITSM →</a>{% endif %}
+  <div class="profile-menu">
+    <button type="button" class="profile-avatar" id="profile-avatar-btn"
+      title="{{ display_name }}" aria-haspopup="true" aria-expanded="false">{{ display_name | initials }}</button>
+    <div class="profile-dropdown" id="profile-dropdown" hidden>
+      <div class="profile-dropdown-name">{{ display_name }}</div>
+      <a class="profile-dropdown-logout" href="/.auth/logout?post_logout_redirect_uri=/">Se déconnecter</a>
+    </div>
+  </div>
 </header>
 <div class="layout">
   <aside class="sidebar">
@@ -573,11 +682,17 @@ PAGE = """
     <div class="sidebar-section-label">Conversations</div>
     <div class="conv-list">
       {% for c in conversations %}
-      <a class="conv-link {% if c.RowKey == active_conversation_id %}active{% endif %}"
-         href="/c/{{ c.RowKey }}?client_id={{ client_id }}">
-        <div class="conv-link-title">{{ c.title }}</div>
-        <div class="conv-link-meta">{{ c.turnCount }} échange{{ "s" if c.turnCount and c.turnCount > 1 else "" }}</div>
-      </a>
+      <div class="conv-row">
+        <a class="conv-link {% if c.RowKey == active_conversation_id %}active{% endif %}"
+           href="/c/{{ c.RowKey }}?client_id={{ client_id }}">
+          <div class="conv-link-title">{{ c.title }}</div>
+          <div class="conv-link-meta">{{ c.turnCount }} échange{{ "s" if c.turnCount and c.turnCount > 1 else "" }}</div>
+        </a>
+        <form method="post" action="/c/{{ c.RowKey }}/delete" class="conv-delete-form">
+          <input type="hidden" name="client_id" value="{{ client_id }}">
+          <button type="submit" class="conv-delete-btn" title="Supprimer la conversation">🗑</button>
+        </form>
+      </div>
       {% else %}
       <div class="conv-empty">Aucune conversation enregistrée.</div>
       {% endfor %}
@@ -661,7 +776,7 @@ PAGE = """
               {% if t.primary_source.sourceType not in ("audio", "video") and t.primary_source.excerpt %}
               <details class="excerpt">
                 <summary>▸ voir l'extrait utilisé</summary>
-                <pre>{{ t.primary_source.excerpt }}</pre>
+                <div class="excerpt-text">{{ t.primary_source.excerpt | clean_excerpt }}</div>
               </details>
               {% elif t.primary_source.safe_summary %}
               <div class="safe-summary">🛡️ {{ t.primary_source.safe_summary }}</div>
@@ -688,7 +803,7 @@ PAGE = """
               {% if s.excerpt %}
               <details class="excerpt">
                 <summary>▸ voir l'extrait utilisé</summary>
-                <pre>{{ s.excerpt }}</pre>
+                <div class="excerpt-text">{{ s.excerpt | clean_excerpt }}</div>
               </details>
               {% endif %}
             </div>
@@ -734,7 +849,7 @@ PAGE = """
           <option value="{{ c }}" {% if c == client_id %}selected{% endif %}>{{ c }}</option>
           {% endfor %}
         </select>
-        <textarea name="query" rows="2" placeholder="Pose ta question..." required>{{ query }}</textarea>
+        <textarea name="query" rows="2" placeholder="Pose ta question... (ou joins juste une capture)">{{ query }}</textarea>
         <label class="screenshot-btn" title="Joindre une capture d'ecran">
           📷<input type="file" name="screenshot" accept="image/*" class="screenshot-input">
         </label>
@@ -745,6 +860,98 @@ PAGE = """
   {% endif %}
   </div>
 </div>
+<div id="confirm-modal" class="modal-overlay" hidden>
+  <div class="modal-card">
+    <div class="modal-title">Supprimer cette conversation ?</div>
+    <div class="modal-sub">Cette action est définitive : la conversation et tous ses échanges seront supprimés.</div>
+    <div class="modal-actions">
+      <button type="button" class="modal-btn modal-btn-cancel">Annuler</button>
+      <button type="button" class="modal-btn modal-btn-danger">Supprimer</button>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  var turns = document.querySelectorAll('.turn');
+  var lastTurn = turns[turns.length - 1];
+  if (lastTurn) { lastTurn.scrollIntoView({block: 'start'}); }
+
+  var form = document.querySelector('form.composer');
+  var textarea = form ? form.querySelector('textarea[name=query]') : null;
+  var fileInput = form ? form.querySelector('input[name=screenshot]') : null;
+  function hasContent(){
+    return !!(textarea && textarea.value.trim()) || !!(fileInput && fileInput.files.length);
+  }
+  if (form && textarea) {
+    // Entree envoie (Maj+Entree = saut de ligne) ; une capture seule, sans
+    // texte, est desormais un envoi valide.
+    textarea.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (hasContent()) { form.requestSubmit ? form.requestSubmit() : form.submit(); }
+      }
+    });
+    form.addEventListener('submit', function(e){
+      if (!hasContent()) { e.preventDefault(); }
+    });
+  }
+
+  // Profile avatar dropdown (name + "Se deconnecter"), replacing the
+  // plain logout link.
+  var avatarBtn = document.getElementById('profile-avatar-btn');
+  var profileDropdown = document.getElementById('profile-dropdown');
+  if (avatarBtn && profileDropdown) {
+    avatarBtn.addEventListener('click', function(e){
+      e.stopPropagation();
+      var willOpen = profileDropdown.hidden;
+      profileDropdown.hidden = !willOpen;
+      avatarBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    });
+    document.addEventListener('click', function(e){
+      if (!profileDropdown.hidden && !profileDropdown.contains(e.target) && e.target !== avatarBtn) {
+        profileDropdown.hidden = true;
+        avatarBtn.setAttribute('aria-expanded', 'false');
+      }
+    });
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape' && !profileDropdown.hidden) {
+        profileDropdown.hidden = true;
+        avatarBtn.setAttribute('aria-expanded', 'false');
+      }
+    });
+  }
+
+  // Themed confirm modal for "supprimer la conversation", replacing the
+  // browser's native confirm() dialog.
+  var modal = document.getElementById('confirm-modal');
+  var modalCancel = modal ? modal.querySelector('.modal-btn-cancel') : null;
+  var modalConfirm = modal ? modal.querySelector('.modal-btn-danger') : null;
+  var pendingDeleteForm = null;
+  function closeModal(){
+    if (modal) { modal.hidden = true; }
+    pendingDeleteForm = null;
+  }
+  document.querySelectorAll('.conv-delete-form').forEach(function(delForm){
+    delForm.addEventListener('submit', function(e){
+      e.preventDefault();
+      pendingDeleteForm = delForm;
+      if (modal) { modal.hidden = false; }
+    });
+  });
+  if (modal) {
+    modalCancel.addEventListener('click', closeModal);
+    modalConfirm.addEventListener('click', function(){
+      var f = pendingDeleteForm;
+      closeModal();
+      if (f) { f.submit(); }
+    });
+    modal.addEventListener('click', function(e){ if (e.target === modal) { closeModal(); } });
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape' && !modal.hidden) { closeModal(); }
+    });
+  }
+})();
+</script>
 </body>
 </html>
 """
@@ -778,6 +985,16 @@ def _resolve_user_id_for_request():
     return resolve_user_id(claims) or "unknown-user"
 
 
+def _resolve_display_name_for_request():
+    """See auth.py:resolve_display_name. Header's profile avatar/dropdown
+    only -- never part of an access decision."""
+    header_value = request.headers.get("X-MS-CLIENT-PRINCIPAL")
+    if header_value is None:
+        return "Démo locale" if _LOCAL_DEV_CLIENTS else None
+    claims = parse_client_principal(header_value)
+    return resolve_display_name(claims) or "Utilisateur"
+
+
 def _handle(conversation_id):
     error = None
     turns = []
@@ -789,6 +1006,11 @@ def _handle(conversation_id):
         or (allowed_clients[0] if allowed_clients else "")
     )
     query = request.form.get("query", "")
+    # Detected up front (2026-09-... "capture seule, sans texte" UI
+    # request): the file itself is only read further down, once we know
+    # we're actually processing this turn.
+    screenshot = request.files.get("screenshot") if request.method == "POST" else None
+    has_screenshot = bool(screenshot and screenshot.filename)
 
     if conversation_id and client_id in allowed_clients and user_id:
         meta = _get_conversation_meta(client_id, user_id, conversation_id)
@@ -796,7 +1018,9 @@ def _handle(conversation_id):
             return redirect(url_for("index", client_id=client_id))
         turns = _load_turns(conversation_id)
 
-    if request.method == "POST" and query.strip():
+    if request.method == "POST" and (query.strip() or has_screenshot):
+        if not query.strip():
+            query = "Que montre cette capture d'écran ?"
         if client_id not in allowed_clients:
             # Never trust the posted value alone -- re-validated here against
             # THIS request's own resolved set, not a global list.
@@ -825,9 +1049,8 @@ def _handle(conversation_id):
                 # processed in memory only, never written to blob storage or
                 # to the conversation table, only the model's own textual
                 # reading of it.
-                screenshot = request.files.get("screenshot")
                 image_b64 = image_mime = None
-                if screenshot and screenshot.filename:
+                if has_screenshot:
                     image_b64 = base64.b64encode(screenshot.read()).decode("ascii")
                     image_mime = screenshot.mimetype or "image/png"
 
@@ -888,6 +1111,7 @@ def _handle(conversation_id):
     return render_template_string(
         PAGE,
         allowed_clients=allowed_clients,
+        display_name=_resolve_display_name_for_request(),
         client_id=client_id,
         query=query if not turns else "",
         error=error,
@@ -895,6 +1119,7 @@ def _handle(conversation_id):
         conversations=conversations,
         active_conversation_id=conversation_id,
         example_questions=EXAMPLE_QUESTIONS,
+        itsm_enabled=itsm_access_for_request(),
     )
 
 
@@ -906,6 +1131,16 @@ def index():
 @app.route("/c/<conversation_id>", methods=["GET", "POST"])
 def conversation(conversation_id):
     return _handle(conversation_id=conversation_id)
+
+
+@app.route("/c/<conversation_id>/delete", methods=["POST"])
+def delete_conversation(conversation_id):
+    allowed_clients = _resolve_allowed_clients_for_request()
+    user_id = _resolve_user_id_for_request()
+    client_id = request.form.get("client_id") or (allowed_clients[0] if allowed_clients else "")
+    if client_id in allowed_clients and user_id:
+        _delete_conversation(client_id, user_id, conversation_id)
+    return redirect(url_for("index", client_id=client_id))
 
 
 @app.route("/healthz")
