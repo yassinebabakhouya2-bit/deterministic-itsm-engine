@@ -84,6 +84,14 @@ REASON_LABELS = {
     "low_confidence": "Confiance faible (< 0,6)",
     "subject_not_found_in_entra": "Utilisateur introuvable dans Entra ID",
 }
+EXECUTION_LABELS = {
+    "running": "Exécution en cours",
+    "success": "Exécuté",
+    "partial": "Exécuté partiellement",
+    "blocked": "Bloqué à l'exécution",
+    "dry_run": "Simulation (dry run)",
+    "error": "Erreur d'exécution",
+}
 OFFBOARDING_STEP_LABELS = {
     "disable_account": "Désactiver le compte",
     "revoke_sessions": "Révoquer les sessions",
@@ -141,6 +149,13 @@ def _proposal(row) -> dict:
         return {}
 
 
+def _exec_log(row) -> list:
+    try:
+        return json.loads(row.get("executionLog") or "[]")
+    except ValueError:
+        return []
+
+
 def _split(value) -> list:
     return [v for v in (value or "").split(",") if v]
 
@@ -175,7 +190,7 @@ def create_itsm_blueprint(table_service):
         return render_template_string(
             ITSM_PAGE, view="queue", queues=QUEUES, counts=counts, active=active, rows=shown,
             error=error, action_labels=ACTION_LABELS, status_labels=STATUS_LABELS,
-            review_labels=REVIEW_LABELS, split=_split, display_name=_reviewer()[1])
+            review_labels=REVIEW_LABELS, exec_labels=EXECUTION_LABELS, split=_split, display_name=_reviewer()[1])
 
     @bp.route("/itsm/t/<number>")
     def ticket(number):
@@ -190,7 +205,8 @@ def create_itsm_blueprint(table_service):
             action_labels=ACTION_LABELS, status_labels=STATUS_LABELS, review_labels=REVIEW_LABELS,
             step_labels=OFFBOARDING_STEP_LABELS, allowed_groups=_ALLOWED_GROUPS, split=_split,
             sn_instance=_SN_INSTANCE, msg=request.args.get("msg"), display_name=_reviewer()[1],
-            approved=json.loads(row.get("approvedParamsJson") or "{}") if row.get("approvedParamsJson") else None)
+            approved=json.loads(row.get("approvedParamsJson") or "{}") if row.get("approvedParamsJson") else None,
+            exec_labels=EXECUTION_LABELS, exec_log=_exec_log(row))
 
     @bp.route("/itsm/t/<number>/decision", methods=["POST"])
     def decision(number):
@@ -312,6 +328,9 @@ ITSM_PAGE = """
   .b-refused{background:var(--danger-tint);color:var(--danger)}
   .b-validated{background:var(--ok-tint);color:var(--ok)}
   .b-rejected,.b-handled_manually{background:var(--line);color:var(--muted)}
+  .x-success{background:var(--ok-tint);color:var(--ok)}
+  .x-partial,.x-dry_run,.x-running{background:var(--warn-tint);color:var(--warn)}
+  .x-blocked,.x-error{background:var(--danger-tint);color:var(--danger)}
   .chip{display:inline-block;margin:2px 4px 2px 0;padding:2px 8px;border-radius:6px;font-size:.75rem;
     background:var(--danger-tint);color:var(--danger)}
   .chip.soft{background:var(--warn-tint);color:var(--warn)}
@@ -364,7 +383,8 @@ ITSM_PAGE = """
         {% for c in split(r.guardReasons) %}<br><span class="chip {{ '' if r.proposalStatus == 'refused' else 'soft' }}">{{ c | reason_label }}</span>{% endfor %}</td>
       <td>{{ r.subjectUserName }}{% if r.openedByUserName and r.openedByUserName != r.subjectUserName %}<br><span class="muted">demandé par {{ r.openedByUserName }}</span>{% endif %}</td>
       <td>{{ action_labels.get(r.proposalAction, r.proposalAction or '—') }}</td>
-      <td>{% if r.reviewStatus %}<span class="badge b-{{ r.reviewStatus }}">{{ review_labels.get(r.reviewStatus, r.reviewStatus) }}</span>
+      <td>{% if r.executionStatus %}<span class="badge x-{{ r.executionStatus }}">{{ exec_labels.get(r.executionStatus, r.executionStatus) }}</span>
+          {% elif r.reviewStatus %}<span class="badge b-{{ r.reviewStatus }}">{{ review_labels.get(r.reviewStatus, r.reviewStatus) }}</span>
           {% elif r.proposalStatus %}<span class="badge b-{{ r.proposalStatus }}">{{ status_labels.get(r.proposalStatus, r.proposalStatus) }}</span>
           {% else %}<span class="muted">en analyse</span>{% endif %}</td>
     </tr>
@@ -393,7 +413,7 @@ ITSM_PAGE = """
       <h2>Proposition</h2>
       <div class="kv">
         <div>Action</div><div><strong>{{ action_labels.get(row.proposalAction, row.proposalAction or '—') }}</strong></div>
-        <div>Statut</div><div>{% if row.reviewStatus %}<span class="badge b-{{ row.reviewStatus }}">{{ review_labels.get(row.reviewStatus, row.reviewStatus) }}</span>{% elif row.proposalStatus %}<span class="badge b-{{ row.proposalStatus }}">{{ status_labels.get(row.proposalStatus, row.proposalStatus) }}</span>{% else %}<span class="muted">en analyse</span>{% endif %}</div>
+        <div>Statut</div><div>{% if row.executionStatus %}<span class="badge x-{{ row.executionStatus }}">{{ exec_labels.get(row.executionStatus, row.executionStatus) }}</span>{% elif row.reviewStatus %}<span class="badge b-{{ row.reviewStatus }}">{{ review_labels.get(row.reviewStatus, row.reviewStatus) }}</span>{% elif row.proposalStatus %}<span class="badge b-{{ row.proposalStatus }}">{{ status_labels.get(row.proposalStatus, row.proposalStatus) }}</span>{% else %}<span class="muted">en analyse</span>{% endif %}</div>
         <div>Confiance</div><div>{{ row.proposalConfidence or '—' }}</div>
         {% if p.target_name %}<div>Compte visé</div><div>{{ p.target_name }}{% if p.target_is_requester == false %} <span class="chip">≠ demandeur</span>{% endif %}</div>{% endif %}
         {% if p.group_name %}<div>Groupe</div><div>{{ p.group_name }}</div>{% endif %}
@@ -404,11 +424,19 @@ ITSM_PAGE = """
 
       {% if row.reviewStatus %}
         <div class="msg" style="margin-top:14px">
-          <span class="badge b-{{ row.reviewStatus }}">{{ review_labels.get(row.reviewStatus, row.reviewStatus) }}</span>
+          <span class="badge b-{{ row.reviewStatus }}">{{ 'Validé' if row.reviewStatus == 'validated' and row.executionStatus else review_labels.get(row.reviewStatus, row.reviewStatus) }}</span>
           par {{ row.reviewedByName }} — {{ row.reviewedAtUtc[:16].replace('T', ' ') }} UTC
           {% if row.reviewComment %}<br><span class="muted">{{ row.reviewComment }}</span>{% endif %}
           {% if approved %}<br><span class="muted">Paramètres approuvés : {{ action_labels.get(approved.action, approved.action) }}{% if approved.group_name %} → {{ approved.group_name }}{% endif %}{% if approved.offboarding_steps %} → {% for st in approved.offboarding_steps %}{{ step_labels.get(st, st) }}{{ ', ' if not loop.last else '' }}{% endfor %}{% endif %}{% if approved.license_sku_hint %} → {{ approved.license_sku_hint }}{% endif %}</span>{% endif %}
         </div>
+        {% if row.executionStatus %}
+        <div class="msg" style="margin-top:10px">
+          <span class="badge x-{{ row.executionStatus }}">{{ exec_labels.get(row.executionStatus, row.executionStatus) }}</span>
+          {% if row.executedAtUtc %}<span class="muted"> — {{ row.executedAtUtc[:16].replace('T', ' ') }} UTC</span>{% endif %}
+          {% for st in exec_log %}<br>{{ '✓' if st.ok else '✗' }} {{ st.step }} <span class="muted">{{ st.detail }}</span>{% endfor %}
+          {% if row.executionStatus == 'success' and row.ticketType == 'ritm' %}<br><span class="muted">Demande clôturée dans ServiceNow.</span>{% endif %}
+        </div>
+        {% endif %}
       {% elif row.proposalStatus == 'pending_review' %}
         <form method="post" action="/itsm/t/{{ row.RowKey }}/decision">
           <input type="hidden" name="proposed_at" value="{{ row.proposedAtUtc }}">
