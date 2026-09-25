@@ -1,0 +1,24 @@
+# =====================================================================
+# ITSM action module (Jalon 10) -- configuration of the agent review tab
+# (app/itsm.py). Separate from engine.<client>.yaml on purpose: the ITSM
+# module is not a RAG client (no index, no KB) and must not show up in the
+# RAG client selector.
+# =====================================================================
+
+# Partition of the itsmtickets table (= clientCode of itsm/poll and itsm/propose)
+clientCode: itsm-demo
+table: itsmtickets
+serviceNowInstance: dev374242
+
+# Access (deny-by-default, same claim-based model as Jalon 5 / app/auth.py):
+# the signed-in user must come from this tenant AND hold this Entra security group.
+access:
+  entraTenantId: "6cdc0a5a-779d-4912-a0b3-455e5fc4d9c6"
+  entraGroup: "1bcf7b37-d2fd-4f5c-968c-906ddafac988"   # KE-v9-itsm-agents, created 2026-09-25 (runbook 11.6)
+
+# Groups an agent may pick when validating a group_add proposal.
+# Must stay in sync with the allowedGroups parameter of itsm/propose/main.bicep.
+allowedGroups:
+  - SG-SP-Projets
+  - SG-VPN-Users
+  - SG-App-Planning

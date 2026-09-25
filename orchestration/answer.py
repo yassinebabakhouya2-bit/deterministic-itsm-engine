@@ -252,16 +252,18 @@ SYSTEM_PROMPT = (
     "fait en termes generaux (par exemple : le technicien a fait epeler un "
     "nouveau mot de passe au client, sans jamais repeter lequel). EN DEHORS de "
     "cette regle stricte sur les identifiants/mots de passe/codes epeles, "
-    "redige pour chaque SOURCE de type appel reellement utilisee (primaire ou "
-    "annexe) un resume AUSSI CONCRET ET DETAILLE que possible du deroulement "
+    "redige pour CHAQUE SOURCE de type appel, primaire ou annexe, QU'ELLE SOIT "
+    "UTILISEE OU NON dans ta reponse, un resume AUSSI CONCRET ET DETAILLE que "
+    "possible du deroulement "
     "de l'appel : les actions effectuees, les etapes suivies dans l'ordre, les "
     "verifications faites et le resultat obtenu -- comme une mini procedure de "
     "resolution, jamais juste une phrase vague, mais toujours dans tes propres "
     "mots (jamais une citation verbatim du transcript). Mets ces resumes dans "
     "primary_safe_summaries (un par SOURCE PRIMAIRE, MEME ORDRE que le "
-    "CONTEXTE, null pour une primaire texte ou non utilisee) et dans "
-    "annex_safe_summaries (un par SOURCE ANNEXE, MEME ORDRE que le CONTEXTE, "
-    "null pour une annexe texte ou non utilisee)."
+    "CONTEXTE, null UNIQUEMENT pour une primaire de type texte/KB -- jamais a "
+    "cause d'une non-utilisation) et dans annex_safe_summaries (un par SOURCE "
+    "ANNEXE, MEME ORDRE que le CONTEXTE, null UNIQUEMENT pour une annexe de "
+    "type texte/KB -- jamais a cause d'une non-utilisation)."
 )
 
 # Strict JSON Schema for Structured Outputs -- Azure/OpenAI does not prescribe
@@ -315,11 +317,12 @@ ANSWER_SCHEMA = {
             "items": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "description": (
                 "Un resume DETAILLE (actions, etapes, resultat) par SOURCE PRIMAIRE de "
-                "type appel audio/video reellement utilisee, MEME ORDRE que le CONTEXTE, "
-                "sans jamais reproduire verbatim un mot de passe/code/identifiant epele. "
-                "null pour une SOURCE PRIMAIRE texte (KB) ou non utilisee -- une primaire "
-                "audio/video est un cas exceptionnel : aucun document KB ne couvrait la "
-                "question."
+                "type appel audio/video, MEME ORDRE que le CONTEXTE, qu'elle ait "
+                "contribue a la reponse ou non -- sans jamais reproduire verbatim un mot "
+                "de passe/code/identifiant epele. null UNIQUEMENT pour une SOURCE "
+                "PRIMAIRE de type texte (KB), jamais a cause d'une non-utilisation -- une "
+                "primaire audio/video est un cas exceptionnel : aucun document KB ne "
+                "couvrait la question."
             ),
         },
         "annex_safe_summaries": {
@@ -328,8 +331,9 @@ ANSWER_SCHEMA = {
             "description": (
                 "Un resume DETAILLE (meme regle que primary_safe_summaries : jamais de mot "
                 "de passe/code/identifiant epele verbatim) par SOURCE ANNEXE de type appel "
-                "audio/video reellement utilisee, MEME ORDRE que le CONTEXTE. Null pour "
-                "toute annexe texte (KB) ou non utilisee."
+                "audio/video, MEME ORDRE que le CONTEXTE, qu'elle ait contribue a la "
+                "reponse ou non. Null UNIQUEMENT pour toute annexe de type texte (KB), "
+                "jamais a cause d'une non-utilisation."
             ),
         },
     },
@@ -1262,7 +1266,7 @@ def attach_sources(result: dict, primaries: List[Dict], annexes: List[Dict]) -> 
             "used": used,
             "sourceType": doc.get("sourceType"),
             "excerpt": doc.get("chunk"),
-            "safe_summary": _safe(summary_raw) if is_media and used else None,
+            "safe_summary": _safe(summary_raw) if is_media else None,
         }
 
     def _psum(i: int) -> Optional[str]:
