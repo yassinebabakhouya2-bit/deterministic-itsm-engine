@@ -41,7 +41,8 @@ import yaml
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
 from azure.data.tables import UpdateMode
-from flask import Blueprint, abort, redirect, render_template_string, request, url_for
+import requests
+from flask import Blueprint, abort, make_response, redirect, render_template_string, request, url_for
 
 from auth import has_tenant_and_group, parse_client_principal, resolve_display_name, resolve_user_id
 
@@ -53,6 +54,7 @@ _PARTITION = ITSM_CONFIG["clientCode"]
 _ALLOWED_GROUPS = list(ITSM_CONFIG.get("allowedGroups") or [])
 _SN_INSTANCE = ITSM_CONFIG.get("serviceNowInstance", "")
 _LOCAL_DEV = os.environ.get("LOCAL_DEV_ITSM") == "1"
+_DELIVERY_VAULT = ITSM_CONFIG.get("deliveryKeyVault", "")
 
 ACTION_LABELS = {
     "mfa_reset": "Réinitialisation MFA",
@@ -160,7 +162,7 @@ def _split(value) -> list:
     return [v for v in (value or "").split(",") if v]
 
 
-def create_itsm_blueprint(table_service):
+def create_itsm_blueprint(table_service, credential=None):
     bp = Blueprint("itsm", __name__)
     table = table_service.get_table_client(ITSM_CONFIG.get("table", "itsmtickets"))
 
@@ -206,7 +208,7 @@ def create_itsm_blueprint(table_service):
             step_labels=OFFBOARDING_STEP_LABELS, allowed_groups=_ALLOWED_GROUPS, split=_split,
             sn_instance=_SN_INSTANCE, msg=request.args.get("msg"), display_name=_reviewer()[1],
             approved=json.loads(row.get("approvedParamsJson") or "{}") if row.get("approvedParamsJson") else None,
-            exec_labels=EXECUTION_LABELS, exec_log=_exec_log(row))
+            exec_labels=EXECUTION_LABELS, exec_log=_exec_log(row), me=_reviewer()[0])
 
     @bp.route("/itsm/t/<number>/decision", methods=["POST"])
     def decision(number):
@@ -281,6 +283,53 @@ def create_itsm_blueprint(table_service):
         else:
             return back("Le ticket est en cours de mise à jour : réessayez dans quelques secondes.")
         return back("Décision enregistrée.")
+
+    # ------------------------------------------------------------------ 10.4b one-time secret reveal
+    # The temporary password / TAP created by the executor lives ONLY in the dedicated delivery vault.
+    # It is shown once, to the agent who validated the ticket, then deleted. The row is claimed first
+    # (If-Match) so two clicks / two tabs can never both reveal it. Never logged, never stored here.
+    @bp.route("/itsm/t/<number>/reveal", methods=["POST"])
+    def reveal(number):
+        _guard()
+        if not _same_origin():
+            abort(403)
+        try:
+            row = table.get_entity(partition_key=_PARTITION, row_key=number)
+        except ResourceNotFoundError:
+            abort(404)
+
+        def back(msg):
+            return redirect(url_for("itsm.ticket", number=number, msg=msg))
+
+        secret_ref = row.get("secretRef") or ""
+        if not secret_ref or row.get("secretRevealedAtUtc"):
+            return back("Aucun code à afficher (déjà remis ou inexistant).")
+        reviewer_id, reviewer_name = _reviewer()
+        if reviewer_id != row.get("reviewedById"):
+            return back("Seul l'agent qui a validé ce ticket peut afficher le code.")
+        if credential is None or not _DELIVERY_VAULT:
+            return back("Coffre de remise non configuré.")
+        try:
+            table.update_entity({"PartitionKey": _PARTITION, "RowKey": number,
+                                 "secretRevealedAtUtc": _now_utc(), "secretRevealedByName": reviewer_name},
+                                mode=UpdateMode.MERGE, etag=row.metadata.get("etag"),
+                                match_condition=MatchConditions.IfNotModified)
+        except ResourceModifiedError:
+            return back("Le ticket est en cours de mise à jour : réessayez.")
+        url = f"https://{_DELIVERY_VAULT}.vault.azure.net/secrets/{secret_ref}?api-version=7.4"
+        headers = {"Authorization": f"Bearer {credential.get_token('https://vault.azure.net/.default').token}"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return back("Code introuvable ou expiré (validité 1 h) : relancez l'action si nécessaire.")
+        value = resp.json().get("value", "")
+        requests.delete(url, headers=headers, timeout=15)  # one-time: gone from the vault right after display
+        kind = row.get("secretKind")
+        html = render_template_string(REVEAL_PAGE, number=number, value=value, kind=kind,
+                                      subject=row.get("subjectUserName"), display_name=reviewer_name)
+        out = make_response(html)
+        out.headers["Cache-Control"] = "no-store"
+        out.headers["Pragma"] = "no-cache"
+        return out
 
     return bp
 
@@ -435,6 +484,18 @@ ITSM_PAGE = """
           {% if row.executedAtUtc %}<span class="muted"> — {{ row.executedAtUtc[:16].replace('T', ' ') }} UTC</span>{% endif %}
           {% for st in exec_log %}<br>{{ '✓' if st.ok else '✗' }} {{ st.step }} <span class="muted">{{ st.detail }}</span>{% endfor %}
           {% if row.executionStatus == 'success' and row.ticketType == 'ritm' %}<br><span class="muted">Demande clôturée dans ServiceNow.</span>{% endif %}
+          {% if row.executionStatus == 'success' and row.ticketType == 'incident' %}<br><span class="muted">Incident résolu dans ServiceNow.</span>{% endif %}
+          {% if row.secretRef %}
+            {% if row.secretRevealedAtUtc %}
+              <br><span class="muted">{{ 'Code temporaire (TAP)' if row.secretKind == 'tap' else 'Mot de passe temporaire' }} remis par {{ row.secretRevealedByName }} — {{ row.secretRevealedAtUtc[:16].replace('T', ' ') }} UTC. Supprimé du coffre.</span>
+            {% elif me == row.reviewedById %}
+              <form method="post" action="/itsm/t/{{ row.RowKey }}/reveal" style="margin-top:10px">
+                <button class="btn-neutral">Afficher le {{ 'code temporaire (TAP)' if row.secretKind == 'tap' else 'mot de passe temporaire' }} — une seule fois</button>
+              </form>
+            {% else %}
+              <br><span class="muted">Code à remettre par l'agent validateur ({{ row.reviewedByName }}).</span>
+            {% endif %}
+          {% endif %}
         </div>
         {% endif %}
       {% elif row.proposalStatus == 'pending_review' %}
@@ -469,4 +530,26 @@ ITSM_PAGE = """
 </main>
 </body>
 </html>
+"""
+
+
+REVEAL_PAGE = """
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code temporaire — {{ number }}</title>
+<style>
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f7f4ef;color:#20211f}
+  main{max-width:640px;margin:60px auto;padding:0 16px}
+  .card{background:#fff;border:1px solid #e8ddd0;border-radius:12px;padding:24px}
+  .secret{font-family:ui-monospace,Consolas,monospace;font-size:1.6rem;letter-spacing:.06em;background:#faf3ea;
+    border:1px dashed #e2703a;border-radius:10px;padding:16px;text-align:center;margin:18px 0;user-select:all}
+  .warn{background:#fbe4e0;color:#b3372a;border-radius:8px;padding:10px 12px;font-size:.88rem}
+  a{color:#20211f}
+</style></head><body><main><div class="card">
+  <h2 style="margin-top:0">{{ number }} — {{ 'Temporary Access Pass' if kind == 'tap' else 'Mot de passe temporaire' }} pour {{ subject }}</h2>
+  <div class="secret">{{ value }}</div>
+  <p style="font-size:.9rem">{% if kind == 'tap' %}Code à usage unique, valable 60 minutes : l'utilisateur s'en sert pour se connecter et réenregistrer Microsoft Authenticator.{% else %}L'utilisateur devra changer ce mot de passe à sa première connexion.{% endif %}</p>
+  <div class="warn">Ce code ne sera plus jamais affiché : il vient d'être supprimé du coffre. Communiquez-le à l'utilisateur par un canal vérifié (rappel sur son numéro connu, en personne) — jamais dans le ticket ni par e-mail.</div>
+  <p><a href="/itsm/t/{{ number }}">← Retour au ticket</a></p>
+</div></main></body></html>
 """

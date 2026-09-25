@@ -201,7 +201,7 @@ app = Flask(__name__)
 # Records agent decisions only; never executes anything on Entra ID / ServiceNow.
 from itsm import create_itsm_blueprint, itsm_access_for_request  # noqa: E402
 
-app.register_blueprint(create_itsm_blueprint(_table_service))
+app.register_blueprint(create_itsm_blueprint(_table_service, _credential))
 
 HISTORY_MAX = 30  # conversations listed in the sidebar
 
