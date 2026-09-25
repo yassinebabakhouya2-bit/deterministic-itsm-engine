@@ -175,8 +175,8 @@ if ($createdCreds.Count -gt 0) {
 # ---------------------------------------------------------------- ServiceNow
 if ($SkipServiceNow) { Write-Host 'ServiceNow skipped.'; return }
 if (-not $SnInstance) { $SnInstance = Read-Host 'ServiceNow instance name (e.g. dev123456)' }
-# Console prompts instead of Get-Credential: the Windows credential dialog in PS 5.1
-# can return the user name as "\admin" (empty domain prefix), which ServiceNow rejects with 401.
+# Get-Credential in PS 5.1 can return the user name as "\admin" (empty domain prefix),
+# which ServiceNow rejects with 401 -> strip it. Length is printed to catch truncated pastes.
 $snCred = Get-Credential -UserName 'admin' -Message "ServiceNow admin for https://$SnInstance.service-now.com"
 $snUser = $snCred.UserName.Trim().TrimStart('\')
 $snPlain = $snCred.GetNetworkCredential().Password
