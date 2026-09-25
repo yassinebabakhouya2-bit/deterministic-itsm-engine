@@ -1,0 +1,799 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "clientCode": {
+      "type": "string"
+    },
+    "storageAccountName": {
+      "type": "string"
+    },
+    "tableName": {
+      "type": "string"
+    },
+    "snInstance": {
+      "type": "string"
+    },
+    "snUser": {
+      "type": "string"
+    },
+    "keyVaultName": {
+      "type": "string"
+    },
+    "snSecretName": {
+      "type": "string"
+    },
+    "allowedGroupNames": {
+      "type": "array"
+    },
+    "dryRun": {
+      "type": "bool"
+    }
+  },
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Minute",
+        "interval": 2
+      },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "runs": 1
+        }
+      }
+    }
+  },
+  "actions": {
+    "Init_stepLog": {
+      "type": "InitializeVariable",
+      "runAfter": {},
+      "inputs": {
+        "variables": [
+          {
+            "name": "stepLog",
+            "type": "array",
+            "value": []
+          }
+        ]
+      }
+    },
+    "Get_rows": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '()')}",
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://storage.azure.com"
+        },
+        "queries": {
+          "$filter": "@{concat('PartitionKey eq ''', parameters('clientCode'), ''' and reviewStatus eq ''validated''')}"
+        },
+        "headers": {
+          "x-ms-version": "2020-12-06",
+          "Accept": "application/json;odata=minimalmetadata"
+        }
+      },
+      "runAfter": {
+        "Init_stepLog": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Filter_to_execute": {
+      "type": "Query",
+      "runAfter": {
+        "Get_rows": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "from": "@body('Get_rows')?['value']",
+        "where": "@or(empty(item()?['executionStatus']),and(equals(item()?['executionStatus'],'dry_run'),equals(parameters('dryRun'),false)))"
+      }
+    },
+    "Get_sn_secret": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('keyVaultName'), '.vault.azure.net/secrets/', parameters('snSecretName'), '?api-version=7.4')}",
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://vault.azure.net"
+        }
+      },
+      "runAfter": {
+        "Filter_to_execute": [
+          "Succeeded"
+        ]
+      },
+      "runtimeConfiguration": {
+        "secureData": {
+          "properties": [
+            "outputs"
+          ]
+        }
+      }
+    },
+    "For_each_ticket": {
+      "type": "Foreach",
+      "foreach": "@body('Filter_to_execute')",
+      "runAfter": {
+        "Get_sn_secret": [
+          "Succeeded"
+        ]
+      },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "repetitions": 1
+        }
+      },
+      "actions": {
+        "Reset_log": {
+          "type": "SetVariable",
+          "runAfter": {},
+          "inputs": {
+            "name": "stepLog",
+            "value": "@json('[]')"
+          }
+        },
+        "Claim_row": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '(PartitionKey=''', parameters('clientCode'), ''',RowKey=''', items('For_each_ticket')?['RowKey'], ''')')}",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            },
+            "headers": {
+              "x-ms-version": "2020-12-06",
+              "Accept": "application/json;odata=nometadata",
+              "X-HTTP-Method": "MERGE",
+              "Content-Type": "application/json",
+              "If-Match": "@items('For_each_ticket')?['odata.etag']"
+            },
+            "body": {
+              "executionStatus": "running",
+              "executionStartedUtc": "@{utcNow()}"
+            }
+          },
+          "runAfter": {
+            "Reset_log": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_params": {
+          "type": "Compose",
+          "runAfter": {
+            "Claim_row": [
+              "Succeeded"
+            ]
+          },
+          "inputs": "@json(items('For_each_ticket')?['approvedParamsJson'])"
+        },
+        "Scope_execute": {
+          "type": "Scope",
+          "runAfter": {
+            "Compose_params": [
+              "Succeeded"
+            ]
+          },
+          "actions": {
+            "Get_subject_user": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', encodeUriComponent(coalesce(items('For_each_ticket')?['subjectEmail'],'unknown')))}",
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://graph.microsoft.com"
+                },
+                "queries": {
+                  "$select": "id,displayName,accountEnabled"
+                }
+              },
+              "runAfter": {}
+            },
+            "Get_subject_memberOf": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/memberOf')}",
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://graph.microsoft.com"
+                },
+                "queries": {
+                  "$select": "id,displayName"
+                }
+              },
+              "runAfter": {
+                "Get_subject_user": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Filter_roles": {
+              "type": "Query",
+              "runAfter": {
+                "Get_subject_memberOf": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "from": "@body('Get_subject_memberOf')?['value']",
+                "where": "@equals(item()?['@odata.type'],'#microsoft.graph.directoryRole')"
+              }
+            },
+            "Filter_groups": {
+              "type": "Query",
+              "runAfter": {
+                "Filter_roles": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "from": "@body('Get_subject_memberOf')?['value']",
+                "where": "@equals(item()?['@odata.type'],'#microsoft.graph.group')"
+              }
+            },
+            "Compose_precheck": {
+              "type": "Compose",
+              "runAfter": {
+                "Filter_groups": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": "@union(if(greater(length(body('Filter_roles')),0),createArray('target_privileged_role'),json('[]')),if(not(contains(createArray('group_add','offboarding'),outputs('Compose_params')?['action'])),createArray('action_not_implemented'),json('[]')),if(and(equals(outputs('Compose_params')?['action'],'group_add'),not(contains(parameters('allowedGroupNames'),outputs('Compose_params')?['group_name']))),createArray('group_not_allowlisted'),json('[]')),if(not(equals(items('For_each_ticket')?['proposalStatus'],'pending_review')),createArray('proposal_not_pending'),json('[]')),if(not(equals(items('For_each_ticket')?['reviewStatus'],'validated')),createArray('not_validated'),json('[]')))"
+            },
+            "If_can_execute": {
+              "type": "If",
+              "runAfter": {
+                "Compose_precheck": [
+                  "Succeeded"
+                ]
+              },
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@length(outputs('Compose_precheck'))",
+                      0
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "@parameters('dryRun')",
+                      false
+                    ]
+                  }
+                ]
+              },
+              "actions": {
+                "Switch_action": {
+                  "type": "Switch",
+                  "runAfter": {},
+                  "expression": "@outputs('Compose_params')?['action']",
+                  "cases": {
+                    "Case_group_add": {
+                      "case": "group_add",
+                      "actions": {
+                        "Get_group": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "GET",
+                            "uri": "https://graph.microsoft.com/v1.0/groups",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "queries": {
+                              "$filter": "@{concat('displayName eq ''', outputs('Compose_params')?['group_name'], '''')}",
+                              "$select": "id,displayName"
+                            }
+                          },
+                          "runAfter": {}
+                        },
+                        "Add_member": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "POST",
+                            "uri": "@{concat('https://graph.microsoft.com/v1.0/groups/', first(body('Get_group')?['value'])?['id'], '/members/$ref')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json"
+                            },
+                            "body": {
+                              "@@odata.id": "@{concat('https://graph.microsoft.com/v1.0/directoryObjects/', body('Get_subject_user')?['id'])}"
+                            }
+                          },
+                          "runAfter": {
+                            "Get_group": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Log_group_add": {
+                          "type": "AppendToArrayVariable",
+                          "runAfter": {
+                            "Add_member": [
+                              "Succeeded",
+                              "Failed",
+                              "Skipped"
+                            ]
+                          },
+                          "inputs": {
+                            "name": "stepLog",
+                            "value": {
+                              "step": "group_add",
+                              "ok": "@or(equals(outputs('Add_member')?['statusCode'],204),contains(string(body('Add_member')),'already exist'))",
+                              "detail": "@{concat(outputs('Compose_params')?['group_name'], ' (HTTP ', string(outputs('Add_member')?['statusCode']), ')')}"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "Case_offboarding": {
+                      "case": "offboarding",
+                      "actions": {
+                        "If_disable": {
+                          "type": "If",
+                          "runAfter": {},
+                          "expression": {
+                            "and": [
+                              {
+                                "contains": [
+                                  "@outputs('Compose_params')?['offboarding_steps']",
+                                  "disable_account"
+                                ]
+                              }
+                            ]
+                          },
+                          "actions": {
+                            "Disable_user": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "PATCH",
+                                "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'])}",
+                                "authentication": {
+                                  "type": "ManagedServiceIdentity",
+                                  "audience": "https://graph.microsoft.com"
+                                },
+                                "headers": {
+                                  "Content-Type": "application/json"
+                                },
+                                "body": {
+                                  "accountEnabled": false
+                                }
+                              },
+                              "runAfter": {}
+                            },
+                            "Log_disable": {
+                              "type": "AppendToArrayVariable",
+                              "runAfter": {
+                                "Disable_user": [
+                                  "Succeeded",
+                                  "Failed"
+                                ]
+                              },
+                              "inputs": {
+                                "name": "stepLog",
+                                "value": {
+                                  "step": "disable_account",
+                                  "ok": "@equals(outputs('Disable_user')?['statusCode'],204)",
+                                  "detail": "@{concat('HTTP ', string(outputs('Disable_user')?['statusCode']))}"
+                                }
+                              }
+                            }
+                          },
+                          "else": {
+                            "actions": {}
+                          }
+                        },
+                        "If_revoke": {
+                          "type": "If",
+                          "runAfter": {
+                            "If_disable": [
+                              "Succeeded"
+                            ]
+                          },
+                          "expression": {
+                            "and": [
+                              {
+                                "contains": [
+                                  "@outputs('Compose_params')?['offboarding_steps']",
+                                  "revoke_sessions"
+                                ]
+                              }
+                            ]
+                          },
+                          "actions": {
+                            "Revoke_sessions": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "POST",
+                                "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/revokeSignInSessions')}",
+                                "authentication": {
+                                  "type": "ManagedServiceIdentity",
+                                  "audience": "https://graph.microsoft.com"
+                                },
+                                "headers": {
+                                  "Content-Type": "application/json"
+                                },
+                                "body": {}
+                              },
+                              "runAfter": {}
+                            },
+                            "Log_revoke": {
+                              "type": "AppendToArrayVariable",
+                              "runAfter": {
+                                "Revoke_sessions": [
+                                  "Succeeded",
+                                  "Failed"
+                                ]
+                              },
+                              "inputs": {
+                                "name": "stepLog",
+                                "value": {
+                                  "step": "revoke_sessions",
+                                  "ok": "@equals(outputs('Revoke_sessions')?['statusCode'],200)",
+                                  "detail": "@{concat('HTTP ', string(outputs('Revoke_sessions')?['statusCode']))}"
+                                }
+                              }
+                            }
+                          },
+                          "else": {
+                            "actions": {}
+                          }
+                        },
+                        "If_remove_groups": {
+                          "type": "If",
+                          "runAfter": {
+                            "If_revoke": [
+                              "Succeeded"
+                            ]
+                          },
+                          "expression": {
+                            "and": [
+                              {
+                                "contains": [
+                                  "@outputs('Compose_params')?['offboarding_steps']",
+                                  "remove_groups"
+                                ]
+                              }
+                            ]
+                          },
+                          "actions": {
+                            "For_each_group": {
+                              "type": "Foreach",
+                              "foreach": "@body('Filter_groups')",
+                              "runAfter": {},
+                              "runtimeConfiguration": {
+                                "concurrency": {
+                                  "repetitions": 1
+                                }
+                              },
+                              "actions": {
+                                "Get_group_type": {
+                                  "type": "Http",
+                                  "inputs": {
+                                    "method": "GET",
+                                    "uri": "@{concat('https://graph.microsoft.com/v1.0/groups/', items('For_each_group')?['id'])}",
+                                    "authentication": {
+                                      "type": "ManagedServiceIdentity",
+                                      "audience": "https://graph.microsoft.com"
+                                    },
+                                    "queries": {
+                                      "$select": "id,displayName,groupTypes"
+                                    }
+                                  },
+                                  "runAfter": {}
+                                },
+                                "If_static_group": {
+                                  "type": "If",
+                                  "runAfter": {
+                                    "Get_group_type": [
+                                      "Succeeded"
+                                    ]
+                                  },
+                                  "expression": {
+                                    "and": [
+                                      {
+                                        "not": {
+                                          "contains": [
+                                            "@body('Get_group_type')?['groupTypes']",
+                                            "DynamicMembership"
+                                          ]
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  "actions": {
+                                    "Remove_member": {
+                                      "type": "Http",
+                                      "inputs": {
+                                        "method": "DELETE",
+                                        "uri": "@{concat('https://graph.microsoft.com/v1.0/groups/', items('For_each_group')?['id'], '/members/', body('Get_subject_user')?['id'], '/$ref')}",
+                                        "authentication": {
+                                          "type": "ManagedServiceIdentity",
+                                          "audience": "https://graph.microsoft.com"
+                                        }
+                                      },
+                                      "runAfter": {}
+                                    },
+                                    "Log_remove": {
+                                      "type": "AppendToArrayVariable",
+                                      "runAfter": {
+                                        "Remove_member": [
+                                          "Succeeded",
+                                          "Failed"
+                                        ]
+                                      },
+                                      "inputs": {
+                                        "name": "stepLog",
+                                        "value": {
+                                          "step": "remove_group",
+                                          "ok": "@equals(outputs('Remove_member')?['statusCode'],204)",
+                                          "detail": "@{concat(items('For_each_group')?['displayName'], ' (HTTP ', string(outputs('Remove_member')?['statusCode']), ')')}"
+                                        }
+                                      }
+                                    }
+                                  },
+                                  "else": {
+                                    "actions": {
+                                      "Log_dynamic_skipped": {
+                                        "type": "AppendToArrayVariable",
+                                        "runAfter": {},
+                                        "inputs": {
+                                          "name": "stepLog",
+                                          "value": {
+                                            "step": "remove_group",
+                                            "ok": true,
+                                            "detail": "@{concat(items('For_each_group')?['displayName'], ' (dynamic group: membership rule-based, skipped)')}"
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          },
+                          "else": {
+                            "actions": {}
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "default": {
+                    "actions": {}
+                  }
+                }
+              },
+              "else": {
+                "actions": {
+                  "Log_not_executed": {
+                    "type": "AppendToArrayVariable",
+                    "runAfter": {},
+                    "inputs": {
+                      "name": "stepLog",
+                      "value": {
+                        "step": "not_executed",
+                        "ok": "@equals(length(outputs('Compose_precheck')),0)",
+                        "detail": "@{if(greater(length(outputs('Compose_precheck')),0),concat('blocked: ', join(outputs('Compose_precheck'), ',')),concat('dry run - would execute: ', string(outputs('Compose_params'))))}"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "Filter_failed_steps": {
+          "type": "Query",
+          "runAfter": {
+            "Scope_execute": [
+              "Succeeded"
+            ]
+          },
+          "inputs": {
+            "from": "@variables('stepLog')",
+            "where": "@not(equals(item()?['ok'], true))"
+          }
+        },
+        "Compose_exec_status": {
+          "type": "Compose",
+          "runAfter": {
+            "Filter_failed_steps": [
+              "Succeeded"
+            ]
+          },
+          "inputs": "@if(greater(length(outputs('Compose_precheck')),0),'blocked',if(parameters('dryRun'),'dry_run',if(equals(length(body('Filter_failed_steps')),0),'success','partial')))"
+        },
+        "Select_log_lines": {
+          "type": "Select",
+          "runAfter": {
+            "Compose_exec_status": [
+              "Succeeded"
+            ]
+          },
+          "inputs": {
+            "from": "@variables('stepLog')",
+            "select": "@concat(item()?['step'], if(equals(item()?['ok'], true), ' OK ', ' ECHEC '), item()?['detail'])"
+          }
+        },
+        "If_update_servicenow": {
+          "type": "If",
+          "runAfter": {
+            "Select_log_lines": [
+              "Succeeded"
+            ]
+          },
+          "expression": {
+            "and": [
+              {
+                "equals": [
+                  "@parameters('dryRun')",
+                  false
+                ]
+              }
+            ]
+          },
+          "actions": {
+            "If_close": {
+              "type": "If",
+              "runAfter": {},
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@outputs('Compose_exec_status')",
+                      "success"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "@items('For_each_ticket')?['ticketType']",
+                      "ritm"
+                    ]
+                  }
+                ]
+              },
+              "actions": {
+                "Close_ritm": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "PATCH",
+                    "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/sc_req_item/', items('For_each_ticket')?['snSysId'])}",
+                    "authentication": {
+                      "type": "Basic",
+                      "username": "@parameters('snUser')",
+                      "password": "@body('Get_sn_secret')?['value']"
+                    },
+                    "headers": {
+                      "Content-Type": "application/json",
+                      "Accept": "application/json"
+                    },
+                    "body": {
+                      "state": "3",
+                      "work_notes": "@{concat('[KnowledgeEngine] ', outputs('Compose_exec_status'), ' - action ', outputs('Compose_params')?['action'], ' validee par ', items('For_each_ticket')?['reviewedByName'], ' (', items('For_each_ticket')?['reviewedAtUtc'], '). ', join(body('Select_log_lines'), ' | '))}"
+                    }
+                  },
+                  "runAfter": {},
+                  "runtimeConfiguration": {
+                    "secureData": {
+                      "properties": [
+                        "inputs"
+                      ]
+                    }
+                  }
+                }
+              },
+              "else": {
+                "actions": {
+                  "Add_work_note": {
+                    "type": "Http",
+                    "inputs": {
+                      "method": "PATCH",
+                      "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/', if(equals(items('For_each_ticket')?['ticketType'],'ritm'),'sc_req_item','incident'), '/', items('For_each_ticket')?['snSysId'])}",
+                      "authentication": {
+                        "type": "Basic",
+                        "username": "@parameters('snUser')",
+                        "password": "@body('Get_sn_secret')?['value']"
+                      },
+                      "headers": {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json"
+                      },
+                      "body": {
+                        "work_notes": "@{concat('[KnowledgeEngine] ', outputs('Compose_exec_status'), ' - action ', outputs('Compose_params')?['action'], ' validee par ', items('For_each_ticket')?['reviewedByName'], ' (', items('For_each_ticket')?['reviewedAtUtc'], '). ', join(body('Select_log_lines'), ' | '))}"
+                      }
+                    },
+                    "runAfter": {},
+                    "runtimeConfiguration": {
+                      "secureData": {
+                        "properties": [
+                          "inputs"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "actions": {}
+          }
+        },
+        "Merge_result": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '(PartitionKey=''', parameters('clientCode'), ''',RowKey=''', items('For_each_ticket')?['RowKey'], ''')')}",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            },
+            "headers": {
+              "x-ms-version": "2020-12-06",
+              "Accept": "application/json;odata=nometadata",
+              "X-HTTP-Method": "MERGE",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "executionStatus": "@{outputs('Compose_exec_status')}",
+              "executionLog": "@{string(variables('stepLog'))}",
+              "executionDryRun": "@parameters('dryRun')",
+              "snUpdateOk": "@equals(actions('If_update_servicenow')?['status'], 'Succeeded')",
+              "executedAtUtc": "@{utcNow()}"
+            }
+          },
+          "runAfter": {
+            "If_update_servicenow": [
+              "Succeeded",
+              "Failed"
+            ]
+          }
+        },
+        "Merge_error": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '(PartitionKey=''', parameters('clientCode'), ''',RowKey=''', items('For_each_ticket')?['RowKey'], ''')')}",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            },
+            "headers": {
+              "x-ms-version": "2020-12-06",
+              "Accept": "application/json;odata=nometadata",
+              "X-HTTP-Method": "MERGE",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "executionStatus": "error",
+              "executionLog": "@{string(variables('stepLog'))}",
+              "executionError": "Unexpected failure in Scope_execute - see the Logic App run history",
+              "executedAtUtc": "@{utcNow()}"
+            }
+          },
+          "runAfter": {
+            "Scope_execute": [
+              "Failed",
+              "TimedOut"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "outputs": {}
+}
