@@ -888,3 +888,28 @@ hardcoding it into the Logic App.
 `az deployment group create --resource-group rg-knowledgeengine-v9 --template-file infra/modules/videoindexer.bicep --parameters videoIndexerAccountName=vi-knowledgeengine2-v9 storageAccountName=stknowledgeengine2v9` → `Succeeded`, depuis le terminal local de Yassine (`C:\V9\knowledgeengine-rag-platform`), pas Cloud Shell (le repo n'y est pas cloné — piège à noter : Cloud Shell persiste `$HOME` mais ne contient pas ce repo, toujours déployer un `--template-file` depuis un shell où le repo existe réellement).
 
 Reste à récupérer avant le test API (§10.2) : le `principalId` de l'identité managée (sortie Bicep `videoIndexerPrincipalId`) et surtout le **`accountId` interne** du compte (GUID `properties.accountId` sur la ressource ARM — différent du nom `vi-knowledgeengine2-v9`, c'est CET id qui sert dans les URLs `api.videoindexer.ai`), voir commandes ci-dessous.
+
+## §11. ITSM action module (Jalon 10) — demo identities
+
+### 11.1 Seeding the fictional demo identities (2026-09-25 — script written, NOT yet run)
+
+`scripts/itsm/seed-demo-identities.ps1` + `scripts/itsm/demo-identities.json` create, idempotently:
+- **Entra ID (personal tenant only)**: 7 fictional users (`claire.dubois` manager, `amine.elidrissi` MFA reset, `sophie.martin` password reset, `karim.benali` access request, `julie.bernard` licence request, `thomas.leroy` departure, `nadia.admin` = User Administrator, the guardrail persona whose reset must be refused), 3 security groups (`SG-SP-Projets`, `SG-VPN-Users`, `SG-App-Planning`), manager links, memberships, and the directory role.
+- **ServiceNow dev instance**: assignment group `KE-Automation` and matching `sys_user` records. Link key between the two systems: ServiceNow `email` = Entra `userPrincipalName`.
+
+Run from the repo root, after `az login --tenant <personal tenant>` (the script asks for an explicit `YES` after showing the signed-in tenant, to avoid hitting a DXC/[CLIENT-PARENT] tenant):
+
+```powershell
+.\scripts\itsm\seed-demo-identities.ps1 -SnInstance dev123456
+```
+
+Initial passwords of newly created users go to `clients-local/itsm-demo-credentials.csv` (git-ignored). Script source is ASCII-only (see §9.1).
+
+Not covered yet: seeding the demo tickets themselves (incidents via Table API, RITMs via the Service Catalog `order_now` API) — next step.
+
+### 11.2 First run (2026-09-25) and 401 fix
+
+- `az login` pitfalls on this machine: the WAM account picker opens *behind* other windows (Ctrl+C cancels it), and `--use-device-code` is **blocked** on the KnowledgeEngineV9 tenant ("Accès impossible" — device code flow blocked by Conditional Access). Fix: `az config set core.enable_broker_on_windows=false` then `az login --tenant KnowledgeEngineV9.onmicrosoft.com` (browser auth-code flow) → OK.
+- Entra part: all 3 groups, 7 users, 6 memberships, 1 role assignment created without warning.
+- ServiceNow part: **symptom** `(401) Non autorisé` on the first Table API call → **root cause** (most likely) the PS 5.1 `Get-Credential` dialog returns the user name as `\admin` (empty domain prefix) → **fix** the script now prompts in the console (`Read-Host`, `-AsSecureString`), strips a leading `\`, and checks auth once before writing anything. Re-running is safe (Entra objects already present are skipped).
+- Second run: **symptom** re-run stops on `az.cmd : ERROR: Bad Request ... One or more added object references already exist ... 'members'` (NativeCommandError) → **root cause** in Windows PowerShell 5.1, with `$ErrorActionPreference = 'Stop'`, native stderr captured via `2>&1` is turned into a terminating error before the script can inspect `$LASTEXITCODE`, so the intended "already exists → skip" handling never ran → **fix** `Invoke-Graph` sets `ErrorActionPreference = 'Continue'` only around the `az` call and decides on the exit code.
