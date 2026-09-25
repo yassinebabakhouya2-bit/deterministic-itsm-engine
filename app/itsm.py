@@ -309,20 +309,31 @@ def create_itsm_blueprint(table_service, credential=None):
             return back("Seul l'agent qui a validé ce ticket peut afficher le code.")
         if credential is None or not _DELIVERY_VAULT:
             return back("Coffre de remise non configuré.")
+        # Order fixed 2026-09-25 (first live reveal burnt the row without showing anything):
+        # 1) read the secret, 2) claim the row (If-Match), 3) delete + show. A failure before the
+        # claim leaves everything retryable; two concurrent clicks -> only the claim winner shows it.
+        url = f"https://{_DELIVERY_VAULT}.vault.azure.net/secrets/{secret_ref}?api-version=7.4"
+        try:
+            headers = {"Authorization": f"Bearer {credential.get_token('https://vault.azure.net/.default').token}"}
+            resp = requests.get(url, headers=headers, timeout=15)
+        except Exception as exc:
+            return back(f"Coffre de remise inaccessible ({type(exc).__name__}) : réessayez.")
+        if resp.status_code == 404:
+            return back("Code introuvable ou expiré (validité 1 h) : relancez l'action si nécessaire.")
+        if resp.status_code != 200:
+            return back(f"Lecture du coffre refusée (HTTP {resp.status_code}) : droits de l'application sur {_DELIVERY_VAULT} à vérifier, puis réessayez.")
+        value = resp.json().get("value", "")
         try:
             table.update_entity({"PartitionKey": _PARTITION, "RowKey": number,
                                  "secretRevealedAtUtc": _now_utc(), "secretRevealedByName": reviewer_name},
                                 mode=UpdateMode.MERGE, etag=row.metadata.get("etag"),
                                 match_condition=MatchConditions.IfNotModified)
         except ResourceModifiedError:
-            return back("Le ticket est en cours de mise à jour : réessayez.")
-        url = f"https://{_DELIVERY_VAULT}.vault.azure.net/secrets/{secret_ref}?api-version=7.4"
-        headers = {"Authorization": f"Bearer {credential.get_token('https://vault.azure.net/.default').token}"}
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return back("Code introuvable ou expiré (validité 1 h) : relancez l'action si nécessaire.")
-        value = resp.json().get("value", "")
-        requests.delete(url, headers=headers, timeout=15)  # one-time: gone from the vault right after display
+            return back("Le ticket a été modifié entre-temps : réessayez.")
+        try:
+            requests.delete(url, headers=headers, timeout=15)  # one-time: gone from the vault right after display
+        except Exception:
+            pass  # the secret still expires after 1 h; the row already records it as handed over
         kind = row.get("secretKind")
         html = render_template_string(REVEAL_PAGE, number=number, value=value, kind=kind,
                                       subject=row.get("subjectUserName"), display_name=reviewer_name)
