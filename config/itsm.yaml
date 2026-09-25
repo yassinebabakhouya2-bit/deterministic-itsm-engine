@@ -22,3 +22,7 @@ allowedGroups:
   - SG-SP-Projets
   - SG-VPN-Users
   - SG-App-Planning
+
+# Dedicated Key Vault holding one-time secrets (temporary passwords / TAPs) written by the
+# executor (itsm/execute) and revealed ONCE in the review tab to the validating agent, then deleted.
+deliveryKeyVault: kv-ke2-itsm-delivery

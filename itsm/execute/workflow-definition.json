@@ -28,6 +28,12 @@
     },
     "dryRun": {
       "type": "bool"
+    },
+    "deliveryVaultName": {
+      "type": "string"
+    },
+    "incidentCloseCode": {
+      "type": "string"
     }
   },
   "triggers": {
@@ -174,10 +180,19 @@
           },
           "inputs": "@json(items('For_each_ticket')?['approvedParamsJson'])"
         },
+        "Compose_secret_name": {
+          "type": "Compose",
+          "runAfter": {
+            "Compose_params": [
+              "Succeeded"
+            ]
+          },
+          "inputs": "@concat('itsm-', toLower(items('For_each_ticket')?['RowKey']), '-', substring(guid(), 0, 8))"
+        },
         "Scope_execute": {
           "type": "Scope",
           "runAfter": {
-            "Compose_params": [
+            "Compose_secret_name": [
               "Succeeded"
             ]
           },
@@ -247,7 +262,7 @@
                   "Succeeded"
                 ]
               },
-              "inputs": "@union(if(greater(length(body('Filter_roles')),0),createArray('target_privileged_role'),json('[]')),if(not(contains(createArray('group_add','offboarding'),outputs('Compose_params')?['action'])),createArray('action_not_implemented'),json('[]')),if(and(equals(outputs('Compose_params')?['action'],'group_add'),not(contains(parameters('allowedGroupNames'),outputs('Compose_params')?['group_name']))),createArray('group_not_allowlisted'),json('[]')),if(not(equals(items('For_each_ticket')?['proposalStatus'],'pending_review')),createArray('proposal_not_pending'),json('[]')),if(not(equals(items('For_each_ticket')?['reviewStatus'],'validated')),createArray('not_validated'),json('[]')))"
+              "inputs": "@union(if(greater(length(body('Filter_roles')),0),createArray('target_privileged_role'),json('[]')),if(not(contains(createArray('group_add','offboarding','password_reset','mfa_reset'),outputs('Compose_params')?['action'])),createArray('action_not_implemented'),json('[]')),if(and(equals(outputs('Compose_params')?['action'],'group_add'),not(contains(parameters('allowedGroupNames'),outputs('Compose_params')?['group_name']))),createArray('group_not_allowlisted'),json('[]')),if(not(equals(items('For_each_ticket')?['proposalStatus'],'pending_review')),createArray('proposal_not_pending'),json('[]')),if(not(equals(items('For_each_ticket')?['reviewStatus'],'validated')),createArray('not_validated'),json('[]')))"
             },
             "If_can_execute": {
               "type": "If",
@@ -404,11 +419,17 @@
                             ]
                           },
                           "expression": {
-                            "and": [
+                            "or": [
                               {
                                 "contains": [
                                   "@outputs('Compose_params')?['offboarding_steps']",
                                   "revoke_sessions"
+                                ]
+                              },
+                              {
+                                "contains": [
+                                  "@outputs('Compose_params')?['offboarding_steps']",
+                                  "disable_account"
                                 ]
                               }
                             ]
@@ -568,6 +589,440 @@
                           "else": {
                             "actions": {}
                           }
+                        },
+                        "If_remove_licenses": {
+                          "type": "If",
+                          "runAfter": {
+                            "If_remove_groups": [
+                              "Succeeded"
+                            ]
+                          },
+                          "expression": {
+                            "and": [
+                              {
+                                "contains": [
+                                  "@outputs('Compose_params')?['offboarding_steps']",
+                                  "remove_licenses"
+                                ]
+                              }
+                            ]
+                          },
+                          "actions": {
+                            "Get_licenses": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "GET",
+                                "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/licenseDetails')}",
+                                "authentication": {
+                                  "type": "ManagedServiceIdentity",
+                                  "audience": "https://graph.microsoft.com"
+                                },
+                                "queries": {
+                                  "$select": "skuId,skuPartNumber"
+                                }
+                              },
+                              "runAfter": {}
+                            },
+                            "Select_sku_ids": {
+                              "type": "Select",
+                              "runAfter": {
+                                "Get_licenses": [
+                                  "Succeeded"
+                                ]
+                              },
+                              "inputs": {
+                                "from": "@body('Get_licenses')?['value']",
+                                "select": "@item()?['skuId']"
+                              }
+                            },
+                            "If_has_licenses": {
+                              "type": "If",
+                              "runAfter": {
+                                "Select_sku_ids": [
+                                  "Succeeded"
+                                ]
+                              },
+                              "expression": {
+                                "and": [
+                                  {
+                                    "greater": [
+                                      "@length(body('Select_sku_ids'))",
+                                      0
+                                    ]
+                                  }
+                                ]
+                              },
+                              "actions": {
+                                "Remove_licenses": {
+                                  "type": "Http",
+                                  "inputs": {
+                                    "method": "POST",
+                                    "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/assignLicense')}",
+                                    "authentication": {
+                                      "type": "ManagedServiceIdentity",
+                                      "audience": "https://graph.microsoft.com"
+                                    },
+                                    "headers": {
+                                      "Content-Type": "application/json"
+                                    },
+                                    "body": {
+                                      "addLicenses": [],
+                                      "removeLicenses": "@body('Select_sku_ids')"
+                                    }
+                                  },
+                                  "runAfter": {}
+                                },
+                                "Log_remove_licenses": {
+                                  "type": "AppendToArrayVariable",
+                                  "runAfter": {
+                                    "Remove_licenses": [
+                                      "Succeeded",
+                                      "Failed"
+                                    ]
+                                  },
+                                  "inputs": {
+                                    "name": "stepLog",
+                                    "value": {
+                                      "step": "remove_licenses",
+                                      "ok": "@equals(outputs('Remove_licenses')?['statusCode'],200)",
+                                      "detail": "@{concat(string(length(body('Select_sku_ids'))), ' licence(s) (HTTP ', string(outputs('Remove_licenses')?['statusCode']), ')')}"
+                                    }
+                                  }
+                                }
+                              },
+                              "else": {
+                                "actions": {
+                                  "Log_no_license": {
+                                    "type": "AppendToArrayVariable",
+                                    "runAfter": {},
+                                    "inputs": {
+                                      "name": "stepLog",
+                                      "value": {
+                                        "step": "remove_licenses",
+                                        "ok": true,
+                                        "detail": "aucune licence attribuee"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          },
+                          "else": {
+                            "actions": {}
+                          }
+                        }
+                      }
+                    },
+                    "Case_password_reset": {
+                      "case": "password_reset",
+                      "actions": {
+                        "Store_temp_password": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "PUT",
+                            "uri": "@{concat('https://', parameters('deliveryVaultName'), '.vault.azure.net/secrets/', outputs('Compose_secret_name'), '?api-version=7.4')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://vault.azure.net"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json"
+                            },
+                            "body": {
+                              "value": "@{concat('Ke', toUpper(substring(guid(), 0, 4)), '-', substring(guid(), 0, 8), '!', string(rand(10, 99)))}",
+                              "contentType": "temporary-password",
+                              "attributes": {
+                                "exp": "@div(sub(ticks(addHours(utcNow(), 1)), ticks('1970-01-01T00:00:00Z')), 10000000)"
+                              },
+                              "tags": {
+                                "ticket": "@{items('For_each_ticket')?['RowKey']}"
+                              }
+                            }
+                          },
+                          "runAfter": {},
+                          "runtimeConfiguration": {
+                            "secureData": {
+                              "properties": [
+                                "inputs",
+                                "outputs"
+                              ]
+                            }
+                          }
+                        },
+                        "Read_temp_password": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "GET",
+                            "uri": "@{concat('https://', parameters('deliveryVaultName'), '.vault.azure.net/secrets/', outputs('Compose_secret_name'), '?api-version=7.4')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://vault.azure.net"
+                            }
+                          },
+                          "runAfter": {
+                            "Store_temp_password": [
+                              "Succeeded"
+                            ]
+                          },
+                          "runtimeConfiguration": {
+                            "secureData": {
+                              "properties": [
+                                "outputs"
+                              ]
+                            }
+                          }
+                        },
+                        "Reset_password": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "PATCH",
+                            "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'])}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json"
+                            },
+                            "body": {
+                              "passwordProfile": {
+                                "password": "@body('Read_temp_password')?['value']",
+                                "forceChangePasswordNextSignIn": true
+                              }
+                            }
+                          },
+                          "runAfter": {
+                            "Read_temp_password": [
+                              "Succeeded"
+                            ]
+                          },
+                          "runtimeConfiguration": {
+                            "secureData": {
+                              "properties": [
+                                "inputs"
+                              ]
+                            }
+                          }
+                        },
+                        "Revoke_after_reset": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "POST",
+                            "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/revokeSignInSessions')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json"
+                            },
+                            "body": {}
+                          },
+                          "runAfter": {
+                            "Reset_password": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Log_password_reset": {
+                          "type": "AppendToArrayVariable",
+                          "runAfter": {
+                            "Reset_password": [
+                              "Succeeded",
+                              "Failed",
+                              "Skipped"
+                            ],
+                            "Revoke_after_reset": [
+                              "Succeeded",
+                              "Failed",
+                              "Skipped"
+                            ]
+                          },
+                          "inputs": {
+                            "name": "stepLog",
+                            "value": {
+                              "step": "password_reset",
+                              "ok": "@and(equals(outputs('Reset_password')?['statusCode'],204),equals(outputs('Revoke_after_reset')?['statusCode'],200))",
+                              "detail": "@{concat('mot de passe temporaire (changement force a la connexion), sessions revoquees - HTTP ', string(outputs('Reset_password')?['statusCode']), ' - remis a l agent validateur uniquement')}"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "Case_mfa_reset": {
+                      "case": "mfa_reset",
+                      "actions": {
+                        "Get_authenticator_methods": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "GET",
+                            "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/authentication/microsoftAuthenticatorMethods')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            }
+                          },
+                          "runAfter": {}
+                        },
+                        "For_each_method": {
+                          "type": "Foreach",
+                          "foreach": "@body('Get_authenticator_methods')?['value']",
+                          "runAfter": {
+                            "Get_authenticator_methods": [
+                              "Succeeded"
+                            ]
+                          },
+                          "runtimeConfiguration": {
+                            "concurrency": {
+                              "repetitions": 1
+                            }
+                          },
+                          "actions": {
+                            "Delete_method": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "DELETE",
+                                "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/authentication/microsoftAuthenticatorMethods/', items('For_each_method')?['id'])}",
+                                "authentication": {
+                                  "type": "ManagedServiceIdentity",
+                                  "audience": "https://graph.microsoft.com"
+                                }
+                              },
+                              "runAfter": {}
+                            },
+                            "Log_delete_method": {
+                              "type": "AppendToArrayVariable",
+                              "runAfter": {
+                                "Delete_method": [
+                                  "Succeeded",
+                                  "Failed"
+                                ]
+                              },
+                              "inputs": {
+                                "name": "stepLog",
+                                "value": {
+                                  "step": "delete_authenticator",
+                                  "ok": "@equals(outputs('Delete_method')?['statusCode'],204)",
+                                  "detail": "@{concat(coalesce(items('For_each_method')?['displayName'], 'Authenticator'), ' (HTTP ', string(outputs('Delete_method')?['statusCode']), ')')}"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "Create_tap": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "POST",
+                            "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/authentication/temporaryAccessPassMethods')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json"
+                            },
+                            "body": {
+                              "lifetimeInMinutes": 60,
+                              "isUsableOnce": true
+                            }
+                          },
+                          "runAfter": {
+                            "For_each_method": [
+                              "Succeeded"
+                            ]
+                          },
+                          "runtimeConfiguration": {
+                            "secureData": {
+                              "properties": [
+                                "outputs"
+                              ]
+                            }
+                          }
+                        },
+                        "Store_tap": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "PUT",
+                            "uri": "@{concat('https://', parameters('deliveryVaultName'), '.vault.azure.net/secrets/', outputs('Compose_secret_name'), '?api-version=7.4')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://vault.azure.net"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json"
+                            },
+                            "body": {
+                              "value": "@body('Create_tap')?['temporaryAccessPass']",
+                              "contentType": "temporary-access-pass",
+                              "attributes": {
+                                "exp": "@div(sub(ticks(addHours(utcNow(), 1)), ticks('1970-01-01T00:00:00Z')), 10000000)"
+                              },
+                              "tags": {
+                                "ticket": "@{items('For_each_ticket')?['RowKey']}"
+                              }
+                            }
+                          },
+                          "runAfter": {
+                            "Create_tap": [
+                              "Succeeded"
+                            ]
+                          },
+                          "runtimeConfiguration": {
+                            "secureData": {
+                              "properties": [
+                                "inputs"
+                              ]
+                            }
+                          }
+                        },
+                        "Revoke_after_mfa": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "POST",
+                            "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/revokeSignInSessions')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json"
+                            },
+                            "body": {}
+                          },
+                          "runAfter": {
+                            "Store_tap": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Log_mfa_reset": {
+                          "type": "AppendToArrayVariable",
+                          "runAfter": {
+                            "Create_tap": [
+                              "Succeeded",
+                              "Failed",
+                              "Skipped"
+                            ],
+                            "Store_tap": [
+                              "Succeeded",
+                              "Failed",
+                              "Skipped"
+                            ],
+                            "Revoke_after_mfa": [
+                              "Succeeded",
+                              "Failed",
+                              "Skipped"
+                            ]
+                          },
+                          "inputs": {
+                            "name": "stepLog",
+                            "value": {
+                              "step": "mfa_reset",
+                              "ok": "@and(equals(outputs('Create_tap')?['statusCode'],201),equals(outputs('Store_tap')?['statusCode'],200),equals(outputs('Revoke_after_mfa')?['statusCode'],200))",
+                              "detail": "@{concat(string(length(coalesce(body('Get_authenticator_methods')?['value'], json('[]')))), ' methode(s) Authenticator supprimee(s), TAP 60 min usage unique cree (HTTP ', string(outputs('Create_tap')?['statusCode']), '), sessions revoquees - remis a l agent validateur uniquement')}"
+                            }
+                          }
                         }
                       }
                     }
@@ -657,41 +1112,85 @@
                       "@outputs('Compose_exec_status')",
                       "success"
                     ]
-                  },
-                  {
-                    "equals": [
-                      "@items('For_each_ticket')?['ticketType']",
-                      "ritm"
-                    ]
                   }
                 ]
               },
               "actions": {
-                "Close_ritm": {
-                  "type": "Http",
-                  "inputs": {
-                    "method": "PATCH",
-                    "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/sc_req_item/', items('For_each_ticket')?['snSysId'])}",
-                    "authentication": {
-                      "type": "Basic",
-                      "username": "@parameters('snUser')",
-                      "password": "@body('Get_sn_secret')?['value']"
-                    },
-                    "headers": {
-                      "Content-Type": "application/json",
-                      "Accept": "application/json"
-                    },
-                    "body": {
-                      "state": "3",
-                      "work_notes": "@{concat('[KnowledgeEngine] ', outputs('Compose_exec_status'), ' - action ', outputs('Compose_params')?['action'], ' validee par ', items('For_each_ticket')?['reviewedByName'], ' (', items('For_each_ticket')?['reviewedAtUtc'], '). ', join(body('Select_log_lines'), ' | '))}"
+                "If_is_ritm": {
+                  "type": "If",
+                  "runAfter": {},
+                  "expression": {
+                    "and": [
+                      {
+                        "equals": [
+                          "@items('For_each_ticket')?['ticketType']",
+                          "ritm"
+                        ]
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "Close_ritm": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "PATCH",
+                        "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/sc_req_item/', items('For_each_ticket')?['snSysId'])}",
+                        "authentication": {
+                          "type": "Basic",
+                          "username": "@parameters('snUser')",
+                          "password": "@body('Get_sn_secret')?['value']"
+                        },
+                        "headers": {
+                          "Content-Type": "application/json",
+                          "Accept": "application/json"
+                        },
+                        "body": {
+                          "state": "3",
+                          "work_notes": "@{concat('[KnowledgeEngine] ', outputs('Compose_exec_status'), ' - action ', outputs('Compose_params')?['action'], ' validee par ', items('For_each_ticket')?['reviewedByName'], ' (', items('For_each_ticket')?['reviewedAtUtc'], '). ', join(body('Select_log_lines'), ' | '))}"
+                        }
+                      },
+                      "runAfter": {},
+                      "runtimeConfiguration": {
+                        "secureData": {
+                          "properties": [
+                            "inputs"
+                          ]
+                        }
+                      }
                     }
                   },
-                  "runAfter": {},
-                  "runtimeConfiguration": {
-                    "secureData": {
-                      "properties": [
-                        "inputs"
-                      ]
+                  "else": {
+                    "actions": {
+                      "Resolve_incident": {
+                        "type": "Http",
+                        "inputs": {
+                          "method": "PATCH",
+                          "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/incident/', items('For_each_ticket')?['snSysId'])}",
+                          "authentication": {
+                            "type": "Basic",
+                            "username": "@parameters('snUser')",
+                            "password": "@body('Get_sn_secret')?['value']"
+                          },
+                          "headers": {
+                            "Content-Type": "application/json",
+                            "Accept": "application/json"
+                          },
+                          "body": {
+                            "state": "6",
+                            "close_code": "@parameters('incidentCloseCode')",
+                            "close_notes": "@{concat('Traite par KnowledgeEngine apres validation de ', items('For_each_ticket')?['reviewedByName'], ' : ', outputs('Compose_params')?['action'], '. Le code temporaire a ete remis a l utilisateur par l agent (jamais transmis dans ce ticket).')}",
+                            "work_notes": "@{concat('[KnowledgeEngine] ', outputs('Compose_exec_status'), ' - action ', outputs('Compose_params')?['action'], ' validee par ', items('For_each_ticket')?['reviewedByName'], ' (', items('For_each_ticket')?['reviewedAtUtc'], '). ', join(body('Select_log_lines'), ' | '))}"
+                          }
+                        },
+                        "runAfter": {},
+                        "runtimeConfiguration": {
+                          "secureData": {
+                            "properties": [
+                              "inputs"
+                            ]
+                          }
+                        }
+                      }
                     }
                   }
                 }
@@ -752,6 +1251,8 @@
               "executionStatus": "@{outputs('Compose_exec_status')}",
               "executionLog": "@{string(variables('stepLog'))}",
               "executionDryRun": "@parameters('dryRun')",
+              "secretRef": "@{if(and(equals(outputs('Compose_exec_status'),'success'),or(equals(outputs('Compose_params')?['action'],'password_reset'),equals(outputs('Compose_params')?['action'],'mfa_reset'))),outputs('Compose_secret_name'),'')}",
+              "secretKind": "@{if(equals(outputs('Compose_params')?['action'],'mfa_reset'),'tap',if(equals(outputs('Compose_params')?['action'],'password_reset'),'password',''))}",
               "snUpdateOk": "@equals(actions('If_update_servicenow')?['status'], 'Succeeded')",
               "executedAtUtc": "@{utcNow()}"
             }
