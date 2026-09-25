@@ -156,8 +156,15 @@ mfa["For_each_method"] = {"type": "Foreach", "foreach": "@body('Get_authenticato
         **log("Log_delete_method", done("Delete_method"), "delete_authenticator",
               "@equals(outputs('Delete_method')?['statusCode'],204)",
               "@{concat(coalesce(items('For_each_method')?['displayName'], 'Authenticator'), ' (HTTP ', string(outputs('Delete_method')?['statusCode']), ')')}")}}
+# A user can hold only ONE Temporary Access Pass: delete any previous one first (replayed demo,
+# second MFA reset within the hour...), otherwise the creation below is rejected.
+mfa["Get_existing_taps"] = http("GET", f"@{{concat('{GRAPH}/v1.0/users/', {UID}, '/authentication/temporaryAccessPassMethods')}}", MI_GRAPH,
+    ok("For_each_method"))
+mfa["For_each_old_tap"] = {"type": "Foreach", "foreach": "@body('Get_existing_taps')?['value']", "runAfter": ok("Get_existing_taps"),
+    "runtimeConfiguration": {"concurrency": {"repetitions": 1}},
+    "actions": {"Delete_old_tap": http("DELETE", f"@{{concat('{GRAPH}/v1.0/users/', {UID}, '/authentication/temporaryAccessPassMethods/', items('For_each_old_tap')?['id'])}}", MI_GRAPH, {})}}
 mfa["Create_tap"] = dict(http("POST", f"@{{concat('{GRAPH}/v1.0/users/', {UID}, '/authentication/temporaryAccessPassMethods')}}", MI_GRAPH,
-    ok("For_each_method"), headers={"Content-Type": "application/json"},
+    ok("For_each_old_tap"), headers={"Content-Type": "application/json"},
     body={"lifetimeInMinutes": 60, "isUsableOnce": True}), runtimeConfiguration=SECURE_OUT)
 mfa["Store_tap"] = dict(http("PUT", VAULT_SECRET_URI, MI_VAULT, ok("Create_tap"), headers={"Content-Type": "application/json"},
     body={"value": "@body('Create_tap')?['temporaryAccessPass']", "contentType": "temporary-access-pass",

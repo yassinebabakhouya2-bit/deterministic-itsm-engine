@@ -910,6 +910,50 @@
                             }
                           }
                         },
+                        "Get_existing_taps": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "GET",
+                            "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/authentication/temporaryAccessPassMethods')}",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            }
+                          },
+                          "runAfter": {
+                            "For_each_method": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "For_each_old_tap": {
+                          "type": "Foreach",
+                          "foreach": "@body('Get_existing_taps')?['value']",
+                          "runAfter": {
+                            "Get_existing_taps": [
+                              "Succeeded"
+                            ]
+                          },
+                          "runtimeConfiguration": {
+                            "concurrency": {
+                              "repetitions": 1
+                            }
+                          },
+                          "actions": {
+                            "Delete_old_tap": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "DELETE",
+                                "uri": "@{concat('https://graph.microsoft.com/v1.0/users/', body('Get_subject_user')?['id'], '/authentication/temporaryAccessPassMethods/', items('For_each_old_tap')?['id'])}",
+                                "authentication": {
+                                  "type": "ManagedServiceIdentity",
+                                  "audience": "https://graph.microsoft.com"
+                                }
+                              },
+                              "runAfter": {}
+                            }
+                          }
+                        },
                         "Create_tap": {
                           "type": "Http",
                           "inputs": {
@@ -928,7 +972,7 @@
                             }
                           },
                           "runAfter": {
-                            "For_each_method": [
+                            "For_each_old_tap": [
                               "Succeeded"
                             ]
                           },

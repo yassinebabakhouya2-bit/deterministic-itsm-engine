@@ -52,15 +52,22 @@ else {
 }
 
 # 3. Temporary Access Pass policy
+# The az CLI token does NOT carry Policy.ReadWrite.AuthenticationMethod (Forbidden on this endpoint,
+# hit 2026-09-25) -> non-fatal: print the portal steps instead.
 $tapPath = '/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/TemporaryAccessPass'
-$tap = Invoke-Graph GET $tapPath $null
-if ($tap.state -eq 'enabled') { Write-Host '[skip] Temporary Access Pass policy already enabled' }
-else {
-    Invoke-Graph PATCH $tapPath @{
-        '@odata.type' = '#microsoft.graph.temporaryAccessPassAuthenticationMethodConfiguration'
-        state = 'enabled'
-        includeTargets = @(@{ targetType = 'group'; id = 'all_users'; isRegistrationRequired = $false })
-    } | Out-Null
-    Write-Host '[new ] Temporary Access Pass policy enabled (all users)' -ForegroundColor Green
+try {
+    $tap = Invoke-Graph GET $tapPath $null
+    if ($tap.state -eq 'enabled') { Write-Host '[skip] Temporary Access Pass policy already enabled' }
+    else {
+        Invoke-Graph PATCH $tapPath @{
+            '@odata.type' = '#microsoft.graph.temporaryAccessPassAuthenticationMethodConfiguration'
+            state = 'enabled'
+            includeTargets = @(@{ targetType = 'group'; id = 'all_users'; isRegistrationRequired = $false })
+        } | Out-Null
+        Write-Host '[new ] Temporary Access Pass policy enabled (all users)' -ForegroundColor Green
+    }
+} catch {
+    Write-Warning 'Cannot manage the Temporary Access Pass policy with the az CLI token. Enable it in the portal:'
+    Write-Warning '  Entra admin center > Protection > Authentication methods > Policies > Temporary Access Pass > Enable, Target: All users > Save'
 }
 Write-Host 'Allow a few minutes for the directory role and app roles to take effect.'
