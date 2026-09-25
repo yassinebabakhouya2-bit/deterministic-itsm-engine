@@ -12,7 +12,7 @@
   Prerequisites:
     - `az login --tenant <personal tenant>` with an account that is Global Admin
       (or User Administrator + Privileged Role Administrator) on the PERSONAL tenant.
-      Check with `az account show` first - do NOT run this against a DXC/VINCI tenant.
+      Check with `az account show` first - do NOT run this against an employer or client tenant.
     - ServiceNow dev instance admin credentials (prompted).
 
   Source is ASCII only on purpose (Windows PowerShell 5.1 pitfall, runbook 9.1).
@@ -77,7 +77,7 @@ function New-DemoPassword {
 # ---------------------------------------------------------------- Safety check
 $acct = az account show | ConvertFrom-Json
 Write-Host "Signed in as $($acct.user.name) on tenant $($acct.tenantId)" -ForegroundColor Yellow
-$confirm = Read-Host "Is this the PERSONAL KnowledgeEngine tenant (not DXC/VINCI)? Type YES to continue"
+$confirm = Read-Host "Is this the PERSONAL KnowledgeEngine tenant (not an employer or client tenant)? Type YES to continue"
 if ($confirm -ne 'YES') { throw 'Aborted by operator.' }
 
 if (-not $TenantDomain) {

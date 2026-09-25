@@ -14,7 +14,7 @@
 // audio files go to `audioContainerName` (new), everything else keeps
 // going to `containerName` exactly as before. Blob names now preserve the
 // full relative folder path instead of just the file name — this is a
-// no-op for a file already at the drive root (Vinci/SFIT today), and only
+// no-op for a file already at the drive root (client-v/client-s today), and only
 // changes behavior for files in subfolders (newly discovered thanks to the
 // recursive walk).
 // =====================================================================

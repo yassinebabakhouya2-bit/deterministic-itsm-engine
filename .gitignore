@@ -47,3 +47,13 @@ eval/.promptflow/
 
 # Zip deploy artifact (Jalon 4, app/) -- rebuilt locally each deploy, never committed
 deploy.zip
+*.zip
+diag-*.json
+search-body.json
+n1_test.txt
+n7_verif.txt
+test_results.txt
+
+# Local debug artifacts (contain real-client KB excerpts) -- never commit
+turns_*.json
+/zi[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]
