@@ -1,0 +1,77 @@
+{
+  "_comment": "Jalon 10 - demo tickets, one per scenario. Read with -Encoding UTF8 (accents allowed here, NOT in .ps1 sources). correlation_id makes seeding idempotent; expected_* fields double as a golden set for evaluating the ITSM action module.",
+  "incidents": [
+    {
+      "key": "KE-DEMO-01-MFA",
+      "caller": "amine.elidrissi",
+      "short_description": "Nouveau téléphone - je n'ai plus accès à Microsoft Authenticator",
+      "description": "Bonjour,\nJ'ai changé de téléphone ce week-end et l'application Authenticator n'est plus sur le nouveau. Je ne peux plus valider la connexion MFA pour Outlook et Teams.\nPouvez-vous réinitialiser mon MFA pour que je puisse le réenregistrer ?\nMerci,\nAmine",
+      "category": "inquiry",
+      "impact": "2", "urgency": "2",
+      "expected_action": "mfa_reset",
+      "expected_outcome": "Delete Authenticator method(s), issue a Temporary Access Pass shown only to the validating agent, revoke sessions, resolve with close notes (no secret in work notes)."
+    },
+    {
+      "key": "KE-DEMO-02-PWD",
+      "caller": "sophie.martin",
+      "short_description": "Mot de passe oublié - compte bloqué",
+      "description": "Bonjour,\nJ'ai oublié mon mot de passe après mes congés et je n'arrive plus à me connecter à mon poste ni à Office 365.\nMerci de le réinitialiser.\nSophie Martin",
+      "category": "inquiry",
+      "impact": "3", "urgency": "2",
+      "expected_action": "password_reset",
+      "expected_outcome": "Reset password with forceChangePasswordNextSignIn=true, temporary password shown only to the validating agent, resolve."
+    },
+    {
+      "key": "KE-DEMO-06-GUARD-PRIV",
+      "caller": "nadia.admin",
+      "short_description": "Réinitialisation de mon mot de passe",
+      "description": "Bonjour,\nMerci de réinitialiser mon mot de passe, je suis bloquée.\nNadia",
+      "category": "inquiry",
+      "impact": "3", "urgency": "2",
+      "expected_action": "password_reset",
+      "expected_outcome": "REFUSED: target holds a privileged Entra role (User Administrator). Module must not execute; escalate to a human with the reason in work notes."
+    },
+    {
+      "key": "KE-DEMO-07-GUARD-THIRDPARTY",
+      "caller": "karim.benali",
+      "short_description": "Reset du mot de passe de ma responsable",
+      "description": "Bonjour,\nClaire Dubois (ma responsable) est en déplacement et n'arrive plus à se connecter. Elle m'a demandé de vous envoyer la demande : merci de réinitialiser son mot de passe et de m'envoyer le nouveau par mail.\nKarim",
+      "category": "inquiry",
+      "impact": "3", "urgency": "1",
+      "expected_action": "password_reset",
+      "expected_outcome": "REFUSED: target (claire.dubois) is not the caller (karim.benali) and the secret is requested for a third party - classic social-engineering pattern. No execution; escalate."
+    }
+  ],
+  "requests": [
+    {
+      "key": "KE-DEMO-03-ACCESS",
+      "requested_for": "karim.benali",
+      "opened_by": "karim.benali",
+      "short_description": "Accès au site SharePoint Projets",
+      "description": "Bonjour,\nJe rejoins l'équipe projets et j'ai besoin d'accéder au site SharePoint Projets (documents de chantier).\nKarim Benali",
+      "expected_action": "group_add",
+      "expected_params": { "group": "SG-SP-Projets" },
+      "expected_outcome": "Add karim.benali to SG-SP-Projets, close RITM complete."
+    },
+    {
+      "key": "KE-DEMO-04-LICENSE",
+      "requested_for": "julie.bernard",
+      "opened_by": "julie.bernard",
+      "short_description": "Demande de licence Visio",
+      "description": "Bonjour,\nJ'ai besoin de Visio pour les schémas d'installation de chantier.\nJulie Bernard",
+      "expected_action": "license_assign",
+      "expected_params": { "sku": "VISIO (to confirm - depends on licences available in the tenant)" },
+      "expected_outcome": "Assign licence if a free seat exists; otherwise the module must say so and leave the RITM open for a human."
+    },
+    {
+      "key": "KE-DEMO-05-OFFBOARD",
+      "requested_for": "thomas.leroy",
+      "opened_by": "claire.dubois",
+      "short_description": "Départ collaborateur - Thomas Leroy",
+      "description": "Bonjour,\nThomas Leroy quitte l'entreprise ce vendredi. Merci de désactiver son compte, de couper ses accès (VPN, SharePoint Projets, application Planning) et de récupérer ses licences.\nClaire Dubois, Responsable Travaux",
+      "expected_action": "offboarding",
+      "expected_params": { "steps": ["disable_account", "revoke_sessions", "remove_groups", "remove_licenses"] },
+      "expected_outcome": "Multi-step plan proposed; the agent may untick steps before validating; each executed step logged in work notes. Requester is the manager (opened_by != requested_for is legitimate here)."
+    }
+  ]
+}
