@@ -1,0 +1,233 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "clientCode": {
+      "type": "string"
+    },
+    "snInstance": {
+      "type": "string"
+    },
+    "snUser": {
+      "type": "string"
+    },
+    "snAssignmentGroup": {
+      "type": "string"
+    },
+    "keyVaultName": {
+      "type": "string"
+    },
+    "snSecretName": {
+      "type": "string"
+    },
+    "storageAccountName": {
+      "type": "string"
+    },
+    "tableName": {
+      "type": "string"
+    },
+    "maxTicketsPerRun": {
+      "type": "int",
+      "defaultValue": 100
+    }
+  },
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Minute",
+        "interval": 5
+      }
+    }
+  },
+  "actions": {
+    "Get_sn_secret": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('keyVaultName'), '.vault.azure.net/secrets/', parameters('snSecretName'), '?api-version=7.4')}",
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://vault.azure.net"
+        }
+      },
+      "runtimeConfiguration": {
+        "secureData": {
+          "properties": [
+            "outputs"
+          ]
+        }
+      },
+      "runAfter": {}
+    },
+    "Get_incidents": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/incident')}",
+        "queries": {
+          "sysparm_query": "@{concat('assignment_group.name=', parameters('snAssignmentGroup'), '^active=true^ORDERBYsys_updated_on')}",
+          "sysparm_fields": "sys_id,number,short_description,description,state,priority,sys_updated_on,sys_mod_count,correlation_id,opened_by.user_name,opened_by.email,caller_id.user_name,caller_id.email",
+          "sysparm_exclude_reference_link": "true",
+          "sysparm_limit": "@{string(parameters('maxTicketsPerRun'))}"
+        },
+        "headers": {
+          "Accept": "application/json"
+        },
+        "authentication": {
+          "type": "Basic",
+          "username": "@parameters('snUser')",
+          "password": "@body('Get_sn_secret')?['value']"
+        }
+      },
+      "runtimeConfiguration": {
+        "secureData": {
+          "properties": [
+            "inputs"
+          ]
+        }
+      },
+      "runAfter": {
+        "Get_sn_secret": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Get_ritms": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/sc_req_item')}",
+        "queries": {
+          "sysparm_query": "@{concat('assignment_group.name=', parameters('snAssignmentGroup'), '^active=true^ORDERBYsys_updated_on')}",
+          "sysparm_fields": "sys_id,number,short_description,description,state,priority,sys_updated_on,sys_mod_count,correlation_id,opened_by.user_name,opened_by.email,requested_for.user_name,requested_for.email",
+          "sysparm_exclude_reference_link": "true",
+          "sysparm_limit": "@{string(parameters('maxTicketsPerRun'))}"
+        },
+        "headers": {
+          "Accept": "application/json"
+        },
+        "authentication": {
+          "type": "Basic",
+          "username": "@parameters('snUser')",
+          "password": "@body('Get_sn_secret')?['value']"
+        }
+      },
+      "runtimeConfiguration": {
+        "secureData": {
+          "properties": [
+            "inputs"
+          ]
+        }
+      },
+      "runAfter": {
+        "Get_sn_secret": [
+          "Succeeded"
+        ]
+      }
+    },
+    "For_each_incident": {
+      "type": "Foreach",
+      "foreach": "@body('Get_incidents')?['result']",
+      "runAfter": {
+        "Get_incidents": [
+          "Succeeded"
+        ]
+      },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "repetitions": 5
+        }
+      },
+      "actions": {
+        "Upsert_incident": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '(PartitionKey=''', parameters('clientCode'), ''',RowKey=''', items('For_each_incident')?['number'], ''')')}",
+            "headers": {
+              "X-HTTP-Method": "MERGE",
+              "x-ms-version": "2020-12-06",
+              "Content-Type": "application/json",
+              "Accept": "application/json;odata=nometadata"
+            },
+            "body": {
+              "ticketType": "incident",
+              "snSysId": "@{items('For_each_incident')?['sys_id']}",
+              "number": "@{items('For_each_incident')?['number']}",
+              "shortDescription": "@{items('For_each_incident')?['short_description']}",
+              "description": "@{items('For_each_incident')?['description']}",
+              "snState": "@{items('For_each_incident')?['state']}",
+              "priority": "@{items('For_each_incident')?['priority']}",
+              "snUpdatedOn": "@{items('For_each_incident')?['sys_updated_on']}",
+              "snModCount": "@{items('For_each_incident')?['sys_mod_count']}",
+              "correlationId": "@{items('For_each_incident')?['correlation_id']}",
+              "openedByUserName": "@{items('For_each_incident')?['opened_by.user_name']}",
+              "openedByEmail": "@{items('For_each_incident')?['opened_by.email']}",
+              "subjectUserName": "@{items('For_each_incident')?['caller_id.user_name']}",
+              "subjectEmail": "@{items('For_each_incident')?['caller_id.email']}",
+              "snInstance": "@{parameters('snInstance')}",
+              "lastSeenUtc": "@{utcNow()}"
+            },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            }
+          }
+        }
+      }
+    },
+    "For_each_ritm": {
+      "type": "Foreach",
+      "foreach": "@body('Get_ritms')?['result']",
+      "runAfter": {
+        "Get_ritms": [
+          "Succeeded"
+        ]
+      },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "repetitions": 5
+        }
+      },
+      "actions": {
+        "Upsert_ritm": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '(PartitionKey=''', parameters('clientCode'), ''',RowKey=''', items('For_each_ritm')?['number'], ''')')}",
+            "headers": {
+              "X-HTTP-Method": "MERGE",
+              "x-ms-version": "2020-12-06",
+              "Content-Type": "application/json",
+              "Accept": "application/json;odata=nometadata"
+            },
+            "body": {
+              "ticketType": "ritm",
+              "snSysId": "@{items('For_each_ritm')?['sys_id']}",
+              "number": "@{items('For_each_ritm')?['number']}",
+              "shortDescription": "@{items('For_each_ritm')?['short_description']}",
+              "description": "@{items('For_each_ritm')?['description']}",
+              "snState": "@{items('For_each_ritm')?['state']}",
+              "priority": "@{items('For_each_ritm')?['priority']}",
+              "snUpdatedOn": "@{items('For_each_ritm')?['sys_updated_on']}",
+              "snModCount": "@{items('For_each_ritm')?['sys_mod_count']}",
+              "correlationId": "@{items('For_each_ritm')?['correlation_id']}",
+              "openedByUserName": "@{items('For_each_ritm')?['opened_by.user_name']}",
+              "openedByEmail": "@{items('For_each_ritm')?['opened_by.email']}",
+              "subjectUserName": "@{items('For_each_ritm')?['requested_for.user_name']}",
+              "subjectEmail": "@{items('For_each_ritm')?['requested_for.email']}",
+              "snInstance": "@{parameters('snInstance')}",
+              "lastSeenUtc": "@{utcNow()}"
+            },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            }
+          }
+        }
+      }
+    }
+  },
+  "outputs": {}
+}
