@@ -931,3 +931,28 @@ Requests are created as `sc_request` + `sc_req_item` directly via the Table API,
 - Bug hit on first run of `seed-demo-tickets.ps1`: **symptom** `ServiceNow user claire.dubois not found` although the user exists → **root cause** Windows PowerShell 5.1: a function returning a one-element array is unrolled to a single `[pscustomobject]`, and `[pscustomobject]` has no `.Count` in 5.1 (`$null -gt 0` is false) → **fix** wrap the call: `$r = @(Get-SnAll ...)`.
 - Second blocker: **symptom** `POST incident` → 500 `Transaction cancelled: maximum execution time exceeded` → **root cause** freshly woken PDI, incident insert business rules slow on first calls; the insert was actually committed despite the 500 (INC0010002 existed on the next run) → **fix** just re-run: `correlation_id` idempotency prevents duplicates. `Invoke-Sn` now prints ServiceNow's JSON error body instead of PS 5.1's generic "(500) Erreur interne".
 - Result (2026-09-25 02:49): INC0010001 (01-MFA), INC0010002 (02-PWD), INC0010003 (06-GUARD-PRIV), INC0010004 (07-GUARD-THIRDPARTY), RITM0010001 (03-ACCESS), RITM0010002 (04-LICENSE), RITM0010003 (05-OFFBOARD), all assigned to `KE-Automation`.
+
+### 11.4 Ticket polling Logic App (step 10.1) — `itsm/poll/`
+
+Design: Logic App Consumption, zero-connector (same pattern as `ingestion/audio-transcribe/`), every 5 min: Key Vault secret (MI) → ServiceNow Table API `incident` + `sc_req_item` (active, `assignment_group.name=KE-Automation`, basic auth as `svc_ke_itsm`) → Azure Table `itsmtickets` upsert (MI, MERGE over POST). Read-only towards ServiceNow. Chosen over an Azure Function to respect "managed services only, no custom code in the pipeline".
+
+Prerequisite checked 2026-09-25: `svc_ke_itsm` (Identity type Machine, Internal Integration User, role `itil`) reads the `KE-Automation` queue with basic auth (curl → 7 tickets). Not affected by the Zurich interactive-user basic-auth block (`allow_wsao = true`).
+
+1. Store the password in Key Vault without it landing in shell history:
+```powershell
+$s = Read-Host "svc_ke_itsm password" -AsSecureString
+$p = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+$f = New-TemporaryFile; [IO.File]::WriteAllText($f.FullName, $p); $p = $null
+az keyvault secret set --vault-name kv-knowledgeengine-v9 --name servicenow-svc-ke-itsm-password --file $f.FullName --query id -o tsv
+Remove-Item $f
+```
+2. Deploy:
+```powershell
+az deployment group create --resource-group rg-knowledgeengine-v9 --template-file itsm/poll/main.bicep --parameters snInstance=dev374242
+```
+3. Verify: Portal → `logic-itsm-poll-itsm-demo` → Run trigger → check each action; then the table `itsmtickets` should hold 7 rows (4 INC + 3 RITM).
+- 2026-09-25 03:04: secret `servicenow-svc-ke-itsm-password` created (version c10aea59…, length 100 — to confirm it matches the real svc_ke_itsm password: a 401 in `Get_incidents` would mean a bad paste). Pitfall: `az ... --query "length(value)"` breaks in PowerShell (the parentheses are mangled on the way to az.cmd) → use `$v = az ... --query value -o tsv; $v.Length; $v = $null`.
+- 2026-09-25 03:04: `az deployment group create ... itsm/poll/main.bicep --parameters snInstance=dev374242` → Succeeded (table `itsmtickets`, Logic App `logic-itsm-poll-itsm-demo`, MI principal 1f214672-…, 2 role assignments). Note: deployment record name defaulted to `main` (same as infra/main.bicep) — pass `--name itsm-poll` next time to keep deployment history readable.
+- 2026-09-25 03:04 first run → `Get_sn_secret` **Forbidden**: the run fired the very second the deployment finished, before the new Key Vault Secrets User assignment had propagated (expected, not a config error). 03:09 run → **Succeeded** (2.6 s).
+- Verified in Storage browser: `itsmtickets` holds 7 rows (PartitionKey `itsm-demo`, RowKey INC0010001…RITM0010003); both points flagged "verify on first run" are confirmed: MERGE-over-POST upsert with OAuth works, and dot-walked fields come back as flat keys (`subjectEmail` / `openedByEmail` = `amine.elidrissi@KnowledgeEngineV9.onmicrosoft.com` on INC0010001). The 100-char Key Vault secret is correct (ServiceNow-generated password).
+- Cost note: Consumption plan, 288 runs/day × ~20 actions — disable the Logic App (`az logic workflow update ... --state Disabled` or Portal → Disable) between demo periods.
