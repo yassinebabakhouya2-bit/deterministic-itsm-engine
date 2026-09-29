@@ -264,11 +264,21 @@
             ]
           }
         },
-        "Compose_blobsJson": {
+        "Compose_blobsRaw": {
           "type": "Compose",
           "inputs": "@json(outputs('Compose_xmlDoc'))?['EnumerationResults']?['Blobs']?['Blob']",
           "runAfter": {
             "Compose_xmlDoc": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_blobsJson": {
+          "type": "Compose",
+          "description": "XML listing converted to JSON gives an array only for 2+ blobs: one blob is an object, none is null. Normalized to an array here, otherwise Select_blobInfo fails with 1 or 0 files (the run still showed Succeeded because Run_search_indexer always runs last).",
+          "inputs": "@if(equals(outputs('Compose_blobsRaw'), null), createArray(), if(startsWith(string(coalesce(outputs('Compose_blobsRaw'), '')), '['), outputs('Compose_blobsRaw'), createArray(outputs('Compose_blobsRaw'))))",
+          "runAfter": {
+            "Compose_blobsRaw": [
               "Succeeded"
             ]
           }
@@ -598,19 +608,20 @@
               "type": "Query",
               "inputs": {
                 "from": "@body('Get_transcription_json')?['recognizedPhrases']",
-                "where": "@equals(item()?['channel'], 0)"
+                "where": "@and(equals(item()?['channel'], 0), not(empty(item()?['nBest'])))"
               },
               "runAfter": {
                 "Get_transcription_json": [
                   "Succeeded"
                 ]
-              }
+              },
+              "description": "Phrases without nBest (noise) are dropped: the merge reads nBest[0] and failed on them (2 files of client-s, 2026-09-29)."
             },
             "Filter_channel1": {
               "type": "Query",
               "inputs": {
                 "from": "@body('Get_transcription_json')?['recognizedPhrases']",
-                "where": "@equals(item()?['channel'], 1)"
+                "where": "@and(equals(item()?['channel'], 1), not(empty(item()?['nBest'])))"
               },
               "runAfter": {
                 "Get_transcription_json": [
@@ -903,6 +914,11 @@
                 "Compose_agentChannel": [
                   "Succeeded"
                 ]
+              },
+              "runtimeConfiguration": {
+                "concurrency": {
+                  "repetitions": 1
+                }
               }
             },
             "Submit_pii_and_resolution": {
@@ -1121,6 +1137,11 @@
                     "Reset_redactedLines": [
                       "Succeeded"
                     ]
+                  },
+                  "runtimeConfiguration": {
+                    "concurrency": {
+                      "repetitions": 1
+                    }
                   }
                 },
                 "Filter_issue_summary": {
