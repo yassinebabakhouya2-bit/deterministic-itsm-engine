@@ -26,6 +26,9 @@
     "audioContainerName": {
       "type": "string"
     },
+    "videoContainerName": {
+      "type": "string"
+    },
     "audioExtensions": {
       "type": "array",
       "defaultValue": [
@@ -36,6 +39,18 @@
         "flac",
         "ogg",
         "wma"
+      ]
+    },
+    "videoExtensions": {
+      "type": "array",
+      "defaultValue": [
+        "mp4",
+        "mov",
+        "avi",
+        "wmv",
+        "mkv",
+        "webm",
+        "m4v"
       ]
     },
     "clientId": {
@@ -247,7 +262,7 @@
         },
         "Compose_destContainer": {
           "type": "Compose",
-          "inputs": "@{if(contains(parameters('audioExtensions'), outputs('Compose_extension')), parameters('audioContainerName'), parameters('containerName'))}",
+          "inputs": "@{if(contains(parameters('audioExtensions'), outputs('Compose_extension')), parameters('audioContainerName'), if(contains(parameters('videoExtensions'), outputs('Compose_extension')), parameters('videoContainerName'), parameters('containerName')))}",
           "runAfter": {
             "Compose_extension": [
               "Succeeded"
@@ -268,6 +283,9 @@
           "inputs": {
             "method": "HEAD",
             "uri": "@{outputs('Compose_destUri')}",
+            "headers": {
+              "x-ms-version": "2021-08-06"
+            },
             "authentication": {
               "type": "ManagedServiceIdentity",
               "audience": "https://storage.azure.com"
@@ -277,7 +295,8 @@
             "Compose_destUri": [
               "Succeeded"
             ]
-          }
+          },
+          "description": "HEAD on the destination blob; 200 = already copied, skip. x-ms-version is required: without it Storage rejects the managed identity token, the condition below saw every file as missing, and every run re-copied everything (resetting the transcribed / videoindexed flags, re-indexing all documents)."
         },
         "Condition_blob_missing": {
           "type": "If",
@@ -303,37 +322,131 @@
               },
               "runAfter": {}
             },
-            "Download_content": {
-              "type": "Http",
-              "inputs": {
-                "method": "GET",
-                "uri": "@{body('Get_download_url')?['@microsoft.graph.downloadUrl']}"
-              },
-              "runAfter": {
-                "Get_download_url": [
-                  "Succeeded"
+            "Condition_large_file": {
+              "type": "If",
+              "description": "Files over 100 MB (the Logic App HTTP action buffer is 104857600 bytes, so Download_content fails on them): server-side copy by 100 MiB blocks (Put Block From URL from the pre-authenticated SharePoint download URL, then Put Block List). Nothing goes through the Logic App. Smaller files keep the download + write path.",
+              "expression": {
+                "and": [
+                  {
+                    "greater": [
+                      "@coalesce(items('For_each')?['size'], 0)",
+                      100000000
+                    ]
+                  }
                 ]
-              }
-            },
-            "Write_blob": {
-              "type": "Http",
-              "inputs": {
-                "method": "PUT",
-                "uri": "@{outputs('Compose_destUri')}",
-                "headers": {
-                  "x-ms-blob-type": "BlockBlob",
-                  "x-ms-version": "2021-08-06",
-                  "Content-Type": "application/octet-stream",
-                  "x-ms-meta-clientid": "@{parameters('clientId')}"
+              },
+              "actions": {
+                "Compose_blockCount": {
+                  "type": "Compose",
+                  "inputs": "@div(add(items('For_each')?['size'], 104857599), 104857600)",
+                  "runAfter": {}
                 },
-                "body": "@body('Download_content')",
-                "authentication": {
-                  "type": "ManagedServiceIdentity",
-                  "audience": "https://storage.azure.com"
+                "Copy_blocks": {
+                  "type": "Foreach",
+                  "foreach": "@range(0, outputs('Compose_blockCount'))",
+                  "actions": {
+                    "Put_block_from_url": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "PUT",
+                        "uri": "@{outputs('Compose_destUri')}?comp=block&blockid=@{base64(formatNumber(items('Copy_blocks'), '000000'))}",
+                        "headers": {
+                          "x-ms-version": "2021-08-06",
+                          "x-ms-copy-source": "@{body('Get_download_url')?['@microsoft.graph.downloadUrl']}",
+                          "x-ms-source-range": "bytes=@{mul(items('Copy_blocks'), 104857600)}-@{sub(min(mul(add(items('Copy_blocks'), 1), 104857600), items('For_each')?['size']), 1)}"
+                        },
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://storage.azure.com"
+                        }
+                      },
+                      "runAfter": {}
+                    }
+                  },
+                  "runAfter": {
+                    "Compose_blockCount": [
+                      "Succeeded"
+                    ]
+                  },
+                  "runtimeConfiguration": {
+                    "concurrency": {
+                      "repetitions": 4
+                    }
+                  }
+                },
+                "Select_block_list": {
+                  "type": "Select",
+                  "inputs": {
+                    "from": "@range(0, outputs('Compose_blockCount'))",
+                    "select": "@concat('<Latest>', base64(formatNumber(item(), '000000')), '</Latest>')"
+                  },
+                  "runAfter": {
+                    "Copy_blocks": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Commit_block_list": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "PUT",
+                    "uri": "@{outputs('Compose_destUri')}?comp=blocklist",
+                    "headers": {
+                      "x-ms-version": "2021-08-06",
+                      "Content-Type": "application/xml",
+                      "x-ms-blob-content-type": "application/octet-stream",
+                      "x-ms-meta-clientid": "@{parameters('clientId')}"
+                    },
+                    "body": "@concat('<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>', join(body('Select_block_list'), ''), '</BlockList>')",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://storage.azure.com"
+                    }
+                  },
+                  "runAfter": {
+                    "Select_block_list": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "else": {
+                "actions": {
+                  "Download_content": {
+                    "type": "Http",
+                    "inputs": {
+                      "method": "GET",
+                      "uri": "@{body('Get_download_url')?['@microsoft.graph.downloadUrl']}"
+                    },
+                    "runAfter": {}
+                  },
+                  "Write_blob": {
+                    "type": "Http",
+                    "inputs": {
+                      "method": "PUT",
+                      "uri": "@{outputs('Compose_destUri')}",
+                      "headers": {
+                        "x-ms-blob-type": "BlockBlob",
+                        "x-ms-version": "2021-08-06",
+                        "Content-Type": "application/octet-stream",
+                        "x-ms-meta-clientid": "@{parameters('clientId')}"
+                      },
+                      "body": "@body('Download_content')",
+                      "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://storage.azure.com"
+                      }
+                    },
+                    "runAfter": {
+                      "Download_content": [
+                        "Succeeded"
+                      ]
+                    }
+                  }
                 }
               },
               "runAfter": {
-                "Download_content": [
+                "Get_download_url": [
                   "Succeeded"
                 ]
               }

@@ -35,6 +35,8 @@ session.
 - §8 Reminders
 - §9 Audio pipeline (Jalon 7) — metadata repair & PII/summary backfill
 - §10 Video pipeline (Jalon 8) — Video Indexer account setup & API auth chain
+- §11 ITSM action module (Jalon 10) — demo identities, Logic Apps, demo replay
+- §12 Rebuild in a new tenant — `scripts/bootstrap-new-tenant.ps1`
 
 ---
 
@@ -863,41 +865,249 @@ account.** The correct chain for an ARM account:
      convention — confirm the exact string for whichever region §10.1
      lands on.
 
-### 10.3 Indexing preset — must be "Standard" or "Advanced" tier for Topics, not "Basic"
+### 10.3 Indexing preset — CORRECTED 2026-09-25 against the real API spec
 
-Per the indexing configuration guide: OCR is available at every tier
-(Basic/Standard/Advanced) once video-visual analysis is requested at all,
-but **Topics requires Standard or Advanced** — Basic alone won't produce
-it. Use an "audio and video" preset at Standard or Advanced tier to get
-transcript + OCR + topics in a single indexing call. **Exact literal
-`indexingPreset` enum string not yet confirmed against a live call** —
-verify with the actual API response on the first real test video before
-hardcoding it into the Logic App.
+The literal `indexingPreset` enum (confirmed on the live Swagger at
+api-portal.videoindexer.ai, Upload Video operation) is: `Default`,
+`AudioOnly`, `VideoOnly`, `Basic`, `BasicAudio`, `BasicVideo`, `Advanced`,
+`AdvancedAudio`, `AdvancedVideo`. **There is no literal "Standard" value**
+— the earlier note in this section (from a summarized/indirect doc fetch)
+was wrong on that point. `Default` already indexes both audio AND video
+(moderate depth); `Advanced` does both at greater depth. Since Topics is
+inferred from transcript + OCR + faces combined (needs both modalities
+analyzed, not just one), use **`Default`** for the first real test
+(cheapest) and fall back to **`Advanced`** only if Topics/OCR are missing
+or too sparse in the result. Individual insights can be dropped with
+`excludedAI=<name>` (e.g. `excludedAI=Faces`) — full list of excludable
+AIs and of `includedInsights`/`excludedInsights` (for the *retrieval*
+side, `Get Video Index`) confirmed on the same Swagger.
 
-### 10.4 Not yet done
-- Deploy `infra/modules/videoindexer.bicep` (region no longer a blocker).
-- Run one real end-to-end test call (generate token → upload → poll →
-  fetch insights) against the single test video Yassine is uploading to
-  SharePoint (`Documents/Microsoft 365 Basics Outlook and Teams Tutorial…mp4`)
-  to confirm the exact `indexingPreset` string, the real shape of the OCR
-  section, and the account's internal `accountId`/location-string before
-  writing the actual Logic App.
+### 10.3bis No SAS needed — `useManagedIdentityToDownloadVideo=true`
+
+Confirmed 2026-09-25 (Upload Video parameter spec): pass the **plain**
+blob URL (no SAS) as `videoUrl` plus `useManagedIdentityToDownloadVideo=
+true`, and Video Indexer's own managed identity reads the blob directly
+— no `ListServiceSas` action needed in the Logic App, unlike the audio
+pipeline. Requires **Storage Blob Data Owner** (not just Contributor) on
+the storage account for VI's identity — `infra/modules/videoindexer.bicep`
+updated accordingly (was Contributor, now Owner); the already-deployed
+account needs a redeploy of that same module to pick up the new role (see
+10.5bis). If it fails with `STORAGE_ACCESS_DENIED` / `MANAGED_IDENTITY_MISSING`
+anyway, fall back to the audio pipeline's `ListServiceSas` pattern for
+`videoUrl` instead.
+
+### 10.3ter Full auth + call sequence — confirmed against the live Swagger (2026-09-25)
+
+1. ARM bearer token (managed identity, audience `https://management.azure.com`).
+2. `POST https://management.azure.com/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.VideoIndexer/accounts/<account>/generateAccessToken?api-version=2024-01-01`
+   body `{"permissionType":"Contributor","scope":"Account"}` → `{"accessToken":"<JWT>"}`.
+3. Upload: `POST https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos?name=<name>&privacy=Private&indexingPreset=Default&language=fr-FR&videoUrl=<plain blob url>&useManagedIdentityToDownloadVideo=true&accessToken=<JWT>`
+   — `{location}` is the **lowercase ARM region code** (`francecentral`,
+   confirmed — not a display-name form, correcting an earlier wrong note
+   in this section), `{accountId}` is the internal GUID from §10.5
+   (`4175d377-f3f5-4278-a894-6038d4ce7470`), not the ARM resource name.
+   Response 200 gives `id` = videoId, `state` starts at `Uploaded`.
+4. Poll: `GET https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos/{videoId}/Index?accessToken=<JWT>` until `videos[0].state == "Processed"` (`Uploaded`→`Processing`→`Processed`/`Failed`).
+5. Insights are already in that same poll response once `Processed`:
+   `videos[0].insights.transcript[]` (`text`, `instances[].start/end`),
+   `.ocr[]` (`text`, `left/top/width/height`, `instances[]`), `.topics[]`
+   (`name`, `referenceType`: `VideoIndexer`/`Wikipedia`, `confidence`,
+   `instances[]`). No separate "fetch insights" call needed — Upload →
+   poll the same Index endpoint → done.
+6. For a **private** video (our case, `privacy=Private`), the same
+   `accessToken` also gates step 4/5 (scope Account/Video, permission
+   Reader is enough for read-only polling — Contributor from step 2 works
+   too, just broader than needed).
+
+### 10.4 Not yet done (updated 2026-09-25 — see 10.7)
+- ~~Redeploy `infra/modules/videoindexer.bicep` (RBAC upgrade Contributor→Owner)~~ done, see 10.5bis.
+- ~~Run one real end-to-end test call against the single test video~~ done, see 10.7 — Default preset confirmed, real JSON shape confirmed, UTF-8 read bug found+fixed.
+- Next: build `ingestion/video-index/main.bicep` + `workflow-definition.json` (clone `logic-transcribe-client-s`, pure HTTP + managed identity), SharePoint → `video-raw-client-s` ingestion, then test on 2-3 real client-s videos (French) before any bulk run.
 
 ### 10.5 Compte Video Indexer déployé (2026-09-20)
 
 `az deployment group create --resource-group rg-knowledgeengine-v9 --template-file infra/modules/videoindexer.bicep --parameters videoIndexerAccountName=vi-knowledgeengine2-v9 storageAccountName=stknowledgeengine2v9` → `Succeeded`, depuis le terminal local de Yassine (`C:\V9\knowledgeengine-rag-platform`), pas Cloud Shell (le repo n'y est pas cloné — piège à noter : Cloud Shell persiste `$HOME` mais ne contient pas ce repo, toujours déployer un `--template-file` depuis un shell où le repo existe réellement).
 
-Reste à récupérer avant le test API (§10.2) : le `principalId` de l'identité managée (sortie Bicep `videoIndexerPrincipalId`) et surtout le **`accountId` interne** du compte (GUID `properties.accountId` sur la ressource ARM — différent du nom `vi-knowledgeengine2-v9`, c'est CET id qui sert dans les URLs `api.videoindexer.ai`), voir commandes ci-dessous.
+`accountId` interne confirmé (2026-09-25) : `4175d377-f3f5-4278-a894-6038d4ce7470`. `principalId` : `70d44777-6e35-439b-95d7-8af6a011bb82`. Région : `francecentral`.
+
+### 10.5bis Redéploiement RBAC (2026-09-25) — Owner au lieu de Contributor
+
+Recherche du 2026-09-25 sur le vrai swagger (`api-portal.videoindexer.ai`) a montré que `useManagedIdentityToDownloadVideo=true` (§10.3bis, évite le SAS) exige **Storage Blob Data Owner**, pas seulement Contributor. `infra/modules/videoindexer.bicep` mis à jour ; redéployer le même module ajoute le nouveau role assignment Owner (le rôle Contributor existant restera en place aussi, Owner le rend juste redondant — sans risque, à nettoyer plus tard si besoin avec `az role assignment delete` si Yassine veut du RBAC strictement minimal) :
+```powershell
+az deployment group create --resource-group rg-knowledgeengine-v9 --template-file infra/modules/videoindexer.bicep --parameters videoIndexerAccountName=vi-knowledgeengine2-v9 storageAccountName=stknowledgeengine2v9 --query "properties.provisioningState" -o tsv
+```
+
+### 10.6 Test manuel isolé (2026-09-25) — bug curl.exe / PowerShell sur upload multipart
+
+Étape 2 du plan (test isolé token → upload → poll → insights, upload direct
+du fichier local pour éviter de créer un blob/container jetable — la vidéo
+de test existe déjà sur SharePoint, cf. retour Yassine). Tokens ARM/VI
+obtenus sans problème.
+
+- **Symptôme** : `curl.exe -F "file=@\`"<chemin>\`";type=video/mp4" ...` échoue
+  systématiquement avec `curl: (26) Failed to open/read local data from
+  file/application`, y compris après avoir vérifié que le chemin local est
+  correct et le fichier bien présent (confirmé via `Get-ChildItem`).
+- **Cause racine** : le nom de fichier contient une virgule et des
+  parenthèses (`... (1080p, h264).mp4`) — curl exige alors de mettre le nom
+  entre guillemets dans la valeur du champ `-F` (`file=@"...";type=...`).
+  Mais curl interprète le backslash comme caractère d'échappement *à
+  l'intérieur* de ces guillemets de champ multipart — et un chemin Windows
+  (`C:\Users\...`) est plein de backslashes, qui sont donc corrompus par
+  ce parsing avant même que curl essaie d'ouvrir le fichier. Rien à voir
+  avec l'échappement PowerShell (backtick) lui-même, qui construisait la
+  bonne chaîne — le bug est dans la façon dont curl relit sa propre valeur
+  de champ.
+- **Fix** : renommer/copier le fichier vers un chemin sans virgule, parenthèse
+  ni caractère spécial, pour ne plus avoir besoin de guillemets du tout dans
+  `-F` (donc plus aucun backslash à l'intérieur d'une valeur de champ
+  entre guillemets).
+
+```powershell
+Copy-Item "C:\Users\yassine.baba-kho-ext\Downloads\Microsoft 365 Basics Outlook and Teams Tutorial - Learn Skills Daily (1080p, h264).mp4" "C:\Users\yassine.baba-kho-ext\Downloads\test-video.mp4"
+```
+
+Puis `-F "file=@C:\Users\yassine.baba-kho-ext\Downloads\test-video.mp4;type=video/mp4"` sans guillemets internes.
+
+### 10.7 Premier test réel bout en bout (2026-09-25) — succès, indexingPreset=Default confirmé suffisant
+
+Upload direct du fichier local (méthode multipart, cf. 10.6) → poll →
+`state: "Processed"` obtenu. Vidéo de test : tutoriel anglais générique
+téléchargé (SharePoint), 1h25m55s (~5156s), `indexingPreset=Default`,
+`language=fr-FR` (voir caveat langue ci-dessous).
+
+**Confirmé sur données réelles** :
+- `videos[0].insights.transcript` : 55 entrées (`text`, `instances[].start/end`).
+- `videos[0].insights.ocr` : 583 entrées (texte incrusté, ex. dates d'écran
+  `"2/22/2022"`) — très riche, comme attendu pour un tutoriel logiciel.
+- `videos[0].insights.topics` : 6 entrées, ex. `Technologie` (referenceType
+  `VideoIndexer`), `Logiciels`/`Entreprises`/`Marques`/`Tablettes` (Wikipedia).
+  **Confirme définitivement que `indexingPreset=Default` suffit pour
+  Transcript+OCR+Topics** — pas besoin d'Advanced (cohérent avec 10.3, qui
+  avait déjà corrigé la fausse piste "Standard/Advanced requis").
+- `videos[0].insights.keywords` : 0 (vide sur cette vidéo — pas bloquant,
+  pas dans le scope Jalon 8 de toute façon).
+
+**Bug rencontré — encodage UTF-8 corrompu à la lecture PowerShell** (même
+famille que le bug UTF-8 audio, §9.1) : `Get-Content -Raw | ConvertFrom-Json`
+en PowerShell 5.1 lit le fichier JSON (pourtant bien en UTF-8, écrit par
+`curl.exe -o`) avec l'encodage ANSI/CP1252 par défaut faute de BOM →
+mojibake sur les accents (`"Ã‰lÃ©ments de contrÃ´le graphiques"` au lieu de
+`"Éléments de contrôle graphiques"`). **Fix** : lire explicitement en UTF-8
+avec `[System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)`
+au lieu de `Get-Content -Raw`. **À appliquer aussi dans la Logic App**
+(l'action HTTP d'écriture du `.txt` de sortie doit forcer l'encodage UTF-8
+explicitement, ne jamais compter sur un défaut).
+
+**Caveat langue** : vidéo de test en anglais mais indexée avec
+`language=fr-FR` (choix volontaire, car les vraies vidéos client-s seront
+en français) → transcript de mauvaise qualité sur ce test précis (le
+modèle français transcrit phonétiquement de l'anglais, résultat
+incohérent : `"The exercise files fratellis courser a looked in the."`).
+**Pas un bug du pipeline** — juste un mismatch langue/contenu propre à cet
+asset de test générique. À revalider avec une vraie vidéo française
+client-s avant la bascule en production (mais le format JSON, le preset et
+le chemin d'auth sont eux définitivement validés).
+
+**Autre point noté** : `videos[0].durationInSeconds` et `videos[0].created`
+reviennent vides dans la réponse `Index` une fois `Processed` (alors que
+`created` était rempli à l'upload) — pas creusé, pas bloquant (durée
+déductible de `scenes`/`videosRanges` : ici `0:00:00` → `1:25:55.350884`).
+
+### 10.8 Logic Apps écrites (2026-09-25) — PAS ENCORE DÉPLOYÉES
+
+**`ingestion/main.bicep` + `ingestion/workflow-definition.json` (racine)
+modifiés** : ajout `videoContainerName` (défaut `video-raw-${clientCode}`)
+et `videoExtensions` (mp4/mov/avi/wmv/mkv/webm/m4v). `Compose_destContainer`
+route maintenant : audio → `audioContainerName`, vidéo → `videoContainerName`,
+sinon → `containerName` (kb-<client>) — même pattern que l'audio en Jalon 7,
+jamais de vidéo écrite directement dans kb-<client>.
+
+**`ingestion/video-index/main.bicep` + `workflow-definition.json` (nouveau,
+clone de `audio-transcribe/`) créés.** Différences volontaires vs audio :
+- **Aucun secret Key Vault** : Video Indexer utilise le chaînage ARM decrit
+  en 10.3ter (MSI native sur l'action HTTP, audience
+  `https://management.azure.com/`, puis `generateAccessToken`), pas une clé
+  d'abonnement stockée.
+- Le Logic App ne télécharge JAMAIS la vidéo lui-même — pas de `Get_sas`/
+  `ListServiceSas` comme pour l'audio. Il passe juste l'URL blob nue en
+  `videoUrl` + `useManagedIdentityToDownloadVideo=true` ; c'est l'identité
+  managée du compte Video Indexer (déjà Storage Blob Data Owner, §10.5bis)
+  qui lit le blob.
+- **Le JWT data-plane est régénéré à CHAQUE itération du poll**
+  (`Generate_vi_token_poll`), pas une seule fois avant la boucle — confirmé
+  en live (§10.6-10.7) qu'il expire pendant un traitement long. Après la
+  boucle, un dernier `Generate_vi_token_final` + `Get_final_index` récupère
+  les insights (transcript/ocr/topics), plutôt que de référencer la sortie
+  d'une action à l'intérieur d'un `Until` déjà terminé.
+- PII redaction (`ConversationalPIITask`, même ressource Foundry/Language
+  que l'audio) sur le **transcript parlé uniquement** — pas de tâche
+  "resolution" (spécifique aux appels support). **OCR et Topics ne sont PAS
+  redigés en v1** (jugement : texte UI d'un tuto logiciel générique, risque
+  jugé plus faible que la parole ; pas de dédup non plus sur l'OCR, quitte à
+  avoir des lignes répétées tant qu'un élément reste affiché à l'écran) — à
+  revisiter avec Yassine si besoin.
+- Flag anti-re-traitement : métadonnée `x-ms-meta-videoindexed: true` sur le
+  blob source, écrite seulement si tout a réussi (fail-closed, comme
+  l'audio : un échec PII ne laisse jamais rien écrire).
+- `runtimeConfiguration.concurrency.repetitions: 1` et `Run_search_indexer`
+  toujours exécuté après la boucle (même échecs) dès la v1.
+- RBAC de son identité managée : Storage Blob Data Contributor, Search
+  Service Contributor, Cognitive Services User (Foundry), et **Contributor
+  scopé au compte Video Indexer uniquement** (pas de rôle built-in plus fin
+  pour l'action `generateAccessToken`).
+
+**Déploiement — pas encore fait, dans l'ordre :**
+```powershell
+az storage container create --name video-raw-client-s --account-name stknowledgeengine2v9 --auth-mode login
+
+az deployment group create --resource-group rg-knowledgeengine-v9 --template-file ingestion/main.bicep --parameters clients-local/client-s.parameters.json --query "properties.provisioningState" -o tsv
+
+az deployment group create --resource-group rg-knowledgeengine-v9 --template-file ingestion/video-index/main.bicep --parameters clientCode=client-s videoIndexerAccountId=4175d377-f3f5-4278-a894-6038d4ce7470 --query "properties.provisioningState" -o tsv
+```
+
+### 10.9 Déploiement fait (2026-09-26) — bug préexistant découvert sur `logic-ingest-client-s`
+
+Les 3 commandes de 10.8 → **Succeeded** (conteneur `video-raw-client-s` créé, `ingestion/main.bicep` redeployé avec le routage vidéo, `logic-video-index-client-s` déployé).
+
+Déclenchement manuel de `logic-ingest-client-s` (pour faire remonter la vidéo de test vers `video-raw-client-s`) :
+```powershell
+az rest --method post --url "https://management.azure.com/subscriptions/<sub>/resourceGroups/rg-knowledgeengine-v9/providers/Microsoft.Logic/workflows/logic-ingest-client-s/triggers/Recurrence/run?api-version=2019-05-01"
+```
+→ succès silencieux (pas de corps de réponse), mais `video-raw-client-s` reste **vide** ensuite.
+
+**Bug découvert, sans rapport avec les changements vidéo d'aujourd'hui** : `logic-ingest-client-s` échoue sur **tous ses runs quotidiens depuis le 2026-09-21**. Erreur run-level constante : `An action failed. No dependent actions succeeded.` Action-level : `Check_blob_exists` = Failed à l'intérieur du `For_each` (~250+ fichiers SharePoint), en cascade `Download_content`=Failed, `Write_blob`=Skipped.
+
+Diagnostic en cours pour trouver le fichier exact : la pagination de `scopeRepetitions` (exécutions de la boucle `For_each`) via `az rest --url $url` échoue dès que l'URL contient un `nextLink` avec `%24skiptoken=...` — `'%24skiptoken' n'est pas reconnu...` — reproduit même depuis un script `.ps1` sauvegardé (`find_failure.ps1`), pas seulement en collant dans la console. Une fois toutes les pages malgré l'erreur affichée à chaque tour, résultat final `Failures found: 1` mais avec nom/statut vides — objet probablement mal reconstruit par la corruption de parsing. Cause probable : `az rest`/PowerShell 5.1 gère mal les URL contenant des `%24` littéraux dans certains contextes d'appel — non résolu.
+
+**Conséquence** : l'étape 5 du plan Jalon 8 (tester 2-3 vidéos) est bloquée — aucune vidéo n'est encore arrivée dans `video-raw-client-s`, donc `logic-video-index-client-s` n'a encore rien à traiter.
+
+**Pivot** : `find_failure2.ps1` remplace chaque appel `az rest` par un `Invoke-RestMethod` natif PowerShell avec un jeton bearer obtenu une seule fois (`az account get-access-token`), pour contourner le parsing d'URL problématique de `az rest`/CLI. Pas encore exécuté à l'heure de cette entrée.
+
+### 10.10 CAUSE RACINE trouvee (2026-09-26) — abonnement Azure DESACTIVE pour non-paiement
+
+> **Correction (2026-09-26, later the same day):** the banner on the
+> subscription's Overview page reads *"Nous avons identifié une activité
+> suspecte dans cet abonnement. Pour protéger votre compte, nous avons désactivé
+> l'abonnement. Contactez le support Azure…"* — a suspicious-activity hold, not
+> a non-payment disable; there is no unpaid invoice, so the "régler la facture"
+> action below does not apply. Way forward: §12.
+
+Le diagnostic `find_failure2.ps1` a bien fonctionne (contournement du bug `az rest`/`%24skiptoken` via `Invoke-RestMethod` + jeton bearer) et a isole l'iteration en echec du `For_each` : **itemIndex 385** (`scopeRepetitions/000385`), erreur `ActionFailed : An action failed. No dependent actions succeeded.` — mais en creusant plus loin (portail Azure), la vraie cause est apparue : l'**abonnement Azure `Azure subscription` (5e2f9708-6da3-4247-b96a-efa9cc50e848) est en etat `Desactive`**, et la web app (`app-knowledgeengine2-v9`) renvoie `Error 403 - This web app is stopped`.
+
+**Ceci reexplique tout depuis le 2026-09-21** : `logic-ingest-client-s` echoue sur `Check_blob_exists` depuis cette date non pas a cause d'un bug de workflow, mais parce que l'abonnement etait deja desactive (non-paiement) — toutes les ressources (Storage, Logic Apps, Web App) sont progressivement tombees en panne d'auth/acces. La piste `%24skiptoken`/`az rest` etait une vraie limitation PowerShell/CLI mais **secondaire** face a ce blocage de fond.
+
+**Action en cours (Yassine)** : regler la facture impayee / mettre a jour le moyen de paiement dans Portail Azure -> Couts + Facturation, pour reactiver l'abonnement. Rien d'autre (video, ingestion, ITSM) ne peut etre teste ou verifie tant que l'abonnement n'est pas reactive. A reprendre une fois la reactivation confirmee : reverifier `logic-ingest-client-s`, `logic-video-index-client-s` et l'app web depuis zero (le passage par un etat desactive peut avoir des effets de bord sur l'etat des ressources).
 
 ## §11. ITSM action module (Jalon 10) — demo identities
 
 ### 11.1 Seeding the fictional demo identities (2026-09-25 — script written, NOT yet run)
 
 `scripts/itsm/seed-demo-identities.ps1` + `scripts/itsm/demo-identities.json` create, idempotently:
-- **Entra ID (personal tenant only)**: 7 fictional users (`claire.dubois` manager, `amine.elidrissi` MFA reset, `sophie.martin` password reset, `karim.benali` access request, `julie.bernard` licence request, `thomas.leroy` departure, `nadia.admin` = User Administrator, the guardrail persona whose reset must be refused), 3 security groups (`SG-SP-Projets`, `SG-VPN-Users`, `SG-App-Planning`), manager links, memberships, and the directory role.
+- **Entra ID (target tenant)**: 7 fictional users (`claire.dubois` manager, `amine.elidrissi` MFA reset, `sophie.martin` password reset, `karim.benali` access request, `julie.bernard` licence request, `thomas.leroy` departure, `nadia.admin` = User Administrator, the guardrail persona whose reset must be refused), 3 security groups (`SG-SP-Projets`, `SG-VPN-Users`, `SG-App-Planning`), manager links, memberships, and the directory role.
 - **ServiceNow dev instance**: assignment group `KE-Automation` and matching `sys_user` records. Link key between the two systems: ServiceNow `email` = Entra `userPrincipalName`.
 
-Run from the repo root, after `az login --tenant <personal tenant>` (the script asks for an explicit `YES` after showing the signed-in tenant, to avoid hitting an employer or client tenant):
+Run from the repo root, after `az login --tenant <target tenant>` (the script shows the target tenant, domain and ID, and asks for an explicit `YES` before any change):
 
 ```powershell
 .\scripts\itsm\seed-demo-identities.ps1 -SnInstance dev123456
@@ -995,7 +1205,7 @@ Quick check command: `az storage entity query --account-name stknowledgeengine2v
 
 Flask blueprint registered in `app/app.py` (`/itsm` queue, `/itsm/t/<number>` detail, `POST /itsm/t/<number>/decision`). Records the agent's decision in the `itsmtickets` row (`reviewStatus` = validated / rejected / handled_manually, `approvedParamsJson`, `reviewedById/Name`, `reviewedAtUtc`, `reviewComment`). **Executes nothing** — the Web App identity gets no new permission (it already has Storage Table Data Contributor). Server-side rules: access = tenant + Entra group from `config/itsm.yaml` (deny-by-default, `TODO-` placeholder matches nobody); only `pending_review` rows can be validated, `refused` rows never; edited params re-validated (group allowlist, offboarding steps can only be removed); ETag If-Match (no double decision); same-origin check on POST (CSRF). Local smoke test (fake table, 2026-09-25): 403 without the group, HTML in ticket text escaped, forged "validate" on a refused row ignored, POST without/with foreign Origin → 403, non-allowlisted group refused, stale ETag → second decision ignored, offboarding cannot add a non-proposed step — all OK.
 
-1. Create the agents group and add yourself (personal tenant):
+1. Create the agents group and add yourself (target tenant):
 ```powershell
 $gid = az ad group create --display-name KE-v9-itsm-agents --mail-nickname KE-v9-itsm-agents --query id -o tsv
 az ad group member add --group $gid --member-id (az ad signed-in-user show --query id -o tsv)
@@ -1077,3 +1287,219 @@ az deployment group create --name itsm-execute --resource-group rg-knowledgeengi
 py -X utf8 eval\evaluate_rag.py --client clienta
 ```
 Not yet run live at time of writing — if the upload fails with 403, the signed-in user needs the **Azure AI User** role on the Foundry project.
+
+### 10.5ter RBAC Owner redéployé (2026-09-25) — confirmé
+
+Redéploiement de `infra/modules/videoindexer.bicep` (rôle Storage Blob Data Owner) → `Succeeded`. Prochaine étape : test manuel réel (upload → poll) sur la vidéo de test, via un blob direct plutôt que SharePoint (plus simple pour un test isolé) — voir 10.6.
+
+---
+
+## §12. Rebuild in a new tenant — `scripts/bootstrap-new-tenant.ps1`
+
+**Context (2026-09-26):** the Azure subscription of tenant KnowledgeEngineV9 was
+disabled (suspicious-activity hold, see the §10.10 correction). **Update
+(2026-09-26, same day):** the whole tenant will be deactivated on 2026-09-30
+(no further payment). Decision: move to a brand-new tenant + subscription
+entirely. Nothing is copied from the old subscription: indexes, blobs, tables,
+Logic Apps and the web app are all regenerated from this repo.
+
+**Scope: four clients — clienta, clientb, clientc (synthetic demo) and
+client-s (the real [CLIENT-PROD]/DXC client). client-v ([CLIENT-PARENT]) is abandoned and is
+never referenced by the script or this section.**
+
+**First real run: 2026-09-26, tenant KnowledgeEngineV9655.onmicrosoft.com.**
+Foundation, the 4 search pipelines (8 indexers, 0 failures, synonym map
+regenerated) and the web app are deployed. Four problems were hit and fixed on
+the way, all now in the repo (12.4): the Foundry write race and the anti-abuse
+block it triggered, the cold SCM site of the new Function App, Search's missing
+Cognitive Services User role, the missing `kb-client-s` container. client-s
+runs with an empty index until its data is loaded (12.3).
+
+### 12.1 What changed in the repo for this
+
+- Global-name prefix `knowledgeengine2` → `knowledgeengine3` in the 27 files
+  that hard-code it (the old names stay reserved while the old subscription
+  exists; Key Vault names longer, through soft delete). Key Vaults:
+  `kv-knowledgeengine3-v9`, `kv-ke3-itsm-delivery`. Resource group name
+  unchanged. This runbook's historical entries keep the old names on purpose.
+- `infra/main.bicep` exposes `generationCapacity` / `enrichCapacity` /
+  `embeddingCapacity` so a new subscription's model quota can be matched
+  instead of failing the deploy.
+- `deploy-webapp.ps1 -SkipClientsLocal` leaves `clients-local/` (real client
+  configs) out of the package.
+- `scripts/bootstrap-new-tenant.ps1`, below — now covers 4 clients and has
+  opt-in phases for audio / video / SharePoint ingestion.
+- `infra/main.bicep` has `deployFoundry` (default true): the script passes
+  false once the Foundry account and its 3 model deployments exist and are
+  Succeeded, so re-runs never write to the Cognitive Services account again
+  (`-ForceFoundry` overrides). `modules/foundry.bicep`: `gpt-4o` now
+  `dependsOn` the project (see 12.4).
+
+### 12.2 Run it — fast path (foundation + all 4 clients, synthetic-style upload)
+
+Prerequisites: a new tenant with an Azure subscription, `az` logged in with a
+Global Administrator of that tenant who is Owner of the subscription, and — if
+you have one — a local export of client-s's real KB dropped at `kb/client-s/`
+(same shape as `kb/clienta`, etc.). Without that export, client-s still gets
+its group, its Entra config and its (empty) search index; content is added
+later with `-From ingestion` or by dropping files into `kb/client-s` and
+re-running `-From data`.
+
+```powershell
+az login --tenant <new-tenant-id>
+az account set --subscription <subscription-id>
+cd C:\V9\knowledgeengine-rag-platform
+.\scripts\bootstrap-new-tenant.ps1
+```
+
+It prints the tenant/subscription and asks for confirmation, then runs the
+phases below; after fixing a failure, resume with `-From <phase>`:
+
+| Phase | What it does |
+|---|---|
+| `prereqs` | Resource providers, RG, your data-plane roles (Storage Blob/Table Data Contributor, Search Index Data Contributor, Cognitive Services OpenAI User, Key Vault Secrets Officer; Azure AI User optional). |
+| `entra` | App Registration `KnowledgeEngineV9-WebApp-Auth`; native demo user `ke-demo@<initial domain>`; groups `KE-v9-clienta/b/c` (one each) and `KE-v9-clients` (shared, client-s) with the demo user and you as members; rewrites `access:` in `config/engine.client{a,b,c,-s}.yaml`. |
+| `infra` | Fits model capacities to quota, new Easy Auth secret, deploys `infra/main.bicep`, aligns the redirect URI. |
+| `function` | Deploys the enrichment Function (vendored zip if it matches `enrichment/` byte for byte, else source + remote build). |
+| `data` | Uploads `kb/client{a,b,c}` (+ `kb/clientc-multiformat`) and, if present, `kb/client-s` — all with metadata `clientid`. No `kb/client-s`: skipped with a warning, not a failure. |
+| `search` | `search/deploy.ps1` per client (now 4, so 8 indexers), then `search/generate-synonyms.ps1`. |
+| `ingestion` | Key Vault `kv-knowledgeengine3-v9`; app `knowledgeengine-sharepoint-ingestion` (multi-tenant, nativeclient redirect URI, Graph `Sites.Selected` consented, secret in the vault as `ingestion-secret-v2`); a **new SharePoint site per client of `-SharePointClients`** (default client-s: team site of the private Microsoft 365 group `KE <client> KB`); read access for the app on it (a temporary app holding `Sites.FullControl.All` does the grant, then is deleted); containers `kb-`/`audio-raw-`/`video-raw-<client>`; `logic-ingest-<client>`; updates `clients-local/<client>.parameters.json`. |
+| `audio` | `speech-key` = key1 of the Foundry account (Speech runs on it, as on the first tenant - no new Cognitive Services account); `logic-transcribe-<client>` for `-MediaClients`. |
+| `video` | Registers `Microsoft.VideoIndexer`, deploys `infra/modules/videoindexer.bicep`, reads the account's internal GUID (`properties.accountId`), `logic-video-index-<client>`. |
+| `itsm` | Asks the `svc_ke_itsm` password once (checked against ServiceNow, stored in the vault); `seed-demo-identities.ps1` on this tenant's domain (existing ServiceNow callers get their email re-pointed to the new UPN); `logic-itsm-poll/propose/execute-itsm-demo` (executor Enabled, `dryRun=false`) + their Graph permissions (`grant-graph-app-roles.ps1`, `setup-secret-actions.ps1`); group `KE-v9-itsm-agents` + `config/itsm.yaml`; `reset-demo.ps1` (reopens the demo tickets). Interactive: ServiceNow admin credentials, two `YES` confirmations. |
+| `webapp` | `deploy-webapp.ps1 -SkipClientsLocal`. |
+
+Output: app URL, demo user, its password printed once at the end (kept out of
+the transcript log, git-ignored). Commit the rewritten
+`config/engine.client*.yaml` afterwards. The end-of-run summary lists exactly
+what was skipped (client-s data source, audio, video, ITSM).
+
+On a real client's tenant, add `-SkipItsm`: the `itsm` phase seeds the 7
+fictional demo users and groups into the directory. Its prompts name the
+target tenant (domain and ID) and need `YES`; any other answer stops the run
+before `webapp`.
+
+### 12.3 client-s data — new SharePoint site (decided 2026-09-26)
+
+The first tenant's SharePoint sites are abandoned. client-s now lives on the
+site Yassine created on this tenant, `https://knowledgeenginev9655.sharepoint.com/sites/ClientS`
+(Documents library: `Kbs/`, `Audio/2025/...`, `Video/`):
+```powershell
+.\scripts\bootstrap-new-tenant.ps1 -From ingestion -SharePointSiteUrls @{ 'client-s' = 'https://knowledgeenginev9655.sharepoint.com/sites/ClientS' }
+```
+Without `-SharePointSiteUrls`, the `ingestion` phase creates a site itself (team
+site of a private Microsoft 365 group `KE <client> KB`). Either way it prints the
+site URL at the end of the run. Then:
+
+1. Put client-s's documents, audio (`.wav`) and video files in the site's
+   **Documents** library (sub-folders are fine; the Logic App keeps the relative
+   path in the blob name and routes audio/video to their raw containers).
+2. Sync now instead of waiting for the daily run:
+   ```powershell
+   .\scripts\sync-client.ps1 -ClientId client-s            # SharePoint -> Blob, then both indexers
+   .\scripts\sync-client.ps1 -ClientId client-s -WithMedia # + starts the audio / video pipelines
+   ```
+   `sync-client.ps1` fires `logic-ingest-<client>`, waits for that run, re-runs
+   `ix-<client>-di` / `ix-<client>-text` and prints their counts. The audio and
+   video Logic Apps re-index the client themselves when they finish.
+
+A local export dropped in `kb/client-s/` (then `-From data`) still works for a
+one-off load without SharePoint.
+
+### 12.4 Known risks on a fresh subscription
+
+- **Foundry RequestConflict, then Azure anti-abuse block (hit 2026-09-26 on
+  the first real run).** `modules/foundry.bicep` created the project and the
+  `gpt-4o` deployment in parallel on the same account; the account accepts one
+  write at a time, so every run failed with `RequestConflict` ("Another
+  operation is in progress on the resource .../accounts/aif-...") — not
+  transient. The models were created anyway; the project was not. Six re-runs
+  in 30 min, each re-PUTting the account, then got the preflight error
+  `InvalidTemplateDeployment` / `715-123420` ("unusual activity for your
+  account") from Microsoft.CognitiveServices. The subscription itself stayed
+  Active. Fixed by serializing (`gpt-4o` dependsOn project) and by
+  `deployFoundry=false` on re-runs (12.1). If 715-123420 shows up with the
+  account not yet complete: do not loop — wait hours, retry once, then open an
+  Azure support ticket. The missing project only affects
+  `eval/evaluate_rag.py` (eval runs logged to Foundry); add it later with
+  `-From infra -ForceFoundry`.
+- **Search skillset: "Unable to connect to AI Services using managed
+  identity" (hit 2026-09-26).** `ss-<client>-di` bills Document Intelligence
+  Layout to the Foundry account by identity (`AIServicesByIdentity`), which
+  needs Search's identity to hold **Cognitive Services User** on the account.
+  §0 always said `roles.bicep` granted it, but the file only had Cognitive
+  Services OpenAI User: on the first tenant it had been granted by hand. Fixed
+  in `roles.bicep` (`searchToFoundryCsUser`); `search/deploy.ps1` retries that
+  exact error for up to 10 min, since a new role takes minutes to reach Search.
+- **Model version**: `gpt-4o` 2024-11-20 is at the *Legacy* stage (retirement
+  2027-04-14, replacement gpt-5.1). A new subscription can still deploy it, but
+  not once it moves to *Deprecated* — "existing customer" is decided per
+  subscription. Deploy early (phase `infra`).
+- **Quotas**: gpt-4o and embedding capacities are lowered automatically to the
+  free quota. The App Service `B1` plan can fail on some new subscriptions with
+  `Current Limit (Basic VMs): 0` — request quota or change region.
+- **Web app first start**: the Oryx build takes several minutes, and
+  `az webapp deploy` can report a failed status poll on a real success (§7).
+- **Video Indexer account id**: the `video` phase reads the internal GUID
+  (`properties.accountId`) with `az resource show --resource-type
+  Microsoft.VideoIndexer/accounts`, not the ARM id. Verified on the first real
+  run (2026-09-26).
+- **First run of `logic-ingest-<client>` fails (hit 2026-09-26).** A
+  Recurrence trigger without start time fires as soon as the Logic App is
+  created, before its Key Vault Secrets User role is active: `Get_secret` 403
+  "Caller is not authorized", nothing copied, next run 24 h later. After a
+  deployment, run `.\scripts\sync-client.ps1 -ClientId <client> -WithMedia`
+  (it also runs the indexers: `ix-<client>-di` is not started by any Logic App).
+- **Files over 100 MB (hit 2026-09-27, fixed: the 1h25 test video was copied on the next run).** The Logic App HTTP action
+  buffers at most 104857600 bytes, so `Download_content` failed on the 1h25
+  test video (`Cannot write more bytes to the buffer than the configured
+  maximum buffer size`). `ingestion/workflow-definition.json` now copies files
+  over 100 MB server side by 100 MiB blocks (`Put Block From URL` from the
+  pre-authenticated SharePoint download URL, then `Put Block List`); nothing
+  transits through the Logic App. Smaller files keep the download + write path.
+  Redeploy one client's ingestion Logic App only:
+  `az deployment group create --resource-group rg-knowledgeengine-v9 --name
+  ingestion-<client> --template-file ingestion/main.bicep --parameters
+  "@clients-local/<client>.parameters.json" -o none`.
+- **Every ingestion run re-copied every file (found 2026-09-27, fixed).**
+  `Check_blob_exists` (HEAD on the destination blob) had no `x-ms-version`
+  header; Storage refuses a managed identity token without it, so the HEAD
+  never answered 200, every file looked missing and was downloaded and
+  rewritten on every run. Rewriting a blob drops its metadata, so the
+  `transcribed` / `videoindexed` flags were lost (all audio re-transcribed)
+  and every document got a new timestamp (all re-indexed by DI + enrichment):
+  paid work redone every day. Seen after a re-run: `audio-raw` went from 118
+  to 0 transcribed and `ix-<client>-di` re-processed all 286 documents. Fixed
+  by the header; redeploy with the command above.
+- **Video / audio pipeline silently skipping everything with 0 or 1 file
+  (found 2026-09-27, fixed).** `List_blobs_loop` turns the Blob XML listing
+  into JSON: `Blobs.Blob` is an array only for 2+ blobs (one blob gives an
+  object, none gives null), so `Select_blobInfo` failed with one video. The
+  run still showed *Succeeded*: `Run_search_indexer` always runs last and sets
+  the run status. `Compose_blobsJson` now normalizes to an array (both
+  `ingestion/video-index` and `ingestion/audio-transcribe`), and
+  `scripts/sync-client.ps1` reports failed steps under *Succeeded* runs too
+  (`-Trace ingest|audio|video` walks a run step by step). Redeploy:
+  `az deployment group create --resource-group rg-knowledgeengine-v9 --name
+  video-<client> --template-file ingestion/video-index/main.bicep --parameters
+  clientCode=<client> videoIndexerAccountId=<accountId> videoIndexerAccountName=vi-knowledgeengine3-v9
+  videoIndexerLocation=francecentral namePrefix=knowledgeengine3 createRoleAssignments=true -o none`
+  (audio: `--name audio-<client> --template-file ingestion/audio-transcribe/main.bicep
+  --parameters clientCode=<client> speechEndpoint=https://aif-knowledgeengine3-v9.cognitiveservices.azure.com
+  namePrefix=knowledgeengine3 keyVaultName=kv-knowledgeengine3-v9 createRoleAssignments=true`).
+- **Video post-processing had never run end to end; audio choked on empty
+  phrases (found 2026-09-29, fixed).** Video: `Compose_transcript` was written
+  `"@{coalesce(...)}"`, which turns the array into a string, so
+  `For_each_transcriptLine` failed right after Video Indexer had finished. The
+  video was therefore never flagged `videoindexed` and **each daily run
+  uploaded it again and paid a full Video Indexer pass** (1h25 of video, three
+  times from 2026-09-27 to 09-29). Now: a video already *Processed* under the
+  same name in the VI account is reused (`List_vi_videos` /
+  `Condition_already_indexed`, no new upload); transcript lines without text are
+  dropped; `instances[0]` / index lookups go through `first()` / `skip()`.
+  Audio: Speech returns some phrases with an empty `nBest`, and the channel
+  merge read `nBest[0]` (2 files of client-s failed every day);
+  `Filter_channel0/1` now drop them. Both: the loops that append lines to a
+  variable ran 20 in parallel, so lines could land out of order (and video
+  timestamps next to the wrong line); they now run one at a time. Transcripts
+  written before this fix may have lines out of order.

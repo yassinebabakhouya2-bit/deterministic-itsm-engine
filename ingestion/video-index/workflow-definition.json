@@ -1,0 +1,1056 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "storageAccountName": {
+      "type": "string"
+    },
+    "videoContainerName": {
+      "type": "string"
+    },
+    "containerName": {
+      "type": "string"
+    },
+    "clientId": {
+      "type": "string"
+    },
+    "searchServiceName": {
+      "type": "string"
+    },
+    "languageEndpoint": {
+      "type": "string"
+    },
+    "languageApiVersion": {
+      "type": "string",
+      "defaultValue": "2024-05-01"
+    },
+    "subscriptionId": {
+      "type": "string"
+    },
+    "resourceGroupName": {
+      "type": "string"
+    },
+    "videoIndexerAccountName": {
+      "type": "string"
+    },
+    "videoIndexerAccountId": {
+      "type": "string"
+    },
+    "videoIndexerLocation": {
+      "type": "string",
+      "defaultValue": "francecentral"
+    },
+    "videoIndexerArmApiVersion": {
+      "type": "string",
+      "defaultValue": "2024-01-01"
+    },
+    "sourceLanguage": {
+      "type": "string",
+      "defaultValue": "fr-FR"
+    },
+    "indexingPreset": {
+      "type": "string",
+      "defaultValue": "Default"
+    },
+    "pollIntervalSeconds": {
+      "type": "int",
+      "defaultValue": 30
+    },
+    "pollMaxAttempts": {
+      "type": "int",
+      "defaultValue": 240
+    }
+  },
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1
+      }
+    }
+  },
+  "actions": {
+    "Initialize_marker": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "marker",
+            "type": "string",
+            "value": ""
+          }
+        ]
+      },
+      "runAfter": {}
+    },
+    "Initialize_blobItems": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "blobItems",
+            "type": "array",
+            "value": []
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_marker": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_mergedBlobItems": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "mergedBlobItems",
+            "type": "array",
+            "value": []
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_blobItems": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_pollStatus": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "pollStatus",
+            "type": "string",
+            "value": ""
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_mergedBlobItems": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_conversationItems": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "conversationItems",
+            "type": "array",
+            "value": []
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_pollStatus": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_transcriptTimestamps": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "transcriptTimestamps",
+            "type": "array",
+            "value": []
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_conversationItems": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_redactedTranscriptLines": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "redactedTranscriptLines",
+            "type": "array",
+            "value": []
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_transcriptTimestamps": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_videoId": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "videoId",
+            "type": "string",
+            "value": ""
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_redactedTranscriptLines": [
+          "Succeeded"
+        ]
+      }
+    },
+    "List_blobs_loop": {
+      "type": "Until",
+      "expression": "@equals(variables('marker'), '')",
+      "limit": {
+        "count": 60,
+        "timeout": "PT1H"
+      },
+      "actions": {
+        "List_blobs_page": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('videoContainerName'), '?restype=container&comp=list&include=metadata', if(equals(variables('marker'), ''), '', concat('&marker=', variables('marker'))))}",
+            "headers": {
+              "x-ms-version": "2021-08-06"
+            },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://storage.azure.com"
+            }
+          },
+          "runAfter": {}
+        },
+        "Compose_xmlDoc": {
+          "type": "Compose",
+          "inputs": "@xml(body('List_blobs_page'))",
+          "runAfter": {
+            "List_blobs_page": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_blobsRaw": {
+          "type": "Compose",
+          "inputs": "@json(outputs('Compose_xmlDoc'))?['EnumerationResults']?['Blobs']?['Blob']",
+          "runAfter": {
+            "Compose_xmlDoc": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_blobsJson": {
+          "type": "Compose",
+          "description": "XML listing converted to JSON gives an array only for 2+ blobs: one blob is an object, none is null. Normalized to an array here, otherwise Select_blobInfo fails with 1 or 0 files (the run still showed Succeeded because Run_search_indexer always runs last).",
+          "inputs": "@if(equals(outputs('Compose_blobsRaw'), null), createArray(), if(startsWith(string(coalesce(outputs('Compose_blobsRaw'), '')), '['), outputs('Compose_blobsRaw'), createArray(outputs('Compose_blobsRaw'))))",
+          "runAfter": {
+            "Compose_blobsRaw": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Select_blobInfo": {
+          "type": "Select",
+          "inputs": {
+            "from": "@outputs('Compose_blobsJson')",
+            "select": {
+              "name": "@item()?['Name']",
+              "videoindexed": "@item()?['Metadata']?['videoindexed']"
+            }
+          },
+          "runAfter": {
+            "Compose_blobsJson": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Merge_blobItems": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "mergedBlobItems",
+            "value": "@union(variables('blobItems'), body('Select_blobInfo'))"
+          },
+          "runAfter": {
+            "Select_blobInfo": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Update_blobItems": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "blobItems",
+            "value": "@variables('mergedBlobItems')"
+          },
+          "runAfter": {
+            "Merge_blobItems": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_nextMarker": {
+          "type": "Compose",
+          "inputs": "@xpath(outputs('Compose_xmlDoc'), 'string(/EnumerationResults/NextMarker)')",
+          "runAfter": {
+            "Update_blobItems": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Update_marker": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "marker",
+            "value": "@outputs('Compose_nextMarker')"
+          },
+          "runAfter": {
+            "Compose_nextMarker": [
+              "Succeeded"
+            ]
+          }
+        }
+      },
+      "runAfter": {
+        "Initialize_videoId": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Filter_unindexed": {
+      "type": "Query",
+      "inputs": {
+        "from": "@variables('blobItems')",
+        "where": "@not(equals(item()?['videoindexed'], 'true'))"
+      },
+      "runAfter": {
+        "List_blobs_loop": [
+          "Succeeded"
+        ]
+      }
+    },
+    "For_each_video": {
+      "type": "Foreach",
+      "foreach": "@body('Filter_unindexed')",
+      "runtimeConfiguration": {
+        "concurrency": {
+          "repetitions": 1
+        }
+      },
+      "actions": {
+        "Compose_blobName": {
+          "type": "Compose",
+          "inputs": "@items('For_each_video')?['name']",
+          "runAfter": {}
+        },
+        "Select_encodedSegments": {
+          "type": "Select",
+          "inputs": {
+            "from": "@split(outputs('Compose_blobName'), '/')",
+            "select": "@uriComponent(item())"
+          },
+          "runAfter": {
+            "Compose_blobName": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_encodedPath": {
+          "type": "Compose",
+          "inputs": "@join(body('Select_encodedSegments'), '/')",
+          "runAfter": {
+            "Select_encodedSegments": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Compose_videoUrl": {
+          "type": "Compose",
+          "inputs": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('videoContainerName'), '/', outputs('Compose_encodedPath'))}",
+          "runAfter": {
+            "Compose_encodedPath": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Generate_vi_token": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@{concat('https://management.azure.com/subscriptions/', parameters('subscriptionId'), '/resourceGroups/', parameters('resourceGroupName'), '/providers/Microsoft.VideoIndexer/accounts/', parameters('videoIndexerAccountName'), '/generateAccessToken?api-version=', parameters('videoIndexerArmApiVersion'))}",
+            "headers": {
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "permissionType": "Contributor",
+              "scope": "Account"
+            },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://management.azure.com/"
+            }
+          },
+          "runAfter": {
+            "Compose_videoUrl": [
+              "Succeeded"
+            ]
+          }
+        },
+        "List_vi_videos": {
+          "type": "Http",
+          "description": "Videos already in the Video Indexer account. A video already Processed under the same name is reused instead of being uploaded and billed again (a failure after indexing used to re-upload the video on every daily run).",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat('https://api.videoindexer.ai/', parameters('videoIndexerLocation'), '/Accounts/', parameters('videoIndexerAccountId'), '/Videos?pageSize=100&accessToken=', uriComponent(body('Generate_vi_token')?['accessToken']))}"
+          },
+          "runAfter": {
+            "Generate_vi_token": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Filter_existing_video": {
+          "type": "Query",
+          "inputs": {
+            "from": "@coalesce(body('List_vi_videos')?['results'], createArray())",
+            "where": "@and(equals(item()?['name'], outputs('Compose_blobName')), equals(item()?['state'], 'Processed'))"
+          },
+          "runAfter": {
+            "List_vi_videos": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Condition_already_indexed": {
+          "type": "If",
+          "expression": {
+            "and": [
+              {
+                "greater": [
+                  "@length(body('Filter_existing_video'))",
+                  0
+                ]
+              }
+            ]
+          },
+          "actions": {
+            "Set_videoId_existing": {
+              "type": "SetVariable",
+              "inputs": {
+                "name": "videoId",
+                "value": "@{first(body('Filter_existing_video'))?['id']}"
+              },
+              "runAfter": {}
+            },
+            "Set_pollStatus_processed": {
+              "type": "SetVariable",
+              "inputs": {
+                "name": "pollStatus",
+                "value": "Processed"
+              },
+              "runAfter": {
+                "Set_videoId_existing": [
+                  "Succeeded"
+                ]
+              }
+            }
+          },
+          "else": {
+            "actions": {
+              "Upload_video": {
+                "type": "Http",
+                "inputs": {
+                  "method": "POST",
+                  "uri": "@{concat('https://api.videoindexer.ai/', parameters('videoIndexerLocation'), '/Accounts/', parameters('videoIndexerAccountId'), '/Videos?name=', uriComponent(outputs('Compose_blobName')), '&privacy=Private&indexingPreset=', parameters('indexingPreset'), '&language=', parameters('sourceLanguage'), '&videoUrl=', uriComponent(outputs('Compose_videoUrl')), '&useManagedIdentityToDownloadVideo=true&accessToken=', uriComponent(body('Generate_vi_token')?['accessToken']))}"
+                },
+                "runAfter": {}
+              },
+              "Set_videoId_uploaded": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "videoId",
+                  "value": "@{body('Upload_video')?['id']}"
+                },
+                "runAfter": {
+                  "Upload_video": [
+                    "Succeeded"
+                  ]
+                }
+              },
+              "Reset_pollStatus": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "pollStatus",
+                  "value": ""
+                },
+                "runAfter": {
+                  "Set_videoId_uploaded": [
+                    "Succeeded"
+                  ]
+                }
+              },
+              "Poll_until_done": {
+                "type": "Until",
+                "expression": "@or(equals(variables('pollStatus'), 'Processed'), equals(variables('pollStatus'), 'Failed'))",
+                "limit": {
+                  "count": "@parameters('pollMaxAttempts')",
+                  "timeout": "PT4H"
+                },
+                "actions": {
+                  "Wait_before_check": {
+                    "type": "Wait",
+                    "inputs": {
+                      "interval": {
+                        "unit": "Second",
+                        "count": "@parameters('pollIntervalSeconds')"
+                      }
+                    },
+                    "runAfter": {}
+                  },
+                  "Generate_vi_token_poll": {
+                    "type": "Http",
+                    "inputs": {
+                      "method": "POST",
+                      "uri": "@{concat('https://management.azure.com/subscriptions/', parameters('subscriptionId'), '/resourceGroups/', parameters('resourceGroupName'), '/providers/Microsoft.VideoIndexer/accounts/', parameters('videoIndexerAccountName'), '/generateAccessToken?api-version=', parameters('videoIndexerArmApiVersion'))}",
+                      "headers": {
+                        "Content-Type": "application/json"
+                      },
+                      "body": {
+                        "permissionType": "Reader",
+                        "scope": "Account"
+                      },
+                      "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://management.azure.com/"
+                      }
+                    },
+                    "runAfter": {
+                      "Wait_before_check": [
+                        "Succeeded"
+                      ]
+                    }
+                  },
+                  "Check_status": {
+                    "type": "Http",
+                    "inputs": {
+                      "method": "GET",
+                      "uri": "@{concat('https://api.videoindexer.ai/', parameters('videoIndexerLocation'), '/Accounts/', parameters('videoIndexerAccountId'), '/Videos/', variables('videoId'), '/Index?accessToken=', uriComponent(body('Generate_vi_token_poll')?['accessToken']), '&_cb=', string(ticks(utcNow())))}",
+                      "headers": {
+                        "Cache-Control": "no-cache",
+                        "Pragma": "no-cache"
+                      }
+                    },
+                    "runAfter": {
+                      "Generate_vi_token_poll": [
+                        "Succeeded"
+                      ]
+                    }
+                  },
+                  "Update_pollStatus": {
+                    "type": "SetVariable",
+                    "inputs": {
+                      "name": "pollStatus",
+                      "value": "@{coalesce(body('Check_status')?['videos'][0]?['state'], '')}"
+                    },
+                    "runAfter": {
+                      "Check_status": [
+                        "Succeeded"
+                      ]
+                    }
+                  }
+                },
+                "runAfter": {
+                  "Reset_pollStatus": [
+                    "Succeeded"
+                  ]
+                }
+              }
+            }
+          },
+          "runAfter": {
+            "Filter_existing_video": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Condition_video_processed": {
+          "type": "If",
+          "expression": {
+            "and": [
+              {
+                "equals": [
+                  "@variables('pollStatus')",
+                  "Processed"
+                ]
+              }
+            ]
+          },
+          "actions": {
+            "Generate_vi_token_final": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@{concat('https://management.azure.com/subscriptions/', parameters('subscriptionId'), '/resourceGroups/', parameters('resourceGroupName'), '/providers/Microsoft.VideoIndexer/accounts/', parameters('videoIndexerAccountName'), '/generateAccessToken?api-version=', parameters('videoIndexerArmApiVersion'))}",
+                "headers": {
+                  "Content-Type": "application/json"
+                },
+                "body": {
+                  "permissionType": "Reader",
+                  "scope": "Account"
+                },
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://management.azure.com/"
+                }
+              },
+              "runAfter": {}
+            },
+            "Get_final_index": {
+              "type": "Http",
+              "inputs": {
+                "method": "GET",
+                "uri": "@{concat('https://api.videoindexer.ai/', parameters('videoIndexerLocation'), '/Accounts/', parameters('videoIndexerAccountId'), '/Videos/', variables('videoId'), '/Index?accessToken=', uriComponent(body('Generate_vi_token_final')?['accessToken']))}"
+              },
+              "runAfter": {
+                "Generate_vi_token_final": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Compose_insights": {
+              "type": "Compose",
+              "inputs": "@body('Get_final_index')?['videos'][0]?['insights']",
+              "runAfter": {
+                "Get_final_index": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Filter_transcriptLines": {
+              "type": "Query",
+              "inputs": {
+                "from": "@coalesce(outputs('Compose_insights')?['transcript'], createArray())",
+                "where": "@not(empty(trim(coalesce(item()?['text'], ''))))"
+              },
+              "runAfter": {
+                "Compose_insights": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Compose_transcript": {
+              "type": "Compose",
+              "description": "Must stay an array: the former \"@{...}\" form turned it into a string and For_each_transcriptLine failed on the first line.",
+              "inputs": "@body('Filter_transcriptLines')",
+              "runAfter": {
+                "Filter_transcriptLines": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Reset_conversationItems": {
+              "type": "SetVariable",
+              "inputs": {
+                "name": "conversationItems",
+                "value": []
+              },
+              "runAfter": {
+                "Compose_transcript": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Reset_transcriptTimestamps": {
+              "type": "SetVariable",
+              "inputs": {
+                "name": "transcriptTimestamps",
+                "value": []
+              },
+              "runAfter": {
+                "Reset_conversationItems": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "For_each_transcriptLine": {
+              "type": "Foreach",
+              "foreach": "@range(0, length(outputs('Compose_transcript')))",
+              "actions": {
+                "Append_conversationItem": {
+                  "type": "AppendToArrayVariable",
+                  "inputs": {
+                    "name": "conversationItems",
+                    "value": {
+                      "id": "@string(item())",
+                      "participantId": "Presentateur",
+                      "role": "Agent",
+                      "text": "@{outputs('Compose_transcript')[item()]?['text']}"
+                    }
+                  },
+                  "runAfter": {}
+                },
+                "Append_transcriptTimestamp": {
+                  "type": "AppendToArrayVariable",
+                  "inputs": {
+                    "name": "transcriptTimestamps",
+                    "value": "@{coalesce(first(outputs('Compose_transcript')[item()]?['instances'])?['start'], '?')}"
+                  },
+                  "runAfter": {
+                    "Append_conversationItem": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "runAfter": {
+                "Reset_transcriptTimestamps": [
+                  "Succeeded"
+                ]
+              },
+              "runtimeConfiguration": {
+                "concurrency": {
+                  "repetitions": 1
+                }
+              }
+            },
+            "Submit_pii": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@{concat(parameters('languageEndpoint'), '/language/analyze-conversations/jobs?api-version=', parameters('languageApiVersion'))}",
+                "headers": {
+                  "Content-Type": "application/json"
+                },
+                "body": {
+                  "displayName": "@{concat('video-pii: ', outputs('Compose_blobName'))}",
+                  "analysisInput": {
+                    "conversations": [
+                      {
+                        "id": "conv1",
+                        "language": "@{substring(parameters('sourceLanguage'), 0, 2)}",
+                        "modality": "text",
+                        "conversationItems": "@variables('conversationItems')"
+                      }
+                    ]
+                  },
+                  "tasks": [
+                    {
+                      "taskName": "pii",
+                      "kind": "ConversationalPIITask",
+                      "parameters": {
+                        "redactionSource": "text"
+                      }
+                    }
+                  ]
+                },
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://cognitiveservices.azure.com"
+                }
+              },
+              "runAfter": {
+                "For_each_transcriptLine": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Compose_languageJobUrl": {
+              "type": "Compose",
+              "inputs": "@{coalesce(outputs('Submit_pii')['headers']?['Operation-Location'], outputs('Submit_pii')['headers']?['operation-location'])}",
+              "runAfter": {
+                "Submit_pii": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Reset_languagePollStatus": {
+              "type": "SetVariable",
+              "inputs": {
+                "name": "pollStatus",
+                "value": ""
+              },
+              "runAfter": {
+                "Compose_languageJobUrl": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Poll_language_job": {
+              "type": "Until",
+              "expression": "@or(equals(variables('pollStatus'), 'succeeded'), equals(variables('pollStatus'), 'failed'))",
+              "limit": {
+                "count": 60,
+                "timeout": "PT1H"
+              },
+              "actions": {
+                "Wait_before_check_language": {
+                  "type": "Wait",
+                  "inputs": {
+                    "interval": {
+                      "unit": "Second",
+                      "count": "@parameters('pollIntervalSeconds')"
+                    }
+                  },
+                  "runAfter": {}
+                },
+                "Check_language_status": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@{concat(outputs('Compose_languageJobUrl'), '&_cb=', string(ticks(utcNow())))}",
+                    "headers": {
+                      "Cache-Control": "no-cache",
+                      "Pragma": "no-cache"
+                    },
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://cognitiveservices.azure.com"
+                    }
+                  },
+                  "runAfter": {
+                    "Wait_before_check_language": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Update_language_pollStatus": {
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "pollStatus",
+                    "value": "@{toLower(coalesce(body('Check_language_status')?['status'], ''))}"
+                  },
+                  "runAfter": {
+                    "Check_language_status": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "runAfter": {
+                "Reset_languagePollStatus": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Condition_language_job_succeeded": {
+              "type": "If",
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@variables('pollStatus')",
+                      "succeeded"
+                    ]
+                  }
+                ]
+              },
+              "actions": {
+                "Get_language_results": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@{outputs('Compose_languageJobUrl')}",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://cognitiveservices.azure.com"
+                    }
+                  },
+                  "runAfter": {}
+                },
+                "Filter_pii_task": {
+                  "type": "Query",
+                  "inputs": {
+                    "from": "@body('Get_language_results')?['tasks']?['items']",
+                    "where": "@equals(item()?['taskName'], 'pii')"
+                  },
+                  "runAfter": {
+                    "Get_language_results": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Compose_redactedItems": {
+                  "type": "Compose",
+                  "inputs": "@body('Filter_pii_task')[0]?['results']?['conversations'][0]?['conversationItems']",
+                  "runAfter": {
+                    "Filter_pii_task": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Reset_redactedTranscriptLines": {
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "redactedTranscriptLines",
+                    "value": []
+                  },
+                  "runAfter": {
+                    "Compose_redactedItems": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "For_each_conversationItem": {
+                  "type": "Foreach",
+                  "foreach": "@range(0, length(variables('conversationItems')))",
+                  "actions": {
+                    "Append_redactedTranscriptLine": {
+                      "type": "AppendToArrayVariable",
+                      "inputs": {
+                        "name": "redactedTranscriptLines",
+                        "value": "@{concat('[', coalesce(first(skip(variables('transcriptTimestamps'), item())), '?'), '] ', coalesce(first(skip(outputs('Compose_redactedItems'), item()))?['redactedContent']?['text'], '(non disponible)'))}"
+                      },
+                      "runAfter": {}
+                    }
+                  },
+                  "runAfter": {
+                    "Reset_redactedTranscriptLines": [
+                      "Succeeded"
+                    ]
+                  },
+                  "runtimeConfiguration": {
+                    "concurrency": {
+                      "repetitions": 1
+                    }
+                  }
+                },
+                "Select_ocrLines": {
+                  "type": "Select",
+                  "inputs": {
+                    "from": "@coalesce(outputs('Compose_insights')?['ocr'], createArray())",
+                    "select": "@{concat('[', coalesce(first(item()?['instances'])?['start'], '?'), '] ', item()?['text'])}"
+                  },
+                  "runAfter": {
+                    "For_each_conversationItem": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Select_topicLines": {
+                  "type": "Select",
+                  "inputs": {
+                    "from": "@coalesce(outputs('Compose_insights')?['topics'], createArray())",
+                    "select": "@{concat('- ', item()?['name'], ' (confiance : ', string(item()?['confidence']), ', source : ', item()?['referenceType'], ')')}"
+                  },
+                  "runAfter": {
+                    "Select_ocrLines": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Compose_finalVideoText": {
+                  "type": "Compose",
+                  "inputs": "@{concat('Fichier source: ', outputs('Compose_blobName'), decodeUriComponent('%0A%0A'), '--- Transcription (PII redigee automatiquement) ---', decodeUriComponent('%0A%0A'), join(variables('redactedTranscriptLines'), decodeUriComponent('%0A')), decodeUriComponent('%0A%0A'), '--- Texte a l ecran (OCR) ---', decodeUriComponent('%0A%0A'), join(body('Select_ocrLines'), decodeUriComponent('%0A')), decodeUriComponent('%0A%0A'), '--- Sujets detectes ---', decodeUriComponent('%0A%0A'), join(body('Select_topicLines'), decodeUriComponent('%0A')))}",
+                  "runAfter": {
+                    "Select_topicLines": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Compose_txtBlobName": {
+                  "type": "Compose",
+                  "inputs": "@{concat(substring(outputs('Compose_blobName'), 0, lastIndexOf(outputs('Compose_blobName'), '.')), '.txt')}",
+                  "runAfter": {
+                    "Compose_finalVideoText": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Write_video_transcript_blob": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "PUT",
+                    "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', outputs('Compose_txtBlobName'))}",
+                    "headers": {
+                      "x-ms-blob-type": "BlockBlob",
+                      "x-ms-version": "2021-08-06",
+                      "Content-Type": "text/plain; charset=utf-8",
+                      "x-ms-meta-clientid": "@{parameters('clientId')}",
+                      "x-ms-meta-sourcetype": "video"
+                    },
+                    "body": "@outputs('Compose_finalVideoText')",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://storage.azure.com"
+                    }
+                  },
+                  "runAfter": {
+                    "Compose_txtBlobName": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Mark_videoindexed": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "PUT",
+                    "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('videoContainerName'), '/', outputs('Compose_encodedPath'), '?comp=metadata')}",
+                    "headers": {
+                      "x-ms-version": "2021-08-06",
+                      "x-ms-meta-videoindexed": "true"
+                    },
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://storage.azure.com"
+                    }
+                  },
+                  "runAfter": {
+                    "Write_video_transcript_blob": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "else": {
+                "actions": {}
+              },
+              "runAfter": {
+                "Poll_language_job": [
+                  "Succeeded"
+                ]
+              }
+            }
+          },
+          "else": {
+            "actions": {}
+          },
+          "runAfter": {
+            "Condition_already_indexed": [
+              "Succeeded"
+            ]
+          }
+        }
+      },
+      "runAfter": {
+        "Filter_unindexed": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Run_search_indexer": {
+      "type": "Http",
+      "description": "Reindexation automatique : force un passage de l'indexeur texte natif (ix-<clientId>-text) juste apres l'ecriture des .txt video, pour que les transcriptions soient interrogeables sans attendre un declenchement manuel. Toujours execute, meme si For_each_video a eu des echecs individuels.",
+      "inputs": {
+        "method": "POST",
+        "uri": "@{concat('https://', parameters('searchServiceName'), '.search.windows.net/indexers/ix-', parameters('clientId'), '-text/run?api-version=2024-07-01')}",
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://search.azure.com/"
+        }
+      },
+      "runAfter": {
+        "For_each_video": [
+          "Succeeded",
+          "Failed",
+          "Skipped",
+          "TimedOut"
+        ]
+      }
+    }
+  },
+  "outputs": {}
+}
