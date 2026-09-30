@@ -118,7 +118,7 @@ sign-in. Two real defenses stack on top of that gate:
 ```bash
 az ad app create --display-name "KnowledgeEngineV9-WebApp-Auth" \
   --sign-in-audience AzureADMyOrg \
-  --web-redirect-uris "https://app-knowledgeengine2-v9.azurewebsites.net/.auth/login/aad/callback"
+  --web-redirect-uris "https://app-knowledgeengine3-v9.azurewebsites.net/.auth/login/aad/callback"
 ```
 
 Note the returned `appId` — that's `easyAuthClientId` below. (Already done — this

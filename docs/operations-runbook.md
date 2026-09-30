@@ -37,6 +37,7 @@ session.
 - §10 Video pipeline (Jalon 8) — Video Indexer account setup & API auth chain
 - §11 ITSM action module (Jalon 10) — demo identities, Logic Apps, demo replay
 - §12 Rebuild in a new tenant — `scripts/bootstrap-new-tenant.ps1`
+- §13 Diagnostic engine (deterministic agentic RAG) — Diagnostic tab, ServiceNow webhook, display fixes
 
 ---
 
@@ -532,6 +533,10 @@ application` — **Authentication → Implicit grant → check "ID tokens"**
 `WEBSITE_AUTH_AAD_ALLOWED_TENANTS` populated from it. The default
 `openIdIssuer` (`/organizations/v2.0`) works fine with Easy Auth for
 external tenants too — no need to switch to `/common/v2.0`.
+Since 2026-09-30, `scripts/bootstrap-new-tenant.ps1` derives both values
+(and the App Registration's `signInAudience`) from the client configs, and
+`scripts/attach-external-tenant.ps1` applies them to a running deployment —
+see §6.6.
 
 ⚠️ **PowerShell/Azure CLI quoting bug**: passing
 `easyAuthAllowedTenantIds='["a","b"]'` as an inline CLI argument gets
@@ -577,6 +582,86 @@ session (no CLI equivalent for the RAG-answer check):
   unrelated to `easyAuthAllowedTenantIds` or `app/auth.py`. Always test with
   an account native to the tenant under test.
 
+### 6.6 Attach another organization's tenant to a client — `scripts/attach-external-tenant.ps1` (2026-09-30)
+
+**Symptom** (new tenant, 2026-09-30): signing in to the app as
+`YassineBABAKHOUYA@ClientForDemo.onmicrosoft.com` (another organization,
+tenant `7bb131d8-9785-4b78-9f70-92d80b535162`) stops on Microsoft's sign-in
+page with `AADSTS50020: User account '...' from identity provider
+'https://sts.windows.net/7bb131d8-.../' does not exist in tenant
+'KnowledgeEngineV9' and cannot access the application
+'8f7f2a31-458f-48ea-a8d5-05e5e623527a'(KnowledgeEngineV9-WebApp-Auth) in that
+tenant`.
+
+**Root cause**: `bootstrap-new-tenant.ps1` (§12) deployed the app
+single-tenant — App Registration `signInAudience=AzureADMyOrg`, Easy Auth
+issuer `https://sts.windows.net/<this tenant>/v2.0` (so the sign-in page is
+this tenant's own), `WEBSITE_AUTH_AAD_ALLOWED_TENANTS=<this tenant>` — and
+every client config pointed to this tenant with a group. The Jalon 5
+external-tenant set-up (§6.2-6.3, clientc from ClientForDemo on the first
+tenant) was not carried over by the rebuild.
+
+**Decision (2026-09-30)** — the Jalon 5 layout, kept: **client-s stays in
+this deployment's tenant** (group `KE-v9-clients`), **clientc goes to the
+ClientForDemo tenant** (organization 2: whole tenant = clientc, no group).
+First idea was to attach client-s to ClientForDemo; dropped the same night.
+
+**Fix** — one command on the running deployment (az logged in to this
+deployment's tenant), then a one-time consent in the other organization:
+```powershell
+.\scripts\attach-external-tenant.ps1 -ClientId clientc -TenantId 7bb131d8-9785-4b78-9f70-92d80b535162
+```
+It (1) rewrites `access:` in `config/engine.clientc.yaml`:
+`entraTenantId` = the other tenant, `entraGroup` removed (whole tenant =
+clientc, §6.1); (2) switches the App Registration to `AzureADMultipleOrgs`;
+(3) sets the Easy Auth issuer to
+`https://login.microsoftonline.com/organizations/v2.0` (`az rest` GET/PUT of
+`config/authsettingsV2`) and `WEBSITE_AUTH_AAD_ALLOWED_TENANTS` to this
+tenant + every tenant a shipped client config points to (through a JSON file:
+the comma must not cross az.cmd); (4) zip-deploys the app with the client
+configs (`deploy-webapp.ps1 -ClientsLocal client-s`, §7 - this is also what
+puts client-s, whose config was never shipped by the bootstrap's
+`-SkipClientsLocal`, into the UI for its group); (5) prints the consent
+step. Idempotent. Refuses this tenant's own ID, an unknown one
+(public OpenID metadata check) and a tenant another client config already
+points to (one client per whole tenant, `app/auth.py`), before changing
+anything.
+
+**Consent, once, in the other organization**: a Global Administrator of that
+tenant signs in to the app (private window), ticks *Consent on behalf of your
+organization*, Accept — or opens
+`https://login.microsoftonline.com/<tenant id>/adminconsent?client_id=<app id>`
+(whatever page it lands on afterwards, the consent is recorded). Until then a
+non-admin user of that tenant gets "Need admin approval".
+
+**Result**: every user of ClientForDemo gets clientc only (no dropdown,
+§6.5); users of this tenant see the clients of their groups — clienta,
+clientb, client-s — and clientc is no longer one of them (group
+`KE-v9-clientc` stays in Entra, unused).
+
+**Rebuilds keep it**: `bootstrap-new-tenant.ps1` treats a config pointing to
+another tenant without a group as external and leaves it so; its `infra`
+phase derives the allowed tenants, the multi-tenant issuer and the App
+Registration audience from the configs (§12.2).
+`-ExternalTenantClients @{ 'clientc' = '<tenant id>' }` sets one up at
+rebuild time; `@{ 'clientc' = '' }` brings a client back into this tenant
+(its group) on a run from `entra`. The repo's `config/engine.clientc.yaml`
+carries the ClientForDemo tenant once committed, so the preflight of any
+later run prints `External : clientc <- every user of tenant 7bb131d8-...`:
+at a real client's tenant, drop it with `@{ 'clientc' = '' }`.
+
+Status: written and mock-tested 2026-09-30 — config rewrite, idempotent
+re-run, the three refusals; `app/auth.py` run against the rewritten configs:
+checked for both client-s and clientc as the target (ClientForDemo user →
+the external client only; this tenant's user in every group → the others;
+unknown tenant → `[]`). Live run (2026-09-30): clientc attached to the ClientForDemo
+tenant 7bb131d8-... — config, App Registration audience and Easy Auth issuer applied
+on the first run; the zip deploy that follows a settings change failed once with a
+Kudu 502, then "Site failed to start within 10 mins" on the re-run, and the site was
+running anyway a few minutes later (cause not diagnosed). After any app-settings or
+Easy Auth change, wait for the site to answer before redeploying. client-s stays in
+this tenant (group KE-v9-clients). ClientForDemo consent + login test: to confirm.
+
 ---
 
 ## §7. Web app deployment (zip-deploy) — code/config changes
@@ -584,21 +669,29 @@ session (no CLI equivalent for the RAG-answer check):
 Any change to `app/*.py`, `orchestration/answer.py`, `app/requirements.txt`,
 or a `config/*.yaml` / `clients-local/*.yaml` file needs the web app
 redeployed via zip-deploy (a Bicep deploy alone does not push application
-code — see §6.3). The general shape:
+code — see §6.3). Script `deploy-webapp.ps1` (since 2026-09-24), run from
+the repo root:
 
 ```powershell
-# build deploy.zip from the repo's app/orchestration/config files, then:
-az webapp deploy --resource-group <resource-group> --name <webapp-name> \
-  --src-path <zip> --type zip
+.\deploy-webapp.ps1                                  # app/ orchestration/ config/ requirements.txt README.md + clients-local/engine.client-s.yaml
+.\deploy-webapp.ps1 -ClientsLocal client-s,client-x  # other real clients' configs
+.\deploy-webapp.ps1 -SkipClientsLocal                # no real-client config at all (demo only)
 ```
 
-**Gap — not yet fully captured here**: the exact, verified zip-build step
-has been done at least twice (entry-by-entry via .NET's
-`ZipFileExtensions::CreateEntryFromFile`, converting `\` path separators to
-`/`, per prior sessions), but the literal script wasn't committed to this
-runbook at the time. Capture it here verbatim (the actual `.ps1`/command,
-not a paraphrase) the next time a zip-deploy is performed, per the rule in
-`CLAUDE.md`.
+It builds the zip entry by entry (`ZipFileExtensions::CreateEntryFromFile`,
+`/` separators — `Compress-Archive` writes `\`, unreadable by Linux App
+Service), then runs `az webapp deploy --type zip`. Since 2026-09-30 it takes
+from the git-ignored `clients-local/` **only** `engine.<client>.yaml` of
+`-ClientsLocal` (default `client-s`) — the only file of that folder the app
+reads (`orchestration/answer.py` `CONFIG_DIRS`, `app/auth.py`). Before, the
+whole folder went up: `itsm-demo-credentials.csv`, eval data, parameters
+files, the abandoned client-v config. The zip path is also made absolute:
+.NET resolved the relative name against the process directory (which
+`cd`/`Push-Location` do not change) while `az` resolved it against the
+current location, so from a PowerShell window started in another folder the
+zip was written in one place and looked for in another (seen in a mock run,
+2026-09-30; the real runs so far, from a window opened in the repo, were not
+affected).
 
 **A "Deployment has completed successfully" message with a broken status
 poll is not necessarily a failure**: `az webapp deploy`'s own status polling
@@ -1326,7 +1419,13 @@ runs with an empty index until its data is loaded (12.3).
   `embeddingCapacity` so a new subscription's model quota can be matched
   instead of failing the deploy.
 - `deploy-webapp.ps1 -SkipClientsLocal` leaves `clients-local/` (real client
-  configs) out of the package.
+  configs) out of the package. Since 2026-09-30 the package only ever takes
+  `clients-local/engine.<client>.yaml` of `-ClientsLocal` from that folder
+  (§7), and the bootstrap's `webapp` phase ships the configs of its real
+  clients (client-s) instead of none.
+- 2026-09-30: external-tenant clients (§6.6) — `-ExternalTenantClients`, kept
+  on later runs; Easy Auth's allowed tenants / multi-tenant issuer and the App
+  Registration audience are derived from the client configs.
 - `scripts/bootstrap-new-tenant.ps1`, below — now covers 4 clients and has
   opt-in phases for audio / video / SharePoint ingestion.
 - `infra/main.bicep` has `deployFoundry` (default true): the script passes
@@ -1358,8 +1457,8 @@ phases below; after fixing a failure, resume with `-From <phase>`:
 | Phase | What it does |
 |---|---|
 | `prereqs` | Resource providers, RG, your data-plane roles (Storage Blob/Table Data Contributor, Search Index Data Contributor, Cognitive Services OpenAI User, Key Vault Secrets Officer; Azure AI User optional). |
-| `entra` | App Registration `KnowledgeEngineV9-WebApp-Auth`; native demo user `ke-demo@<initial domain>`; groups `KE-v9-clienta/b/c` (one each) and `KE-v9-clients` (shared, client-s) with the demo user and you as members; rewrites `access:` in `config/engine.client{a,b,c,-s}.yaml`. |
-| `infra` | Fits model capacities to quota, new Easy Auth secret, deploys `infra/main.bicep`, aligns the redirect URI. |
+| `entra` | App Registration `KnowledgeEngineV9-WebApp-Auth`; native demo user `ke-demo@<initial domain>`; groups `KE-v9-clienta/b/c` (one each) and `KE-v9-clients` (shared, client-s) with the demo user and you as members; rewrites `access:` in `config/engine.client{a,b,c,-s}.yaml`. An external-tenant client (§6.6: `-ExternalTenantClients`, or a config already pointing to another tenant without a group) gets that tenant and no group instead — no KE-v9-* group for it. |
+| `infra` | Fits model capacities to quota, new Easy Auth secret, deploys `infra/main.bicep`, aligns the redirect URI. Easy Auth sign-in tenants = this tenant + every tenant a shipped client config points to; more than one = multi-tenant (`/organizations` issuer, App Registration `AzureADMultipleOrgs`), else single-tenant. |
 | `function` | Deploys the enrichment Function (vendored zip if it matches `enrichment/` byte for byte, else source + remote build). |
 | `data` | Uploads `kb/client{a,b,c}` (+ `kb/clientc-multiformat`) and, if present, `kb/client-s` — all with metadata `clientid`. No `kb/client-s`: skipped with a warning, not a failure. |
 | `search` | `search/deploy.ps1` per client (now 4, so 8 indexers), then `search/generate-synonyms.ps1`. |
@@ -1367,7 +1466,7 @@ phases below; after fixing a failure, resume with `-From <phase>`:
 | `audio` | `speech-key` = key1 of the Foundry account (Speech runs on it, as on the first tenant - no new Cognitive Services account); `logic-transcribe-<client>` for `-MediaClients`. |
 | `video` | Registers `Microsoft.VideoIndexer`, deploys `infra/modules/videoindexer.bicep`, reads the account's internal GUID (`properties.accountId`), `logic-video-index-<client>`. |
 | `itsm` | Asks the `svc_ke_itsm` password once (checked against ServiceNow, stored in the vault); `seed-demo-identities.ps1` on this tenant's domain (existing ServiceNow callers get their email re-pointed to the new UPN); `logic-itsm-poll/propose/execute-itsm-demo` (executor Enabled, `dryRun=false`) + their Graph permissions (`grant-graph-app-roles.ps1`, `setup-secret-actions.ps1`); group `KE-v9-itsm-agents` + `config/itsm.yaml`; `reset-demo.ps1` (reopens the demo tickets). Interactive: ServiceNow admin credentials, two `YES` confirmations. |
-| `webapp` | `deploy-webapp.ps1 -SkipClientsLocal`. |
+| `webapp` | `deploy-webapp.ps1 -ClientsLocal <real clients of -Clients>` (client-s): only their `clients-local/engine.<client>.yaml` goes up with the code (§7); `-SkipClientsLocal` when there is none. The final summary prints the admin consent link of each external tenant. |
 
 Output: app URL, demo user, its password printed once at the end (kept out of
 the transcript log, git-ignored). Commit the rewritten
@@ -1444,12 +1543,21 @@ one-off load without SharePoint.
   (`properties.accountId`) with `az resource show --resource-type
   Microsoft.VideoIndexer/accounts`, not the ARM id. Verified on the first real
   run (2026-09-26).
-- **First run of `logic-ingest-<client>` fails (hit 2026-09-26).** A
-  Recurrence trigger without start time fires as soon as the Logic App is
-  created, before its Key Vault Secrets User role is active: `Get_secret` 403
-  "Caller is not authorized", nothing copied, next run 24 h later. After a
-  deployment, run `.\scripts\sync-client.ps1 -ClientId <client> -WithMedia`
-  (it also runs the indexers: `ix-<client>-di` is not started by any Logic App).
+- **First run of `logic-ingest-<client>` failed, and nothing re-ran the
+  document indexer (hit 2026-09-26, fixed 2026-09-29).** A Recurrence trigger
+  without start time fires as soon as the Logic App is created, before its Key
+  Vault Secrets User role is active: `Get_secret` 403 "Caller is not
+  authorized", nothing copied, next run 24 h later. And `ix-<client>-di` was
+  started by no Logic App at all (only `ix-<client>-text` was, at the end of
+  the audio / video runs). Now: the three `main.bicep` give the trigger an
+  explicit first run (`firstRunUtc`: ingestion 1 h after its deployment,
+  audio / video 1 h 30, so they find the copied files), then daily at that
+  time; both indexers run every hour (`schedule` in the indexer templates),
+  which also resumes a Document Intelligence run stopped by the 2 h limit, so
+  the audio / video Logic Apps no longer end with `Run_search_indexer`. To do a
+  cycle right away: `.\scripts\sync-client.ps1 -ClientId <client> -WithMedia`.
+  Existing indexers get the schedule by re-running `search/deploy.ps1` per
+  client.
 - **Files over 100 MB (hit 2026-09-27, fixed: the 1h25 test video was copied on the next run).** The Logic App HTTP action
   buffers at most 104857600 bytes, so `Download_content` failed on the 1h25
   test video (`Cannot write more bytes to the buffer than the configured
@@ -1499,7 +1607,104 @@ one-off load without SharePoint.
   dropped; `instances[0]` / index lookups go through `first()` / `skip()`.
   Audio: Speech returns some phrases with an empty `nBest`, and the channel
   merge read `nBest[0]` (2 files of client-s failed every day);
-  `Filter_channel0/1` now drop them. Both: the loops that append lines to a
+  `Filter_channel0/1` now drop them; a recording left with no phrase at all
+  (the same `cb6131cb-...wav` in two folders) is flagged `transcribed` +
+  `nospeech` instead of failing in `Merge_channels_loop` (an Until loop runs
+  once even with nothing to merge) and being re-submitted to Speech every day.
+  Both: the loops that append lines to a
   variable ran 20 in parallel, so lines could land out of order (and video
   timestamps next to the wrong line); they now run one at a time. Transcripts
   written before this fix may have lines out of order.
+
+---
+
+## §13. Diagnostic engine (deterministic agentic RAG) — 2026-09-30
+
+Design: the architecture document "Architecture - Agentic RAG diagnostic ITSM" (Docs).
+Code: `orchestration/diagnostic/` (contracts, pure FSM, ports, prompts, service) and
+`app/diag_tab.py` (tab + signed endpoints). Tests: `python -m pytest tests` (needs
+`pydantic`, `pytest`, `flask`; 42 tests, no network).
+
+### 13.1 What it is
+
+A state machine `INIT_TRIAGE -> NEED_DIAGNOSTIC_DATA / OCR_PROCESSING -> KB_MATCHED ->
+ACTION_PROPOSED`, terminal `HUMAN_ESCALATION`. The model extracts facts, reads screenshots and
+drafts the plan; **code** decides every transition. Loop termination: 4 questions max, 24 h
+deadline, stagnation check, never the same question twice, 2 unreadable screenshots, 2 rejected
+plans, 8-transition guard per event. A plan is accepted only if every step cites a chunk of the
+selected document, every `verbatim_from_kb` step is a substring of it, and its sha256 matches.
+Risk topics (MFA reset, privileged access, data deletion, security incident) escalate at once.
+A technical failure (search/model down) becomes an escalation, never an improvised answer.
+
+### 13.2 Web app
+
+Tab **Diagnostic** (`/diag`) between Assistant and Tickets ITSM: paste text and/or screenshots
+(PNG/JPEG/WebP, 10 MB, 3 max, kept in memory only), answer the question, get the plan or the
+escalation file. Sessions are rows of the `diagsessions` table (created at start-up); a session
+is visible to its author, and ServiceNow sessions to users with ITSM access. Deploy:
+`.\deploy-webapp.ps1 -ClientsLocal client-s` (new Python dependency `pydantic`, installed by Oryx).
+
+### 13.3 ServiceNow webhook (optional)
+
+`.\scripts\enable-diagnostic-webhook.ps1 -ClientId client-s` sets `DIAG_WEBHOOK_SECRET` /
+`DIAG_WEBHOOK_CLIENT`, excludes exactly `/api/servicenow/webhook` and `/diag/internal/sweep` from
+Easy Auth, and writes the secret to `clients-local\diag-webhook-secret.txt` (never printed).
+`POST /api/servicenow/webhook` with `X-KE-Timestamp` and `X-KE-Signature: sha256=HMAC(secret,
+"<timestamp>.<body>")` (5 minute window), JSON `{event_id, ticket_number, short_description,
+description, comment}`. The response carries `state`, `outbox` (question / plan / escalation)
+and `plan` for the flow to post into the ticket; the same `event_id` twice changes nothing.
+`POST /diag/internal/sweep` (same signature) escalates waiting sessions past their deadline:
+call it hourly from a Logic App. Without the secret both endpoints answer 404.
+**Not done:** posting back into ServiceNow from the app (the flow does it from the response).
+
+### 13.4 To calibrate before trusting the thresholds
+
+Confidence = 0.5 x reranker/`reranker_full` + 0.3 x margin/`margin_full` + 0.2 x variable
+coverage; KB_MATCHED needs >= 0.95 and a margin >= `margin_min`. Starting values (NOT yet measured):
+`reranker_full` 3.0, `margin_full` 0.8, `margin_min` 0.5 - a top score of about 2.8 with a 0.8 margin
+and the required variables present reaches 0.95. Calibrate on `eval/` (goal: zero wrong fiche at
+>= 0.95) and override per client in `engine.<client>.yaml`:
+
+    diagnostic:
+      conf_threshold: 0.95
+      margin_min: 0.5
+      reranker_full: 3.0
+      margin_full: 0.8
+
+Other limits of this first version: the index has no application/OS fields, so the variables
+steer the query text and the question choice, not OData filters; screenshots are read by the
+chat model (no Vision/Document Intelligence service deployed), so `bbox` is empty and a code is
+"verified" only when it matches a known pattern with confidence >= 0.85; `source_system` is
+always `servicenow_kb` (no SharePoint-tagged documents in the index yet).
+
+### 13.5 Display fixes on the Assistant (2026-09-30)
+
+- No irrelevant KB fiche as "source principale": when no fiche covers the question, the best
+  audio/video source actually used is promoted (label "Aucun document KB pertinent"), else none.
+  The fiche stays in `_trace`. Shared engine (`attach_sources`): re-run the golden eval.
+- Audio/video sources show a redacted summary or excerpt instead of "contenu non affiche": only
+  sentences that look like a spelled password are dropped, digit runs are masked; one card per
+  source document.
+
+### 13.6 First live session and fixes (2026-09-30 22h)
+
+A screenshot-only start ("Connexion Bureau a distance" loading dialog) then the answer
+"burau a distance" ended in `stagnation` at 29 %. Causes, fixed (45 tests): the text read from
+a screenshot was neither used in the search query nor counted as evidence; a short answer to a
+targeted question was not stored as that variable; a second screenshot was requested after one had
+already been read; a screenshot-only start put a placeholder sentence in the query.
+
+Second live session ("Outlook en ligne : correcteur ..." at 63 %): a screenshot was requested for a
+how-to question, and one empty reply ("Ca ne marche pas") escalated at turn 1/4. Now: close
+candidates are asked about first (choose between the fiches), a screenshot is requested after that;
+escalation for stagnation needs two consecutive replies with nothing new; the escalation card lists
+the closest fiches and points to the Assistant.
+
+### 13.7 One tab: the Assistant and the Diagnostic merged (2026-09-30 22h)
+
+`/` now redirects to `/diag`, the single "Assistant" tab: the closest KB fiche (title, match strength,
+excerpt, other leads) is shown as soon as the problem is described and stays on top while the guided
+diagnostic asks its questions; once a plan is validated the plan replaces it. The previous single-shot
+assistant is kept at `/classic` (link "Assistant classique", keeps its saved conversations), so a
+rollback is one redirect line in `app/app.py` (`root`). Not yet in the unified tab: audio/video
+secondary sources and the Assistant's conversation history sidebar.

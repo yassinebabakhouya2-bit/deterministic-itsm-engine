@@ -423,7 +423,7 @@ ITSM_PAGE = """
     <div><h1>KnowledgeEngine v9 — Tickets ITSM</h1>
     <p>Propositions d'actions sur les tickets ServiceNow — rien n'est exécuté sans validation d'un agent.</p></div>
   </div>
-  <nav><a href="/">Assistant</a><a class="on" href="/itsm">Tickets ITSM</a>
+  <nav><a href="/diag">Assistant</a><a class="on" href="/itsm">Tickets ITSM</a>
     <span class="muted" style="margin-left:14px;font-size:.8rem">{{ display_name }}</span></nav>
 </header>
 <main>
