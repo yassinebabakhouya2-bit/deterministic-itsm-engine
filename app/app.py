@@ -170,7 +170,7 @@ _LOCAL_DEV_CLIENTS = [c.strip() for c in os.environ.get("LOCAL_DEV_CLIENTS", "")
 # the conversation tables below -- one shared account, per-purpose isolation
 # is the container/table, exactly like knowledge.index is the isolation
 # boundary on the Search side.
-_STORAGE_ACCOUNT = "stknowledgeengine2v9"
+_STORAGE_ACCOUNT = "stknowledgeengine3v9"
 _TABLE_ENDPOINT = f"https://{_STORAGE_ACCOUNT}.table.core.windows.net"
 _CONV_INDEX_TABLE = "convindex"
 _CONV_TURNS_TABLE = "convturns"
@@ -202,6 +202,24 @@ app = Flask(__name__)
 from itsm import create_itsm_blueprint, itsm_access_for_request  # noqa: E402
 
 app.register_blueprint(create_itsm_blueprint(_table_service, _credential))
+
+# Diagnostic tab (deterministic agentic RAG, orchestration/diagnostic/): guided
+# diagnosis with bounded questions, screenshot reading, plan or human escalation.
+# Same client resolution as the assistant; state in the `diagsessions` table.
+from answer import _fetch_document_chunks, retrieve_hierarchy  # noqa: E402
+from diag_tab import create_diagnostic_blueprint  # noqa: E402
+
+app.register_blueprint(create_diagnostic_blueprint(_table_service, {
+    "allowed_clients": lambda: _resolve_allowed_clients_for_request(),
+    "user_id": lambda: _resolve_user_id_for_request(),
+    "display_name": lambda: _resolve_display_name_for_request() or "Utilisateur",
+    "itsm_access": lambda: itsm_access_for_request(),
+    "search_token": lambda: get_search_bearer_token(),
+    "aoai": _aoai_client,
+    "load_engine_config": load_engine_config,
+    "retrieve_hierarchy": retrieve_hierarchy,
+    "fetch_document_chunks": _fetch_document_chunks,
+}))
 
 HISTORY_MAX = 30  # conversations listed in the sidebar
 
@@ -666,7 +684,8 @@ PAGE = """
       <p>Connecté via Entra ID — le client affiché ci-dessous est déterminé automatiquement par votre organisation.</p>
     </div>
   </div>
-  {% if itsm_enabled %}<a href="/itsm" style="margin-left:auto;margin-right:14px;color:var(--txt);font-size:.85rem;font-weight:600;text-decoration:none">Tickets ITSM →</a>{% endif %}
+  <a href="/diag" style="margin-left:auto;margin-right:14px;color:var(--txt);font-size:.85rem;font-weight:600;text-decoration:none">Nouvel assistant →</a>
+  {% if itsm_enabled %}<a href="/itsm" style="margin-right:14px;color:var(--txt);font-size:.85rem;font-weight:600;text-decoration:none">Tickets ITSM →</a>{% endif %}
   <div class="profile-menu">
     <button type="button" class="profile-avatar" id="profile-avatar-btn"
       title="{{ display_name }}" aria-haspopup="true" aria-expanded="false">{{ display_name | initials }}</button>
@@ -764,7 +783,7 @@ PAGE = """
               {% if t.primary_source.sourceType not in ("audio", "video") %}
               <span class="glabel-icon">📄</span> Source principale — base de connaissances
               {% else %}
-              <span class="glabel-icon">⚠️</span> Aucun document KB trouvé — réponse basée sur un appel
+              <span class="glabel-icon">⚠️</span> Aucun document KB pertinent — réponse basée sur {{ "une vidéo" if t.primary_source.sourceType == "video" else "un appel" }}
               {% endif %}
             </div>
             <div class="src-card primary {% if t.primary_source.used %}used{% endif %}">
@@ -780,8 +799,6 @@ PAGE = """
               </details>
               {% elif t.primary_source.safe_summary %}
               <div class="safe-summary">🛡️ {{ t.primary_source.safe_summary }}</div>
-              {% elif t.primary_source.sourceType in ("audio", "video") %}
-              <div class="excerpt-hidden">🔒 contenu de l'appel non affiché (confidentialité)</div>
               {% endif %}
             </div>
           </div>
@@ -813,7 +830,7 @@ PAGE = """
 
           {% if media_annexes %}
           <div class="source-group group-media-annex">
-            <div class="source-group-label"><span class="glabel-icon">🔒</span> Sources secondaires — appels &amp; vidéos</div>
+            <div class="source-group-label"><span class="glabel-icon">🎧</span> Sources secondaires — appels &amp; vidéos</div>
             {% for s in media_annexes %}
             <div class="src-card secondary {% if s.used %}used{% endif %}">
               <div class="src-card-title">
@@ -823,8 +840,6 @@ PAGE = """
               </div>
               {% if s.safe_summary %}
               <div class="safe-summary">🛡️ {{ s.safe_summary }}</div>
-              {% else %}
-              <div class="excerpt-hidden">🔒 contenu non affiché (confidentialité)</div>
               {% endif %}
             </div>
             {% endfor %}
@@ -1123,7 +1138,15 @@ def _handle(conversation_id):
     )
 
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/")
+def root():
+    # One entry point: the unified assistant (closest KB fiche shown at once, then the
+    # guided diagnostic) lives in app/diag_tab.py. The previous single-shot assistant
+    # stays reachable at /classic (and keeps its saved conversations).
+    return redirect("/diag")
+
+
+@app.route("/classic", methods=["GET", "POST"])
 def index():
     return _handle(conversation_id=None)
 

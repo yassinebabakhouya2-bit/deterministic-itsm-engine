@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestration")
 from diagnostic.contracts import (DiagnosticState, Event, FsmState, KbCandidate, OcrFinding,
                                   UserNextActionPrompt, Variable)
 from diagnostic.fsm import Ports, advance, compute_plan_sha256
+from diagnostic.ports import build_query
 
 T0 = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
 CHUNKS = {"c1": "Ouvrez Parametres puis Comptes.", "c2": "Cliquez sur Enregistrer."}
@@ -232,3 +233,63 @@ def test_input_state_is_not_mutated():
     before = s.model_dump_json()
     advance(s, ev(1), make_ports(), T0)
     assert s.model_dump_json() == before
+
+
+def _rdp_ocr(atts):
+    f = OcrFinding(image_sha256="b" * 64, kind="dialog_text", ocr_confidence=0.9, bbox=(0, 0, 0, 0),
+                   text="Connexion a : SRV01 - Chargement de la machine virtuelle", verified=False)
+    return [f], True
+
+
+def test_screenshot_only_start_reply_fills_the_asked_variable_and_no_second_screenshot_request():
+    """Real session 2026-09-30: a screenshot alone, then 'burau a distance' as the application."""
+    from diagnostic.ports import next_question
+    weak = lambda st: [cand("KB1", 1.8), cand("KB2", 1.7)]
+    p = make_ports(ocr=_rdp_ocr, retrieve=weak, next_question=next_question,
+                   extract_variables=lambda t: [])
+    r1 = advance(new_state(), ev(1, text="", att=["a.png"]), p, T0)
+    assert r1.state.state == FsmState.NEED_DIAGNOSTIC_DATA
+    assert r1.outbox[-1]["prompt"]["question_id"] == "q_application"
+    assert r1.state.ocr_findings                                  # what the screenshot says is kept
+    r2 = advance(r1.state, ev(2, "burau a distance", "reply"), p, T0)
+    app = next(v for v in r2.state.variables if v.name == "application")
+    assert app.value == "burau a distance" and app.confirmed      # the answer fills the asked variable
+    assert r2.state.state == FsmState.NEED_DIAGNOSTIC_DATA        # not escalated for "stagnation"
+    assert r2.outbox[-1]["prompt"]["question_id"] != "q_error_code"
+
+
+def test_ocr_text_feeds_variable_extraction_and_retrieval_query():
+    from diagnostic.ports import build_query
+    seen = []
+    p = make_ports(ocr=_rdp_ocr, extract_variables=lambda t: seen.append(t) or [],
+                   retrieve=lambda st: [cand("KB1", 1.8), cand("KB2", 1.7)])
+    st = advance(new_state(), ev(1, text="", att=["a.png"]), p, T0).state
+    assert any("Chargement de la machine virtuelle" in t for t in seen)
+    assert "machine virtuelle" in build_query(st)
+
+
+def test_unverified_screenshot_content_counts_as_new_evidence():
+    from diagnostic.fsm import evidence_hash
+    a = new_state()
+    b = a.model_copy(deep=True)
+    b.ocr_findings.append(_rdp_ocr([])[0][0])
+    assert evidence_hash(a) != evidence_hash(b)
+
+
+def test_one_reply_without_news_does_not_escalate_but_two_in_a_row_do():
+    from diagnostic.ports import next_question
+    weak = lambda st: [cand("KB1", 2.0), cand("KB2", 1.9)]
+    p = make_ports(retrieve=weak, next_question=next_question, extract_variables=lambda t: [])
+    st = advance(new_state(), ev(1, "Outlook ne marche pas"), p, T0).state
+    st = advance(st, ev(2, "", "reply"), p, T0).state            # nothing new
+    assert st.state == FsmState.NEED_DIAGNOSTIC_DATA and st.stagnant_turns == 1
+    st = advance(st, ev(3, "", "reply"), p, T0).state            # nothing new again
+    assert st.state == FsmState.HUMAN_ESCALATION and st.escalation_reason in ("stagnation", "no_new_question")
+
+
+def test_close_candidates_are_asked_about_before_a_screenshot():
+    from diagnostic.ports import next_question
+    st = new_state()
+    st.variables = [Variable(name="application", value="Outlook", source="user_reply", confidence=1, confirmed=True)]
+    st.candidates = [cand("KB1", 2.0), cand("KB2", 1.9)]
+    assert next_question(st).question_id.startswith("q_disc_")

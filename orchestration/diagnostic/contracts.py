@@ -57,6 +57,7 @@ class KbCandidate(Strict):
     chunk_ids: list[str] = []
     source_system: SourceSystem = "servicenow_kb"
     source_url: str = ""
+    excerpt: str = Field("", max_length=1500)   # best matching passage, shown as the illustrating source
 
 
 class TurnRecord(Strict):
@@ -105,7 +106,7 @@ class FinalExecutionPlan(Strict):
     kb_version: str
     source_system: SourceSystem
     source_url: str
-    confidence: float = Field(ge=CONF_THRESHOLD, le=1)
+    confidence: float = Field(ge=0, le=1)      # threshold enforced by the FSM (configurable)
     preconditions: list[str]
     steps: list[PlanStep] = Field(min_length=1, max_length=25)
     verification: list[str]
@@ -132,7 +133,9 @@ class DiagnosticState(Strict):
     max_turns: Literal[4] = MAX_TURNS
     ocr_failures_in_row: int = Field(0, ge=0, le=2)
     plan_failures: int = Field(0, ge=0, le=2)
+    stagnant_turns: int = Field(0, ge=0, le=MAX_TURNS + 1)
     pending_attachments: list[str] = []
+    conversation_text: str = Field("", max_length=4000)
     variables: list[Variable] = []
     required_variables: list[str] = ["application"]
     missing_variables: list[str] = []
@@ -142,6 +145,8 @@ class DiagnosticState(Strict):
     rejected_parent_ids: list[str] = []
     confidence: float = Field(0, ge=0, le=1)
     asked_question_ids: list[str] = []
+    last_question_target: Optional[str] = None
+    last_question_kind: Optional[str] = None
     seen_event_ids: list[str] = []
     history: list[TurnRecord] = []
     risk_flags: list[RiskFlag] = []

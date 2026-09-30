@@ -20,12 +20,22 @@ from .contracts import (
     KbCandidate, OcrFinding, PlanRefusal, TurnRecord, UserNextActionPrompt, Variable,
 )
 
-MARGIN_MIN = 0.6          # minimum reranker gap between first and second document
+MARGIN_MIN = 0.5          # minimum reranker gap between first and second document
 MIN_PROGRESS = 0.05       # minimum confidence gain per turn when evidence is unchanged
 RERANKER_MAX = 4.0        # Azure semantic reranker scale
 ITERATION_GUARD = 8       # hard cap on transitions per event, independent of the business budget
 OCR_MAX_FAILURES = 2
 PLAN_MAX_FAILURES = 2
+
+
+@dataclass
+class Thresholds:
+    """Calibrated on eval/ (see docs); overridable per client in engine.<client>.yaml
+    under `diagnostic:`."""
+    conf_threshold: float = CONF_THRESHOLD
+    margin_min: float = MARGIN_MIN
+    reranker_full: float = 3.0              # reranker score that counts as a full match (scale 0-4)
+    margin_full: float = 0.8                # margin that counts as a full separation
 
 
 @dataclass
@@ -38,6 +48,7 @@ class Ports:
     next_question: Callable[[DiagnosticState], Optional[UserNextActionPrompt]]
     load_chunks: Callable[[str], Dict[str, str]]       # chunk_id -> text of the selected document
     build_plan: Callable[[DiagnosticState, Dict[str, str]], dict]
+    thresholds: Thresholds = field(default_factory=Thresholds)
 
 
 @dataclass
@@ -50,7 +61,7 @@ class StepResult:
 
 def evidence_hash(st: DiagnosticState) -> str:
     facts = sorted((v.name, v.value.strip().lower()) for v in st.variables)
-    ocr = sorted(f.text for f in st.ocr_findings if f.verified)
+    ocr = sorted(f.text for f in st.ocr_findings)
     return hashlib.sha256(json.dumps([facts, ocr]).encode()).hexdigest()
 
 
@@ -68,12 +79,14 @@ def compute_missing(st: DiagnosticState) -> List[str]:
     return [r for r in st.required_variables if r not in have]
 
 
-def score_confidence(st: DiagnosticState, cands: List[KbCandidate]) -> float:
+def score_confidence(st: DiagnosticState, cands: List[KbCandidate],
+                     th: Optional["Thresholds"] = None) -> float:
     """0.5 * normalised reranker + 0.3 * margin score + 0.2 * variable coverage."""
+    th = th or Thresholds()
     if not cands:
         return 0.0
-    top = max(0.0, min(1.0, cands[0].reranker_score / RERANKER_MAX))
-    m = max(0.0, min(1.0, margin(cands) / 1.0))
+    top = max(0.0, min(1.0, cands[0].reranker_score / th.reranker_full))
+    m = max(0.0, min(1.0, margin(cands) / th.margin_full))
     req = st.required_variables
     cov = 1.0 if not req else (len(req) - len(compute_missing(st))) / len(req)
     return round(max(0.0, min(1.0, 0.5 * top + 0.3 * m + 0.2 * cov)), 4)
@@ -134,18 +147,21 @@ def _init_triage(st: DiagnosticState, p: Ports, out: List[dict]) -> None:
         key=lambda c: (-c.reranker_score, c.parent_id),
     )
     st.missing_variables = compute_missing(st)
-    st.confidence = score_confidence(st, st.candidates)
+    st.confidence = score_confidence(st, st.candidates, p.thresholds)
     h = evidence_hash(st)
     prev = st.history[-1] if st.history else None
     unchanged = prev is not None and prev.evidence_hash == h and st.turn_count > 0
     gain = (st.confidence - prev.confidence) if prev else 1.0
 
-    if st.confidence >= CONF_THRESHOLD and margin(st.candidates) >= MARGIN_MIN:
+    if st.confidence >= p.thresholds.conf_threshold and margin(st.candidates) >= p.thresholds.margin_min:
         st.selected_parent_id = st.candidates[0].parent_id
         return _record(st, before, FsmState.KB_MATCHED, None)
+    # One reply that teaches nothing is not a reason to give up: the next question is a different
+    # one (asked ids are never repeated). Two such turns in a row is.
+    st.stagnant_turns = st.stagnant_turns + 1 if (unchanged and gain < MIN_PROGRESS) else 0
     if st.turn_count >= st.max_turns:
         return escalate(st, "turn_budget", out)
-    if unchanged and gain < MIN_PROGRESS:
+    if st.stagnant_turns >= 2:
         return escalate(st, "stagnation", out)
     _record(st, before, FsmState.NEED_DIAGNOSTIC_DATA, None)
 
@@ -157,6 +173,7 @@ def _need_data(st: DiagnosticState, p: Ports, out: List[dict]) -> None:
     if q is None or q.question_id in st.asked_question_ids:
         return escalate(st, "no_new_question", out)
     st.asked_question_ids.append(q.question_id)
+    st.last_question_target, st.last_question_kind = q.target_variable, q.kind
     st.turn_count += 1
     out.append({"kind": "question", "prompt": q.model_dump()})
     _record(st, before, FsmState.NEED_DIAGNOSTIC_DATA, None, question_id=q.question_id)
@@ -174,15 +191,29 @@ def _ocr(st: DiagnosticState, p: Ports, out: List[dict]) -> None:
         if f.kind == "error_code" and f.verified:
             merge_variables(st, [Variable(name="error_code", value=f.text, source="ocr",
                                           confidence=f.ocr_confidence, confirmed=True)])
+    readable = "\n".join(f.text for f in findings
+                         if f.kind in ("dialog_title", "dialog_text", "ui_state", "error_code"))
+    if readable.strip():
+        new = [v.model_copy(update={"source": "ocr", "confirmed": False})
+               for v in p.extract_variables(readable)]
+        merge_variables(st, new)
     _record(st, before, FsmState.INIT_TRIAGE, None)
 
 
-def check_plan(raw: dict, st: DiagnosticState, chunks: Dict[str, str]) -> FinalExecutionPlan:
+def _norm(text: str) -> str:
+    return " ".join((text or "").split()).casefold()
+
+
+def check_plan(raw: dict, st: DiagnosticState, chunks: Dict[str, str],
+               th: Optional["Thresholds"] = None) -> FinalExecutionPlan:
+    th = th or Thresholds()
     """Validation that the prompt cannot guarantee: raises ValueError on any violation."""
     if raw.get("applicable") is False:
         r = PlanRefusal.model_validate(raw)
         raise ValueError("refusal:" + r.reason)
     plan = FinalExecutionPlan.model_validate(raw)
+    if plan.confidence < th.conf_threshold:
+        raise ValueError("confidence below threshold")
     if plan.kb_parent_id != st.selected_parent_id:
         raise ValueError("plan for another document")
     if plan.plan_sha256 != compute_plan_sha256(raw):
@@ -191,7 +222,7 @@ def check_plan(raw: dict, st: DiagnosticState, chunks: Dict[str, str]) -> FinalE
         text = chunks.get(s.source_chunk_id)
         if text is None:
             raise ValueError(f"unknown source_chunk_id {s.source_chunk_id}")
-        if s.verbatim_from_kb and s.instruction.strip() not in text:
+        if s.verbatim_from_kb and _norm(s.instruction) not in _norm(text):
             raise ValueError(f"step {s.order} is not verbatim")
         if s.action_type == "agent_action" and st.risk_flags:
             raise ValueError("agent_action with risk flag")
@@ -202,7 +233,7 @@ def _kb_matched(st: DiagnosticState, p: Ports, out: List[dict]) -> None:
     before = st.state
     chunks = p.load_chunks(st.selected_parent_id)
     try:
-        plan = check_plan(p.build_plan(st, chunks), st, chunks)
+        plan = check_plan(p.build_plan(st, chunks), st, chunks, p.thresholds)
     except Exception:                       # schema, citation or refusal: same handling
         st.plan_failures += 1
         if st.plan_failures >= PLAN_MAX_FAILURES or st.turn_count >= st.max_turns:
@@ -226,7 +257,17 @@ HANDLERS = {
 
 # ------------------------------------------------------------------ entry
 
+_ANSWERABLE = {"application", "os_family", "os_version", "scope", "symptom", "device_type"}
+
+
 def _ingest(st: DiagnosticState, evt: Event, p: Ports) -> None:
+    target, kind = st.last_question_target, st.last_question_kind
+    if (evt.kind == "reply" and evt.text.strip() and target in _ANSWERABLE
+            and kind in ("free_text_short", "choose_one", "confirm_value") and len(evt.text.strip()) <= 120):
+        merge_variables(st, [Variable(name=target, value=evt.text.strip()[:256], source="user_reply",
+                                      confidence=1.0, confirmed=True)])
+    if evt.kind == "reply":
+        st.last_question_target = st.last_question_kind = None
     if evt.text:
         src = "user_reply" if evt.kind == "reply" else "ticket_text"
         new = []
@@ -235,6 +276,8 @@ def _ingest(st: DiagnosticState, evt: Event, p: Ports) -> None:
                 v = v.model_copy(update={"source": src, "confirmed": v.confirmed or evt.kind == "reply"})
             new.append(v)
         merge_variables(st, new)
+    if evt.text:
+        st.conversation_text = (st.conversation_text + "\n" + evt.text).strip()[-4000:]
     st.pending_attachments = list(evt.attachments)
 
 
