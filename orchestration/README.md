@@ -12,7 +12,7 @@ as of 2026-09-10, it does not support Structured Outputs (`response_format:
 json_schema`) — only direct Chat Completions / Responses API calls on an Azure OpenAI
 deployment do. A reliable, schema-enforced answer (no hallucinated shape, an explicit
 `ambiguous` flag instead of guessing) was the explicit priority for this milestone, so
-this module calls the `aif-knowledgeengine2-v9` deployment directly instead.
+this module calls the `aif-knowledgeengine3-v9` deployment directly instead.
 
 Prompt Flow and Foundry's visual Workflows were also ruled out: both are being retired
 (Prompt Flow 2027-04-20, Workflows 2026-12-01) — see project memory
@@ -66,3 +66,11 @@ path they were validated with in Jalon 3, untouched.
 `answer_query_core()` from this module instead of duplicating retrieval/generation
 (axiom A4) — it fetches admin keys once and reuses this module, it does not have its
 own `retrieve()`/`answer()` anymore.
+
+## Diagnostic engine (orchestration/diagnostic/)
+
+Deterministic diagnostic state machine (brick 1, no LLM, not yet wired to the app).
+`contracts.py` = Pydantic contracts, `fsm.py` = pure transitions with injected ports
+(extraction, risks, retrieval, OCR, question, chunk loading, plan drafting).
+Tests: `python -m pytest tests/test_diagnostic_fsm.py` (needs `pydantic`, `pytest`).
+Design: see the architecture document "Architecture - Agentic RAG diagnostic ITSM".
