@@ -2,3 +2,5 @@ openai
 requests
 PyYAML
 azure-identity
+
+pydantic
