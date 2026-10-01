@@ -1,0 +1,22 @@
+{
+  "name": "demo-standard",
+  "_comment": "Synthetic decisions of a retrieval engine that always shows its first fiche.",
+  "decisions": {
+    "clienta/D-001": {"kind": "fiche", "fiches": ["KB0010001", "KB0010009"], "score": 2.9, "usage": {"search_calls": 1}},
+    "clienta/D-002": {"kind": "fiche", "fiches": ["KB0010008", "KB0010002"], "score": 1.4, "usage": {"search_calls": 1}},
+    "clienta/D-003": {"kind": "fiche", "fiches": ["KB0010013", "KB0010003"], "score": 2.2, "usage": {"search_calls": 1}},
+    "clienta/D-004": {"kind": "fiche", "fiches": ["KB0010004"], "score": 0.9, "usage": {"search_calls": 1}},
+    "clienta/D-005": [
+      {"kind": "fiche", "fiches": ["KB0010005", "KB0010007"], "score": 2.1, "usage": {"search_calls": 1}},
+      {"kind": "fiche", "fiches": ["KB0010007", "KB0010005"], "score": 2.0, "usage": {"search_calls": 1}}
+    ],
+    "clienta/D-006": {"kind": "fiche", "fiches": ["KB0010006"], "score": 3.1, "usage": {"search_calls": 1}},
+    "clienta/D-007": {"kind": "fiche", "fiches": ["KB0010011"], "score": 1.8, "usage": {"search_calls": 1}}
+  },
+  "candidates": {
+    "clienta/D-007": [
+      {"id": "KB0010011", "title": "Excel crashes on start-up"},
+      {"id": "KB0010012", "title": "Map a shared network drive"}
+    ]
+  }
+}
