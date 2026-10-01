@@ -1,0 +1,201 @@
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestration"))
+
+from guide.contracts import Event, GuideState, KbCandidate, Phase
+from guide.fsm import Ports, Thresholds, advance, check_guide, fallback_guide
+
+T0 = datetime(2026, 9, 30, tzinfo=timezone.utc)
+CHUNKS = {"k1_0": "1. Ouvrez Parametres.\n2. Cliquez sur Comptes.\n3. Choisissez Reinitialiser.",
+          "k1_1": "4. Redemarrez le poste."}
+
+
+def cand(pid, score, title=None):
+    return KbCandidate(parent_id=pid, title=title or pid, reranker_score=score, excerpt=f"texte {pid}")
+
+
+def draft(n=3, applicable=True):
+    return {"applicable": applicable, "reason": "", "summary": "Cette fiche explique X.", "preconditions": [],
+            "steps": [{"title": f"Etape {i}", "instruction": ["Ouvrez Parametres.", "Cliquez sur Comptes.", "Choisissez Reinitialiser."][i - 1] if i <= 3 else "Redemarrez le poste.",
+                       "source_chunk_id": "k1_0" if i <= 3 else "k1_1", "verbatim_from_kb": True} for i in range(1, n + 1)],
+            "verification": ["Le probleme a disparu."]}
+
+
+def ports(cands=None, judge=None, build=None, help_=None, **kw):
+    cands = cands if cands is not None else [cand("A", 3.5), cand("B", 1.0)]
+    return Ports(
+        extract_variables=lambda t: [], detect_risks=lambda st: [], retrieve=lambda st: list(cands),
+        ocr=lambda refs: ([], False), judge=judge or (lambda st, c: None), load_chunks=lambda pid: dict(CHUNKS),
+        build_guide=build or (lambda st, c, ch: draft()),
+        help_step=help_ or (lambda st, step, ch, t: {"text": "aide:" + t, "found_in_kb": True, "source_chunk_id": "k1_0"}),
+        thresholds=kw.get("th", Thresholds()))
+
+
+def new():
+    return GuideState(session_id="s1", client_id="c", created_utc=T0)
+
+
+_n = [0]
+
+
+def ev(text="", action=None, kind="reply", att=()):
+    _n[0] += 1
+    return Event(event_id=f"e{_n[0]}", kind=kind, text=text, action=action, attachments=list(att))
+
+
+def test_strong_match_goes_straight_to_the_guide_with_first_step():
+    r = advance(new(), ev("reset mot de passe", kind="created"), ports(), T0)
+    assert r.state.phase == Phase.GUIDING and r.state.guide.parent_id == "A"
+    assert [m["kind"] for m in r.outbox] == ["guide", "step"]
+    assert len(r.state.guide.steps) == 3 and r.state.guide.guide_sha256
+
+
+def test_ambiguous_match_asks_to_choose_and_pick_starts_the_guide():
+    p = ports([cand("A", 2.2), cand("B", 2.1), cand("C", 1.0)])
+    r1 = advance(new(), ev("probleme", kind="created"), p, T0)
+    assert r1.state.phase == Phase.LOCATE and [c.parent_id for c in r1.state.choices] == ["A", "B", "C"]
+    r2 = advance(r1.state, ev(action="pick:2"), p, T0)
+    assert r2.state.phase == Phase.GUIDING and r2.state.guide.parent_id == "B"
+    assert r2.state.choices == []
+
+
+def test_judge_can_break_a_tie_but_not_override_a_strong_match():
+    tie = ports([cand("A", 2.2), cand("B", 2.1)], judge=lambda st, c: "B")
+    assert advance(new(), ev("x", kind="created"), tie, T0).state.guide.parent_id == "B"
+    strong = ports([cand("A", 3.5), cand("B", 1.0)], judge=lambda st, c: "B")
+    r = advance(new(), ev("x", kind="created"), strong, T0)
+    assert r.state.phase == Phase.LOCATE                       # disagreement -> the user decides
+
+
+def test_unanswered_clarifications_end_with_best_fiche_marked_approximate():
+    p = ports([cand("A", 1.5), cand("B", 1.4)])
+    st = advance(new(), ev("a", kind="created"), p, T0).state
+    st = advance(st, ev("b"), p, T0).state
+    r = advance(st, ev("c"), p, T0)
+    assert r.state.phase == Phase.GUIDING and r.state.guide.approximate
+    assert r.outbox[0]["kind"] == "notice"
+
+
+def test_walkthrough_done_back_and_solved():
+    p = ports()
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    for i in range(3):
+        r = advance(st, ev(action="done"), p, T0)
+        st = r.state
+    assert st.current_step == 3 and r.outbox[-1]["kind"] == "verify"
+    st = advance(st, ev(action="back"), p, T0).state
+    assert st.current_step == 2
+    st = advance(st, ev(action="done"), p, T0).state
+    r = advance(st, ev(action="solved_yes"), p, T0)
+    assert r.state.phase == Phase.SOLVED and r.outbox[-1]["kind"] == "done"
+    again = advance(r.state, ev(action="done"), p, T0)            # closed: nothing moves
+    assert again.outbox == [] and again.state.phase == Phase.SOLVED
+
+
+def test_blocked_step_gets_help_from_the_fiche_and_offers_other_fiche_after_two_tries():
+    p = ports()
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    r1 = advance(st, ev("je ne vois pas Comptes"), p, T0)
+    assert r1.outbox[0]["kind"] == "help" and "je ne vois pas Comptes" in r1.outbox[0]["text"]
+    assert not r1.outbox[0]["offer_other"] and r1.state.current_step == 0
+    r2 = advance(r1.state, ev(action="blocked"), p, T0)
+    assert r2.outbox[0]["offer_other"] and r2.state.phase == Phase.GUIDING
+
+
+def test_explain_does_not_count_as_a_failed_attempt():
+    p = ports()
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    r = advance(st, ev(action="explain"), p, T0)
+    assert r.state.step_attempts == 0 and r.outbox[0]["kind"] == "help"
+
+
+def test_wrong_fiche_proposes_others_and_never_the_rejected_one():
+    p = ports([cand("A", 3.5), cand("B", 2.0), cand("C", 1.5)])
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    r = advance(st, ev(action="wrong_fiche"), p, T0)
+    assert r.state.phase == Phase.LOCATE and "A" in r.state.rejected_parent_ids
+    assert [c.parent_id for c in r.state.choices] == ["B", "C"]
+
+
+def test_problem_persists_moves_to_next_fiche_and_runs_out_without_escalating():
+    p = ports([cand("A", 3.5)])
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    for _ in range(3):
+        st = advance(st, ev(action="done"), p, T0).state
+    r = advance(st, ev(action="solved_no"), p, T0)
+    assert r.state.phase == Phase.STUCK and r.outbox[-1]["level"] == "stuck"
+    # a new description reopens the search, with the rejected list reset
+    r2 = advance(r.state, ev("autre description"), p, T0)
+    assert r2.state.phase == Phase.GUIDING
+
+
+def test_model_refusal_skips_to_next_fiche_but_a_user_pick_is_never_refused():
+    def build(st, c, ch):
+        return draft(applicable=False) if c.parent_id == "A" else draft()
+    p = ports([cand("A", 3.5), cand("B", 3.0)], build=build)
+    r = advance(new(), ev("x", kind="created"), p, T0)
+    assert r.state.guide.parent_id == "B" and "A" in r.state.rejected_parent_ids
+    p2 = ports([cand("A", 2.2), cand("B", 2.1)], build=lambda st, c, ch: draft(applicable=False))
+    st = advance(new(), ev("x", kind="created"), p2, T0).state
+    r2 = advance(st, ev(action="pick:1"), p2, T0)
+    assert r2.state.phase == Phase.GUIDING and r2.state.guide.origin == "fallback"
+
+
+def test_unusable_draft_falls_back_to_the_fiche_own_numbered_lines():
+    p = ports(build=lambda st, c, ch: {"applicable": True, "summary": "", "preconditions": [], "verification": [],
+                                       "steps": [{"title": "t", "instruction": "x", "source_chunk_id": "ghost", "verbatim_from_kb": False}]})
+    r = advance(new(), ev("x", kind="created"), p, T0)
+    g = r.state.guide
+    assert g.origin == "fallback" and [s.instruction for s in g.steps][:2] == ["Ouvrez Parametres.", "Cliquez sur Comptes."]
+    assert len(g.steps) == 4
+
+
+def test_check_guide_downgrades_false_verbatim_and_rejects_ghost_chunks():
+    d = draft()
+    d["steps"][0]["instruction"] = "Ouvrez les Parametres rapidement."
+    g = check_guide(d, CHUNKS)
+    assert g["steps"][0]["verbatim_from_kb"] is False and g["steps"][1]["verbatim_from_kb"] is True
+    d["steps"][1]["source_chunk_id"] = "nope"
+    assert check_guide(d, CHUNKS) is None
+
+
+def test_no_candidate_waits_instead_of_escalating():
+    r = advance(new(), ev("x", kind="created"), ports(cands=[]), T0)
+    assert r.state.phase == Phase.STUCK and r.state.phase != Phase.SOLVED
+
+
+def test_same_event_is_idempotent_and_empty_events_do_nothing():
+    p = ports()
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    e = ev(action="done")
+    a = advance(st, e, p, T0)
+    b = advance(a.state, e, p, T0)
+    assert b.outbox == [] and b.state.current_step == 1
+    assert advance(a.state, ev(), p, T0).outbox == []
+
+
+def test_input_state_is_never_mutated():
+    p = ports()
+    st = new()
+    before = st.model_dump_json()
+    advance(st, ev("x", kind="created"), p, T0)
+    assert st.model_dump_json() == before
+
+
+def test_replay_is_deterministic():
+    def run():
+        p = ports([cand("A", 2.2), cand("B", 2.1)])
+        st = new()
+        for e in [Event(event_id="1", kind="created", text="x"), Event(event_id="2", kind="reply", action="pick:1"),
+                  Event(event_id="3", kind="reply", action="done")]:
+            st = advance(st, e, p, T0).state
+        return st.model_dump_json()
+    assert run() == run()
+
+
+def test_invalid_action_is_rejected():
+    import pytest
+    with pytest.raises(Exception):
+        Event(event_id="1", kind="reply", action="escalate")

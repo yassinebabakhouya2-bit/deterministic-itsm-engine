@@ -203,8 +203,8 @@ from itsm import create_itsm_blueprint, itsm_access_for_request  # noqa: E402
 
 app.register_blueprint(create_itsm_blueprint(_table_service, _credential))
 
-# Diagnostic tab (deterministic agentic RAG, orchestration/diagnostic/): guided
-# diagnosis with bounded questions, screenshot reading, plan or human escalation.
+# Assistant tab (deterministic guided resolution, orchestration/guide/): exact fiche,
+# step summary, step-by-step walkthrough with fiche-grounded help, no escalation.
 # Same client resolution as the assistant; state in the `diagsessions` table.
 from answer import _fetch_document_chunks, retrieve_hierarchy  # noqa: E402
 from diag_tab import create_diagnostic_blueprint  # noqa: E402
