@@ -1,0 +1,12 @@
+{
+  "name": "demo-careful",
+  "_comment": "Synthetic decisions of an engine that abstains or asks when unsure.",
+  "decisions": {
+    "clienta/D-001": {"kind": "fiche", "fiches": ["KB0010001"], "score": 0.93, "usage": {"input_tokens": 8100, "output_tokens": 870, "search_calls": 2}},
+    "clienta/D-002": {"kind": "question", "fiches": ["KB0010002", "KB0010008"], "question": "Does the drop happen on Wi-Fi only?", "usage": {"input_tokens": 7900, "output_tokens": 640, "search_calls": 2}},
+    "clienta/D-003": {"kind": "fiche", "fiches": ["KB0010003"], "score": 0.88, "usage": {"input_tokens": 8300, "output_tokens": 900, "search_calls": 2}},
+    "clienta/D-004": {"kind": "abstain", "usage": {"input_tokens": 6000, "output_tokens": 200, "search_calls": 2}},
+    "clienta/D-005": {"kind": "fiche", "fiches": ["KB0010005"], "score": 0.81, "usage": {"input_tokens": 8000, "output_tokens": 850, "search_calls": 2}},
+    "clienta/D-006": {"kind": "fiche", "fiches": ["KB0010006"], "score": 0.97, "usage": {"input_tokens": 8200, "output_tokens": 880, "search_calls": 2}}
+  }
+}

@@ -1,0 +1,7 @@
+{"ticket_id": "D-001", "client": "clienta", "text": "Outlook does not start since the last update: it freezes on the loading screen.", "expected": ["KB0010001"]}
+{"ticket_id": "D-002", "client": "clienta", "text": "The VPN drops every ten minutes when working from home.", "expected": ["KB0010002"]}
+{"ticket_id": "D-003", "client": "clienta", "text": "The printer on floor 2 reports a paper jam but no paper is stuck.", "expected": ["KB0010003", "KB0010013"]}
+{"ticket_id": "D-004", "client": "clienta", "text": "Request for a second monitor for a new hire.", "expected": []}
+{"ticket_id": "D-005", "client": "clienta", "text": "The Teams camera stays black during meetings.", "expected": ["KB0010005"]}
+{"ticket_id": "D-006", "client": "clienta", "text": "Password expired and the account is now locked.", "expected": ["KB0010006"]}
+{"ticket_id": "D-007", "client": "clienta", "text": "Excel crashes when opening a file from the shared drive."}
