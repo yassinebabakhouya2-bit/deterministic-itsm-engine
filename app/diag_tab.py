@@ -4,12 +4,12 @@
 # Routes:
 #   GET  /diag                     list of my sessions + new diagnostic form
 #   POST /diag/new                 start a session (text and/or screenshot)
-#   GET  /diag/s/<id>              session timeline, current question / plan / escalation
-#   POST /diag/s/<id>/reply        answer the question (text, choice, screenshot)
+#   GET  /diag/s/<id>              fiche choice, step summary, current step, help
+#   POST /diag/s/<id>/reply        action (done/blocked/...), text and/or screenshot
 #   POST /api/servicenow/webhook   ServiceNow ticket event (HMAC signed, JSON in / JSON out)
-#   POST /diag/internal/sweep      escalate sessions whose reply deadline passed (HMAC signed)
+#   POST /diag/internal/sweep      no-op kept for compatibility (HMAC signed)
 #
-# The engine itself lives in orchestration/diagnostic/ (pure FSM + ports). This
+# The engine itself lives in orchestration/guide/ (pure FSM + ports). This
 # module only does access control, form handling and rendering.
 #
 # Security rules, enforced server-side:
@@ -26,45 +26,26 @@
 # =====================================================================
 import hashlib
 import hmac
+import html as _html
 import json
 import os
+import re
 import time
 from urllib.parse import urlparse
 
 from flask import Blueprint, abort, jsonify, redirect, render_template_string, request, url_for
 
-from diagnostic.contracts import FsmState
-from diagnostic.fsm import Thresholds
-from diagnostic.ports import build_ports
-from diagnostic.service import Conflict, DiagnosticService, NotFound, SESSION_ID_RE, TableStore
+from guide.contracts import ACTION_RE
+from guide.fsm import Thresholds
+from guide.ports import build_ports
+from guide.service import Conflict, GuideService, NotFound, SESSION_ID_RE, TableStore
+from guide.textutil import kb_text
 
 TABLE = "diagsessions"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_MIMES = {"image/png", "image/jpeg", "image/webp"}
-STATE_LABELS = {
-    "INIT_TRIAGE": "Analyse", "NEED_DIAGNOSTIC_DATA": "En attente de votre réponse",
-    "OCR_PROCESSING": "Lecture de la capture", "KB_MATCHED": "Fiche identifiée",
-    "ACTION_PROPOSED": "Plan proposé", "HUMAN_ESCALATION": "Escalade humaine",
-}
-ESCALATION_LABELS = {
-    "turn_budget": "Nombre maximal de questions atteint",
-    "stagnation": "Les réponses n'apportent plus d'information nouvelle",
-    "no_new_question": "Plus aucune question utile à poser",
-    "ocr_unreadable": "Captures illisibles",
-    "plan_invalid": "Aucun plan fiable n'a pu être produit à partir de la fiche",
-    "deadline": "Délai dépassé", "reply_timeout": "Pas de réponse dans le délai",
-    "iteration_guard": "Garde-fou technique",
-}
-
-
-def _label_reason(reason):
-    if not reason:
-        return ""
-    if reason.startswith("risk:"):
-        return "Sujet sensible (" + reason[5:] + ") : traitement humain obligatoire"
-    if reason.startswith("technical_error"):
-        return "Erreur technique : " + reason.split(":", 1)[-1]
-    return ESCALATION_LABELS.get(reason, reason)
+STATE_LABELS = {"LOCATE": "Recherche de la fiche", "GUIDING": "Résolution guidée",
+                "SOLVED": "Résolu", "STUCK": "En attente d'une nouvelle description"}
 
 
 def _same_origin():
@@ -88,6 +69,7 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
     """deps: allowed_clients(), user_id(), display_name(), itsm_access(), search_token(),
     aoai, load_engine_config, retrieve_hierarchy, fetch_document_chunks."""
     bp = Blueprint("diag", __name__)
+    bp.add_app_template_filter(kb_text, "kb_text")
     if store is None:
         try:
             table_service.create_table(TABLE)
@@ -112,7 +94,7 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         return build_ports(aoai=deps["aoai"], model=gen["model"], seed=gen["seed"], search_docs=search_docs,
                            fetch_chunks=fetch_chunks, images=images, thresholds=th)
 
-    service = DiagnosticService(store, ports_factory)
+    service = GuideService(store, ports_factory)
 
     # ------------------------------------------------------------ helpers
     def _clients():
@@ -189,7 +171,7 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         if not _can_see(view):
             abort(404)
         return render_template_string(PAGE, view="session", s=view, states=STATE_LABELS,
-                                      reason_label=_label_reason, display_name=deps["display_name"](),
+                                      display_name=deps["display_name"](),
                                       error=request.args.get("error"))
 
     @bp.route("/diag/s/<session_id>/reply", methods=["POST"])
@@ -205,14 +187,17 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         if not _can_see(view):
             abort(404)
         text = (request.form.get("text") or "").strip()
+        action = (request.form.get("action") or "").strip() or None
+        if action is not None and not ACTION_RE.match(action):
+            abort(400)
         images = _images()
-        if not text and not images:
+        if action is None and not text and not images:
             return redirect(url_for("diag.session", client_id=client_id, session_id=session_id))
         err = None
         for _ in range(2):                              # one retry on a concurrent writer
             try:
                 service.reply(client_id=client_id, session_id=session_id, text=text[:4000],
-                              images=images, event_id=request.form.get("event_id") or None)
+                              images=images, action=action, event_id=request.form.get("event_id") or None)
                 err = None
                 break
             except Conflict:
@@ -251,14 +236,14 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
                                  text=text[:4000], ticket_id=number, session_id=sid, event_id=event_id)
         except Conflict:
             abort(409)
-        return jsonify({k: view[k] for k in ("session_id", "state", "terminal", "turn", "confidence",
-                                             "escalation_reason", "outbox", "plan")})
+        return jsonify({k: view[k] for k in ("session_id", "state", "terminal", "guide", "current_step",
+                                             "outbox")})
 
     @bp.route("/diag/internal/sweep", methods=["POST"])
     def sweep():
         _signed_body()
         client_id = os.environ.get("DIAG_WEBHOOK_CLIENT", "")
-        return jsonify({"escalated": service.sweep(client_id) if client_id else 0})
+        return jsonify({"swept": service.sweep(client_id) if client_id else 0})
 
     bp.service = service
     return bp
@@ -270,22 +255,30 @@ PAGE = """<!doctype html>
 <style>
 :root{--bg:#faf7f2;--card:#fff;--txt:#2b2620;--mut:#7a6f62;--acc:#d9622b;--line:#e7dfd3;--ok:#2f7d4f;--warn:#b7791f;--bad:#b83b3b}
 @media (prefers-color-scheme:dark){:root{--bg:#1b1815;--card:#252019;--txt:#efe8dc;--mut:#a79a8a;--line:#3a3329}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.5 system-ui,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.55 system-ui,sans-serif}
 header{display:flex;align-items:center;gap:18px;padding:14px 24px;border-bottom:1px solid var(--line)}
 header h1{font-size:1.05rem;margin:0}header a{color:var(--txt);text-decoration:none;font-weight:600;font-size:.88rem}
-header a.cur{border-bottom:2px solid var(--acc)}main{max-width:860px;margin:24px auto;padding:0 16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:14px}
-textarea{width:100%;min-height:110px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--txt);font:inherit}
+header a.cur{border-bottom:2px solid var(--acc)}main{max-width:820px;margin:24px auto;padding:0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+textarea{width:100%;min-height:80px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--txt);font:inherit}
 select,input[type=file]{font:inherit;color:var(--txt)}
-button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 16px;font:inherit;font-weight:600;cursor:pointer}
+button{background:var(--acc);color:#fff;border:0;border-radius:9px;padding:9px 18px;font:inherit;font-weight:600;cursor:pointer}
 button.alt{background:transparent;color:var(--txt);border:1px solid var(--line)}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+button.ok{background:var(--ok)}button.lnk{background:none;color:var(--mut);padding:4px 8px;font-weight:400;font-size:.85rem;text-decoration:underline}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:.78rem;font-weight:700;background:var(--line)}
-.b-ACTION_PROPOSED{background:#dff1e5;color:var(--ok)}.b-HUMAN_ESCALATION{background:#f6dede;color:var(--bad)}
-.b-NEED_DIAGNOSTIC_DATA{background:#fbeccc;color:var(--warn)}
+.b-SOLVED{background:#dff1e5;color:var(--ok)}.b-GUIDING{background:#fbeccc;color:var(--warn)}.b-STUCK{background:#f6dede;color:var(--bad)}
 .mut{color:var(--mut);font-size:.85rem}.err{color:var(--bad);font-weight:600}
-.msg-user{border-left:3px solid var(--acc)}.msg-asst{border-left:3px solid var(--line)}
-ol.steps li{margin:6px 0}table{width:100%;border-collapse:collapse}td{padding:8px 4px;border-bottom:1px solid var(--line)}
+.warn{background:#fbeccc;color:#6b4a0a;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:.9rem}
+.bar{height:6px;background:var(--line);border-radius:99px;overflow:hidden;margin:10px 0 4px}.bar i{display:block;height:100%;background:var(--acc)}
+ol.st{list-style:none;padding:0;margin:12px 0 0}ol.st li{display:flex;gap:10px;padding:7px 10px;border-radius:9px;align-items:flex-start}
+ol.st li .n{flex:none;width:24px;height:24px;border-radius:50%;background:var(--line);display:flex;align-items:center;justify-content:center;font-size:.78rem;font-weight:700}
+ol.st li.done{color:var(--mut)}ol.st li.done .n{background:var(--ok);color:#fff}
+ol.st li.cur{background:rgba(217,98,43,.10);font-weight:600}ol.st li.cur .n{background:var(--acc);color:#fff}
+.step h2{font-size:1.15rem;margin:2px 0 8px}.step .ins{font-size:1.02rem;white-space:pre-wrap}
+.msg{border-left:3px solid var(--line);padding:6px 12px;margin:8px 0}.msg.u{border-color:var(--acc)}.msg.h{border-color:var(--ok);background:rgba(47,125,79,.06)}
+.pick{display:block;width:100%;text-align:left;margin-top:10px;padding:12px 14px}
+table{width:100%;border-collapse:collapse}td{padding:8px 4px;border-bottom:1px solid var(--line)}
 a.l{color:var(--acc);text-decoration:none}
 </style></head><body>
 <header><h1>KnowledgeEngine v9</h1>
@@ -297,13 +290,13 @@ a.l{color:var(--acc);text-decoration:none}
 
 {% if view == "home" %}
 <div class="card"><b>Décrivez votre problème</b>
-<p class="mut">Collez le texte du problème et/ou joignez une capture d'écran. Vous voyez tout de suite la fiche de la base de connaissances la plus proche, puis l'assistant pose au plus 4 questions ciblées pour confirmer la bonne procédure, ou transmet à un humain avec tout ce qui a été appris.</p>
+<p class="mut">Collez le texte du problème et/ou joignez une capture d'écran. L'assistant trouve la fiche exacte, vous montre un résumé des étapes, puis vous accompagne étape par étape jusqu'à la résolution.</p>
 <form method="post" action="/diag/new" enctype="multipart/form-data">
 {% if clients|length > 1 %}<select name="client_id">{% for c in clients %}<option value="{{ c }}" {{ 'selected' if c==client_id }}>{{ c }}</option>{% endfor %}</select>
 {% else %}<input type="hidden" name="client_id" value="{{ client_id }}">{% endif %}
-<textarea name="text" placeholder="Décrivez le problème, collez le message d'erreur…"></textarea>
+<textarea name="text" style="min-height:110px" placeholder="Décrivez le problème, collez le message d'erreur…"></textarea>
 <div class="row"><input type="file" name="screenshot" accept="image/png,image/jpeg,image/webp" multiple>
-<button type="submit">Rechercher</button></div></form></div>
+<button type="submit">Trouver la solution</button></div></form></div>
 <div class="card"><b>Conversations récentes</b>
 {% if rows %}<table>{% for r in rows %}<tr>
 <td><a class="l" href="/diag/s/{{ r.session_id }}?client_id={{ client_id }}">{{ r.title or r.session_id }}</a>
@@ -312,47 +305,79 @@ a.l{color:var(--acc);text-decoration:none}
 {% else %}<p class="mut">Aucune session.</p>{% endif %}</div>
 
 {% else %}
+{% set g = s.guide %}
 <p><a class="l" href="/diag?client_id={{ s.client_id }}">← Conversations</a></p>
-<div class="card"><span class="badge b-{{ s.state }}">{{ states.get(s.state, s.state) }}</span>
-<span class="mut"> · tour {{ s.turn }}/4 · confiance {{ (s.confidence * 100)|round|int }} %{% if s.ticket_id %} · ticket {{ s.ticket_id }}{% endif %}</span></div>
+<div class="card" style="padding:12px 18px"><span class="badge b-{{ s.state }}">{{ states.get(s.state, s.state) }}</span>
+<span class="mut">{% if s.ticket_id %} · ticket {{ s.ticket_id }}{% endif %}</span></div>
 
-{% if s.candidates and s.state != 'ACTION_PROPOSED' %}
-{% set c0 = s.candidates[0] %}
-<div class="card" style="border-left:3px solid var(--acc)">
-<div class="mut">📄 Fiche la plus proche — à confirmer par le diagnostic
- · correspondance {{ 'forte' if c0.reranker_score >= 2.5 else ('moyenne' if c0.reranker_score >= 1.5 else 'faible') }}</div>
-<b>{{ c0.title }}</b>
-{% if c0.excerpt %}<details style="margin-top:6px"><summary class="mut" style="cursor:pointer">▸ voir l'extrait</summary>
-<div style="white-space:pre-wrap;margin-top:6px">{{ c0.excerpt }}</div></details>{% endif %}
-{% if s.candidates|length > 1 %}<div class="mut" style="margin-top:8px">Autres pistes : {% for c in s.candidates[1:] %}{{ c.title }}{{ ' · ' if not loop.last }}{% endfor %}</div>{% endif %}
+{% if s.risk_flags %}<div class="warn">⚠ Sujet sensible ({{ s.risk_flags|join(', ') }}) : suivez la fiche à la lettre et ne sautez aucune étape.</div>{% endif %}
+
+{% if g %}
+{% set n = g.steps|length %}{% set cur = s.current_step %}
+<div class="card">
+<div class="mut">📄 Fiche {{ 'la plus proche' if g.approximate else 'identifiée' }}{% if g.origin == 'fallback' %} · résumé automatique{% endif %}</div>
+<h2 style="margin:4px 0 6px;font-size:1.2rem">{{ g.title }}</h2>
+{% if g.summary %}<div>{{ g.summary }}</div>{% endif %}
+{% if g.approximate %}<div class="mut" style="margin-top:6px">Je n'ai pas pu confirmer que c'est exactement la bonne fiche : dites-le-moi si elle ne correspond pas.</div>{% endif %}
+{% if g.preconditions %}<p class="mut" style="margin:10px 0 0"><b>Avant de commencer :</b> {{ g.preconditions|join(' · ') }}</p>{% endif %}
+<div class="bar"><i style="width:{{ (100 * [cur, n]|min / n)|round|int }}%"></i></div>
+<div class="mut">{{ [cur, n]|min }} / {{ n }} étapes faites</div>
+<ol class="st">{% for st in g.steps %}<li class="{{ 'done' if loop.index0 < cur else ('cur' if loop.index0 == cur else '') }}">
+<span class="n">{{ '✓' if loop.index0 < cur else loop.index }}</span><span>{{ st.title }}</span></li>{% endfor %}</ol>
+{% if g.source_url %}<div class="mut" style="margin-top:8px">Source : <a class="l" href="{{ g.source_url }}" rel="noopener noreferrer">ouvrir la fiche</a></div>{% endif %}
 </div>
 {% endif %}
 
 {% for m in s.messages %}
-{% if m.role == 'user' %}<div class="card msg-user"><div class="mut">Vous{% if m.images %} · {{ m.images }} capture(s){% endif %}</div>{{ m.text }}</div>
-{% elif m.kind == 'question' %}<div class="card msg-asst"><div class="mut">Question</div>{{ m.prompt.text_fr }}
-<div class="mut">{{ m.prompt.why_needed }}</div></div>
-{% elif m.kind == 'plan' %}<div class="card msg-asst"><div class="mut">Procédure — {{ m.plan.kb_title }}</div>
-{% if m.plan.preconditions %}<p><b>Prérequis</b></p><ul>{% for x in m.plan.preconditions %}<li>{{ x }}</li>{% endfor %}</ul>{% endif %}
-<ol class="steps">{% for st in m.plan.steps %}<li>{{ st.instruction }}</li>{% endfor %}</ol>
-{% if m.plan.verification %}<p><b>Pour vérifier</b></p><ul>{% for x in m.plan.verification %}<li>{{ x }}</li>{% endfor %}</ul>{% endif %}
-<div class="mut">Source : {{ m.plan.kb_title }}{% if m.plan.source_url %} · <a class="l" href="{{ m.plan.source_url }}" rel="noopener noreferrer">ouvrir</a>{% endif %}</div></div>
-{% elif m.kind == 'escalation' %}<div class="card msg-asst"><div class="mut">Transmis à un humain</div>
-<b>{{ reason_label(m.reason) }}</b>
-<p class="mut">Vous pouvez aussi poser la question dans l'<a class="l" href="/classic">assistant classique</a>.</p>
-{% if m.dossier and m.dossier.variables %}<p class="mut">Éléments recueillis : {% for v in m.dossier.variables %}{{ v.name }} = {{ v.value }}{{ ', ' if not loop.last }}{% endfor %}</p>{% endif %}</div>
-{% endif %}{% endfor %}
+{% if m.role == 'user' %}<div class="msg u"><span class="mut">Vous{% if m.images %} · {{ m.images }} capture(s){% endif %}</span><br>{{ m.text }}</div>
+{% elif m.kind == 'help' %}<div class="msg h"><span class="mut">Aide · étape {{ m.step }}</span><br><div style="white-space:pre-wrap">{{ m.text }}</div></div>
+{% elif m.kind == 'notice' %}<div class="msg"><span class="mut">{{ m.text }}</span></div>
+{% elif m.kind == 'done' %}{% endif %}{% endfor %}
 
-{% if not s.terminal %}
-{% set q = (s.messages | selectattr('kind','equalto','question') | list | last) %}
-<div class="card"><form method="post" action="/diag/s/{{ s.session_id }}/reply" enctype="multipart/form-data">
+{% if s.state == 'SOLVED' %}
+<div class="card" style="border-left:4px solid var(--ok)"><b>✅ Problème résolu</b>
+<p class="mut" style="margin:6px 0 0">Bravo. Vous pouvez démarrer une nouvelle recherche depuis la page des conversations.</p></div>
+
+{% else %}
+<form method="post" action="/diag/s/{{ s.session_id }}/reply" enctype="multipart/form-data">
 <input type="hidden" name="client_id" value="{{ s.client_id }}">
-{% if q and q.prompt.options %}<div class="row">{% for o in q.prompt.options %}
-<button class="alt" type="submit" name="text" value="{{ o.label }}">{{ o.label }}</button>{% endfor %}</div>
-<p class="mut">ou répondez librement :</p>{% endif %}
-<textarea name="text" placeholder="Votre réponse…"></textarea>
+
+{% if s.state == 'LOCATE' and s.choices %}
+<div class="card"><b>Quelle fiche correspond à votre problème ?</b>
+<div class="mut">Choisissez-en une : je vous montre aussitôt les étapes.</div>
+{% for c in s.choices %}<button class="alt pick" type="submit" name="action" value="pick:{{ loop.index }}">
+<b>{{ c.title }}</b><br><span class="mut">correspondance {{ 'forte' if c.score >= 2.5 else ('moyenne' if c.score >= 1.5 else 'faible') }}</span></button>
+{% if s.candidates and loop.index0 < s.candidates|length and s.candidates[loop.index0].excerpt %}
+<details><summary class="mut" style="cursor:pointer;padding:4px 14px">▸ voir l'extrait</summary>
+<div style="white-space:pre-wrap;padding:6px 14px" class="mut">{{ s.candidates[loop.index0].excerpt | kb_text(700) }}</div></details>{% endif %}{% endfor %}
+<div class="row"><button class="lnk" type="submit" name="action" value="none">Aucune de ces fiches</button></div></div>
+{% endif %}
+
+{% if g and s.state == 'GUIDING' %}
+{% if cur < n %}{% set stp = g.steps[cur] %}
+<div class="card step" style="border-left:4px solid var(--acc)"><div class="mut">Étape {{ cur + 1 }} sur {{ n }}</div>
+<h2>{{ stp.title }}</h2><div class="ins">{{ stp.instruction }}</div>
+<div class="row"><button class="ok" type="submit" name="action" value="done">✓ C'est fait</button>
+<button class="alt" type="submit" name="action" value="blocked">✗ Ça ne marche pas</button>
+<button class="alt" type="submit" name="action" value="explain">? Expliquer</button>
+{% if cur > 0 %}<button class="alt" type="submit" name="action" value="back">← Précédente</button>{% endif %}</div>
+{% if s.step_attempts >= 2 %}<div class="mut" style="margin-top:10px">Toujours bloqué ? <button class="lnk" type="submit" name="action" value="wrong_fiche">Essayer une autre fiche</button></div>{% endif %}
+</div>
+{% else %}
+<div class="card" style="border-left:4px solid var(--ok)"><b>Toutes les étapes sont faites. Le problème est-il résolu ?</b>
+{% if g.verification %}<ul>{% for x in g.verification %}<li>{{ x }}</li>{% endfor %}</ul>{% endif %}
+<div class="row"><button class="ok" type="submit" name="action" value="solved_yes">✓ Oui, résolu</button>
+<button class="alt" type="submit" name="action" value="solved_no">✗ Non, toujours là</button>
+<button class="alt" type="submit" name="action" value="back">← Revoir la dernière étape</button></div></div>
+{% endif %}
+<div class="row" style="margin-top:0"><button class="lnk" type="submit" name="action" value="wrong_fiche">Ce n'est pas la bonne fiche</button></div>
+{% endif %}
+
+<div class="card"><div class="mut">{% if g %}Une question ou un blocage sur cette étape ? Décrivez-le ou joignez une capture.{% elif s.state == 'STUCK' %}Décrivez le problème autrement ou joignez une capture.{% else %}Précisez le problème pour affiner la recherche (optionnel).{% endif %}</div>
+<textarea name="text" placeholder="Votre message…"></textarea>
 <div class="row"><input type="file" name="screenshot" accept="image/png,image/jpeg,image/webp" multiple>
-<button type="submit">Envoyer</button></div></form></div>
+<button type="submit">Envoyer</button></div></div>
+</form>
 {% endif %}
 {% endif %}
 </main></body></html>"""

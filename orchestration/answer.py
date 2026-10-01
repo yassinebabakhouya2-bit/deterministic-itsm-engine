@@ -14,7 +14,7 @@
 # Responses API calls on an Azure OpenAI deployment do. A reliable,
 # schema-enforced answer (no hallucinated shape, explicit `ambiguous` flag
 # instead of guessing) was the explicit priority for this milestone, so
-# this module calls the aif-knowledgeengine2-v9 deployment directly.
+# this module calls the aif-knowledgeengine3-v9 deployment directly.
 # Prompt Flow and Foundry's visual Workflows were also ruled out: both are
 # being retired (2027-04-20 and 2026-12-01 respectively).
 # See project memory jalon3-orchestration.md for the full discussion.
@@ -113,11 +113,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIRS = [REPO_ROOT / "config", REPO_ROOT / "clients-local"]
 
 RG = "rg-knowledgeengine-v9"
-SEARCH_SERVICE = "srch-knowledgeengine2-v9"
+SEARCH_SERVICE = "srch-knowledgeengine3-v9"
 SEARCH_ENDPOINT = f"https://{SEARCH_SERVICE}.search.windows.net"
 SEARCH_API_VERSION = "2024-07-01"
 
-AOAI_ACCOUNT = "aif-knowledgeengine2-v9"
+AOAI_ACCOUNT = "aif-knowledgeengine3-v9"
 AOAI_ENDPOINT = f"https://{AOAI_ACCOUNT}.openai.azure.com"
 # First API version supporting Structured Outputs (response_format:
 # json_schema, strict) -- same version eval/evaluate_rag.py already uses.
@@ -581,6 +581,31 @@ def _looks_sensitive(text: Optional[str]) -> bool:
     if _DIGIT_RUN.search(text):
         return True
     return False
+
+
+_TS_PREFIX = re.compile(r"\[\d+:\d{2}(?::\d{2})?(?:\.\d+)?\]\s*")
+
+
+def _redact_sensitive(text: Optional[str], max_chars: int = 600) -> Optional[str]:
+    """Shows what is useful, hides only what is sensitive (2026-09-30). The old
+    backstop suppressed a whole summary as soon as it looked sensitive, which
+    left the user with a 'contenu non affiche' placeholder. Now only the
+    offending SENTENCES (spelled-out credential signatures) are dropped and
+    any digit run is masked; the rest is kept. Returns None only when nothing
+    useful remains."""
+    text = _TS_PREFIX.sub("", (text or "")).strip()
+    if not text:
+        return None
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    kept = []
+    for sent in sentences:
+        if len(_SPELLING_MARKERS.findall(sent)) >= 1 and _looks_sensitive(sent + " " + sent):
+            continue
+        kept.append(_DIGIT_RUN.sub("[...]", sent))
+    out = " ".join(k for k in kept if k.strip()).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rsplit(" ", 1)[0] + "..."
+    return out or None
 
 
 def az(cmd: str) -> str:
@@ -1256,8 +1281,7 @@ def attach_sources(result: dict, primaries: List[Dict], annexes: List[Dict]) -> 
     annex_summaries_raw = result.pop("annex_safe_summaries", [])
 
     def _safe(text: Optional[str]) -> Optional[str]:
-        text = (text or "").strip() or None
-        return text if text and not _looks_sensitive(text) else None
+        return _redact_sensitive(text, max_chars=2000)
 
     def _entry(doc: Dict, used: bool, summary_raw: Optional[str]) -> dict:
         is_media = doc.get("sourceType") in ("audio", "video")
@@ -1266,35 +1290,65 @@ def attach_sources(result: dict, primaries: List[Dict], annexes: List[Dict]) -> 
             "used": used,
             "sourceType": doc.get("sourceType"),
             "excerpt": doc.get("chunk"),
-            "safe_summary": _safe(summary_raw) if is_media else None,
+            # Model summary first; if absent, a redacted excerpt of the passage
+            # itself -- never an empty 'hidden' placeholder.
+            "safe_summary": (
+                (_safe(summary_raw) or _redact_sensitive(doc.get("chunk"))) if is_media else None
+            ),
         }
 
     def _psum(i: int) -> Optional[str]:
         return primary_summaries_raw[i] if i < len(primary_summaries_raw) else None
 
-    # When the model reported that NO candidate covers the question, the
-    # best-ranked one is still surfaced (flagged used=False) so the user sees
-    # what was actually retrieved -- same behaviour as before, when there was
-    # only ever one primary and it was shown whether used or not.
-    base_i = selected if selected is not None else 0
-    result["primary_source"] = (
-        _entry(primaries[base_i], selected is not None, _psum(base_i))
-        if primaries
-        else None
-    )
+    # When NO KB candidate covers the question (selected is None), the
+    # best-ranked KB fiche is NOT shown as "source principale" (2026-09-30:
+    # an unrelated LogMeIn fiche was displayed under a question about an
+    # Outlook video -- worse than showing nothing). It stays in _trace. The
+    # best audio/video source the model actually used is promoted to primary
+    # instead (app/app.py then labels it "aucun document KB trouve"); if none
+    # was used, there is no primary source at all.
+    base_doc = None
+    base_i = selected
+    promoted_annex = None
+    if selected is not None:
+        base_doc = primaries[selected]
+        result["primary_source"] = _entry(base_doc, True, _psum(selected))
+    else:
+        result["primary_source"] = None
+        for i, a in enumerate(annexes):
+            used = used_flags[i] if i < len(used_flags) else False
+            if used and a.get("sourceType") in ("audio", "video"):
+                promoted_annex = i
+                base_doc = a
+                summary = annex_summaries_raw[i] if i < len(annex_summaries_raw) else None
+                result["primary_source"] = _entry(a, True, summary)
+                break
+    result["_base_doc"] = base_doc
 
     related_sources = []
     for i, p in enumerate(primaries):
-        if i == base_i:
+        if selected is None or i == base_i:
             continue
         used = primary_used_flags[i] if i < len(primary_used_flags) else False
         if used:
             related_sources.append(_entry(p, True, _psum(i)))
     for i, a in enumerate(annexes):
+        if i == promoted_annex:
+            continue
         used = used_flags[i] if i < len(used_flags) else False
         summary = annex_summaries_raw[i] if i < len(annex_summaries_raw) else None
         related_sources.append(_entry(a, used, summary))
-    result["related_sources"] = related_sources
+    merged, seen = [], {}
+    for e in related_sources:
+        k = e.get("title")
+        if k in seen:
+            seen[k]["used"] = seen[k]["used"] or e["used"]
+            if not seen[k].get("safe_summary") and e.get("safe_summary"):
+                seen[k]["safe_summary"] = e["safe_summary"]
+            continue
+        seen[k] = e
+        merged.append(e)
+    result["related_sources"] = merged
     return result
 
 
@@ -1343,7 +1397,7 @@ def answer_query_core(
     result = generate(query, context, aoai_client, gen["model"], gen["temperature"], gen["seed"])
     selected = _selected_primary_index(result, primaries)
     result = attach_sources(result, primaries, annexes)
-    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    base_primary = result.pop("_base_doc", None)
 
     # Traceability (axiom A5): attach which source was primary/annex, its real
     # reranker score, and the raw context string (golden-dataset evaluation
@@ -1470,7 +1524,7 @@ def answer_query_core_keyless(
     result = generate(query, context, aoai_client, gen["model"], gen["temperature"], gen["seed"])
     selected = _selected_primary_index(result, primaries)
     result = attach_sources(result, primaries, annexes)
-    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    base_primary = result.pop("_base_doc", None)
     result["_trace"] = {
         "client": client_id,
         "index": index,
@@ -1612,7 +1666,7 @@ def analyze_screenshot_query_core(
     result = _generate_screenshot(query, context, image_b64, image_mime, aoai_client, gen["model"], gen["seed"])
     selected = _selected_primary_index(result, primaries)
     result = attach_sources(result, primaries, annexes)
-    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    base_primary = result.pop("_base_doc", None)
     result["_trace"] = {
         "client": client_id,
         "index": index,
@@ -1671,7 +1725,7 @@ def analyze_screenshot_query_core_keyless(
     result = _generate_screenshot(query, context, image_b64, image_mime, aoai_client, gen["model"], gen["seed"])
     selected = _selected_primary_index(result, primaries)
     result = attach_sources(result, primaries, annexes)
-    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    base_primary = result.pop("_base_doc", None)
     result["_trace"] = {
         "client": client_id,
         "index": index,
@@ -1866,7 +1920,7 @@ def diagnostic_query_core(
     )
     selected = _selected_primary_index(result, primaries)
     result = attach_sources(result, primaries, annexes)
-    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    base_primary = result.pop("_base_doc", None)
     result["_trace"] = {
         "client": client_id,
         "index": index,
@@ -1938,7 +1992,7 @@ def diagnostic_query_core_keyless(
     )
     selected = _selected_primary_index(result, primaries)
     result = attach_sources(result, primaries, annexes)
-    base_primary = primaries[selected if selected is not None else 0] if primaries else None
+    base_primary = result.pop("_base_doc", None)
     result["_trace"] = {
         "client": client_id,
         "index": index,
