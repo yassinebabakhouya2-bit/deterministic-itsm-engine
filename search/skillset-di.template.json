@@ -28,7 +28,7 @@
       "name": "embed",
       "description": "Vectorise chaque chunk",
       "context": "/document/markdown_document/*",
-      "resourceUri": "https://aif-knowledgeengine2-v9.openai.azure.com",
+      "resourceUri": "https://aif-knowledgeengine3-v9.openai.azure.com",
       "deploymentId": "text-embedding-3-large",
       "modelName": "text-embedding-3-large",
       "dimensions": 3072,
@@ -48,8 +48,8 @@
     {
       "@odata.type": "#Microsoft.Skills.Custom.WebApiSkill",
       "name": "enrich",
-      "description": "Extraction semantique via fn-knowledgeengine2-v9/api/enrich. Contexte document entier (pas par chunk) : le prompt raisonne sur le texte complet, pas un fragment. Un seul point d'entree qui route en interne selon sourceType -- fiche (entites/alias/triplets/audience) ou appel/video (probleme/resolution/issue). Echec = warning, jamais une erreur qui ferait tomber l'indexation (voir enrichment/README.md).",
-      "uri": "https://fn-knowledgeengine2-v9.azurewebsites.net/api/enrich",
+      "description": "Extraction semantique via fn-knowledgeengine3-v9/api/enrich. Contexte document entier (pas par chunk) : le prompt raisonne sur le texte complet, pas un fragment. Un seul point d'entree qui route en interne selon sourceType -- fiche (entites/alias/triplets/audience) ou appel/video (probleme/resolution/issue). Echec = warning, jamais une erreur qui ferait tomber l'indexation (voir enrichment/README.md).",
+      "uri": "https://fn-knowledgeengine3-v9.azurewebsites.net/api/enrich",
       "httpMethod": "POST",
       "timeout": "PT90S",
       "context": "/document",
@@ -109,7 +109,7 @@
   "cognitiveServices": {
     "@odata.type": "#Microsoft.Azure.Search.AIServicesByIdentity",
     "description": "Identite managee systeme du service Search, role 'Cognitive Services User' sur la ressource Foundry.",
-    "subdomainUrl": "https://aif-knowledgeengine2-v9.services.ai.azure.com",
+    "subdomainUrl": "https://aif-knowledgeengine3-v9.services.ai.azure.com",
     "identity": null
   },
   "indexProjections": {

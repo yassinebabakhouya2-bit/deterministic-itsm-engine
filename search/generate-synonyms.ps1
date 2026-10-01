@@ -9,7 +9,7 @@
 # Usage: ./generate-synonyms.ps1
 # =====================================================================
 param(
-  [string]$Service       = "srch-knowledgeengine2-v9",
+  [string]$Service       = "srch-knowledgeengine3-v9",
   [string]$ResourceGroup = "rg-knowledgeengine-v9",
   [string]$MapName       = "syn-clienta",
   [string]$ApiVersion    = "2024-07-01"
@@ -20,7 +20,7 @@ $key = az search admin-key show --service-name $Service --resource-group $Resour
 if (-not $key) { throw "Could not retrieve the admin key." }
 $headers = @{ "api-key" = $key; "Content-Type" = "application/json" }
 
-$clients = @("clienta","clientb","clientc","client-s","client-v")
+$clients = @("clienta","clientb","clientc","client-s")   # client-v abandoned 2026-09-26 (tenant rebuild)
 # canonical (lowercase key) -> HashSet of surface forms actually seen (incl. canonical itself)
 $groups = @{}
 

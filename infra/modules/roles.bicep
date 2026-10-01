@@ -22,6 +22,7 @@ param webAppPrincipalId string
 // Built-in Azure roles (stable IDs)
 var storageBlobDataReader = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var cognitiveServicesOpenAIUser = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
+var cognitiveServicesUser = 'a97b65f3-24c7-4388-baec-2e87135dc908' // DI Layout skill, AIServicesByIdentity
 var searchIndexDataReader = '1407120a-92aa-4202-b7e9-c0e197c71c8f' // query-only, not admin
 var storageTableDataContributor = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3' // Jalon 7+, 2026-09-18 -- saved conversations (convindex/convturns tables)
 
@@ -59,6 +60,21 @@ resource searchToFoundry 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
   }
 }
 
+// Search -> Document Intelligence Layout skill, billed to the Foundry account by identity
+// (search/skillset-di.template.json: "cognitiveServices": AIServicesByIdentity). Without it
+// the skillset PUT fails: "Unable to connect to AI Services using managed identity. Ensure
+// the identity has been granted permission Cognitive Services User on the AI Service."
+// Runbook 0 always listed it, but on the first tenant it had been granted by hand; it was
+// missing from this file until the 2026-09-26 rebuild (runbook 12.4).
+resource searchToFoundryCsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(foundry.id, searchPrincipalId, cognitiveServicesUser)
+  scope: foundry
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesUser)
+    principalId: searchPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
 
 // ---- Jalon 4: Web App (app/) -- keyless RBAC, no admin keys, no Key Vault ----
 

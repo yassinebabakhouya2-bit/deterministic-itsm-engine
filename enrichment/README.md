@@ -67,7 +67,7 @@ Le code se pousse comme le reste :
 
 ```powershell
 cd C:\V9\knowledgeengine-rag-platform\enrichment
-func azure functionapp publish fn-knowledgeengine2-v9 --python
+func azure functionapp publish fn-knowledgeengine3-v9 --python
 ```
 
 ou, sans Core Tools, par paquet zip (`az functionapp deployment source config-zip`).

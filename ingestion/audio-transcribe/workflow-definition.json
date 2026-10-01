@@ -275,7 +275,7 @@
         },
         "Compose_blobsJson": {
           "type": "Compose",
-          "description": "XML listing converted to JSON gives an array only for 2+ blobs: one blob is an object, none is null. Normalized to an array here, otherwise Select_blobInfo fails with 1 or 0 files (the run still showed Succeeded because Run_search_indexer always runs last).",
+          "description": "XML listing converted to JSON gives an array only for 2+ blobs: one blob is an object, none is null. Normalized to an array here, otherwise Select_blobInfo fails with 1 or 0 files (and the failure was hidden: the run used to end with an always-run reindex step).",
           "inputs": "@if(equals(outputs('Compose_blobsRaw'), null), createArray(), if(startsWith(string(coalesce(outputs('Compose_blobsRaw'), '')), '['), outputs('Compose_blobsRaw'), createArray(outputs('Compose_blobsRaw'))))",
           "runAfter": {
             "Compose_blobsRaw": [
@@ -629,512 +629,296 @@
                 ]
               }
             },
-            "Reset_mergeIdx0": {
-              "type": "SetVariable",
-              "inputs": {
-                "name": "mergeIdx0",
-                "value": 0
-              },
-              "runAfter": {
-                "Filter_channel0": [
-                  "Succeeded"
-                ],
-                "Filter_channel1": [
-                  "Succeeded"
+            "Condition_has_speech": {
+              "type": "If",
+              "description": "Merge_channels_loop is an Until loop, so it runs once even with nothing to merge and then fails on index 0 of an empty channel: a recording without any recognised phrase goes to the else branch instead.",
+              "expression": {
+                "and": [
+                  {
+                    "greater": [
+                      "@add(length(body('Filter_channel0')), length(body('Filter_channel1')))",
+                      0
+                    ]
+                  }
                 ]
-              }
-            },
-            "Reset_mergeIdx1": {
-              "type": "SetVariable",
-              "inputs": {
-                "name": "mergeIdx1",
-                "value": 0
-              },
-              "runAfter": {
-                "Reset_mergeIdx0": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Reset_mergedLines": {
-              "type": "SetVariable",
-              "inputs": {
-                "name": "mergedLines",
-                "value": []
-              },
-              "runAfter": {
-                "Reset_mergeIdx1": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Merge_channels_loop": {
-              "type": "Until",
-              "expression": "@and(greaterOrEquals(variables('mergeIdx0'), length(body('Filter_channel0'))), greaterOrEquals(variables('mergeIdx1'), length(body('Filter_channel1'))))",
-              "limit": {
-                "count": 2000,
-                "timeout": "PT1H"
               },
               "actions": {
-                "Condition_channel0_exhausted": {
-                  "type": "If",
-                  "expression": {
-                    "and": [
-                      {
-                        "greaterOrEquals": [
-                          "@variables('mergeIdx0')",
-                          "@length(body('Filter_channel0'))"
-                        ]
-                      }
-                    ]
-                  },
-                  "actions": {
-                    "AppendToArrayVariable_channel1_only": {
-                      "type": "AppendToArrayVariable",
-                      "inputs": {
-                        "name": "mergedLines",
-                        "value": "@{concat('Canal 1: ', body('Filter_channel1')[variables('mergeIdx1')]?['nBest'][0]?['display'])}"
-                      },
-                      "runAfter": {}
-                    },
-                    "Increment_mergeIdx1_only": {
-                      "type": "IncrementVariable",
-                      "inputs": {
-                        "name": "mergeIdx1",
-                        "value": 1
-                      },
-                      "runAfter": {
-                        "AppendToArrayVariable_channel1_only": [
-                          "Succeeded"
-                        ]
-                      }
-                    }
-                  },
-                  "else": {
-                    "actions": {
-                      "Condition_channel1_exhausted": {
-                        "type": "If",
-                        "expression": {
-                          "and": [
-                            {
-                              "greaterOrEquals": [
-                                "@variables('mergeIdx1')",
-                                "@length(body('Filter_channel1'))"
-                              ]
-                            }
-                          ]
-                        },
-                        "actions": {
-                          "AppendToArrayVariable_channel0_only": {
-                            "type": "AppendToArrayVariable",
-                            "inputs": {
-                              "name": "mergedLines",
-                              "value": "@{concat('Canal 0: ', body('Filter_channel0')[variables('mergeIdx0')]?['nBest'][0]?['display'])}"
-                            },
-                            "runAfter": {}
-                          },
-                          "Increment_mergeIdx0_only": {
-                            "type": "IncrementVariable",
-                            "inputs": {
-                              "name": "mergeIdx0",
-                              "value": 1
-                            },
-                            "runAfter": {
-                              "AppendToArrayVariable_channel0_only": [
-                                "Succeeded"
-                              ]
-                            }
-                          }
-                        },
-                        "else": {
-                          "actions": {
-                            "Condition_channel0_earlier": {
-                              "type": "If",
-                              "expression": {
-                                "and": [
-                                  {
-                                    "lessOrEquals": [
-                                      "@body('Filter_channel0')[variables('mergeIdx0')]?['offsetInTicks']",
-                                      "@body('Filter_channel1')[variables('mergeIdx1')]?['offsetInTicks']"
-                                    ]
-                                  }
-                                ]
-                              },
-                              "actions": {
-                                "AppendToArrayVariable_channel0_both": {
-                                  "type": "AppendToArrayVariable",
-                                  "inputs": {
-                                    "name": "mergedLines",
-                                    "value": "@{concat('Canal 0: ', body('Filter_channel0')[variables('mergeIdx0')]?['nBest'][0]?['display'])}"
-                                  },
-                                  "runAfter": {}
-                                },
-                                "Increment_mergeIdx0_both": {
-                                  "type": "IncrementVariable",
-                                  "inputs": {
-                                    "name": "mergeIdx0",
-                                    "value": 1
-                                  },
-                                  "runAfter": {
-                                    "AppendToArrayVariable_channel0_both": [
-                                      "Succeeded"
-                                    ]
-                                  }
-                                }
-                              },
-                              "else": {
-                                "actions": {
-                                  "AppendToArrayVariable_channel1_both": {
-                                    "type": "AppendToArrayVariable",
-                                    "inputs": {
-                                      "name": "mergedLines",
-                                      "value": "@{concat('Canal 1: ', body('Filter_channel1')[variables('mergeIdx1')]?['nBest'][0]?['display'])}"
-                                    },
-                                    "runAfter": {}
-                                  },
-                                  "Increment_mergeIdx1_both": {
-                                    "type": "IncrementVariable",
-                                    "inputs": {
-                                      "name": "mergeIdx1",
-                                      "value": 1
-                                    },
-                                    "runAfter": {
-                                      "AppendToArrayVariable_channel1_both": [
-                                        "Succeeded"
-                                      ]
-                                    }
-                                  }
-                                }
-                              },
-                              "runAfter": {}
-                            }
-                          }
-                        },
-                        "runAfter": {}
-                      }
-                    }
+                "Reset_mergeIdx0": {
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "mergeIdx0",
+                    "value": 0
                   },
                   "runAfter": {}
-                }
-              },
-              "runAfter": {
-                "Reset_mergedLines": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Reset_conversationItems": {
-              "type": "SetVariable",
-              "inputs": {
-                "name": "conversationItems",
-                "value": []
-              },
-              "runAfter": {
-                "Merge_channels_loop": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Compose_agentChannel": {
-              "type": "Compose",
-              "inputs": "@{substring(variables('mergedLines')[0], 0, indexOf(variables('mergedLines')[0], ':'))}",
-              "runAfter": {
-                "Reset_conversationItems": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "For_each_mergedLine": {
-              "type": "Foreach",
-              "foreach": "@range(0, length(variables('mergedLines')))",
-              "actions": {
-                "Compose_participant": {
-                  "type": "Compose",
-                  "inputs": "@substring(variables('mergedLines')[item()], 0, indexOf(variables('mergedLines')[item()], ':'))"
                 },
-                "Compose_role": {
-                  "type": "Compose",
-                  "inputs": "@if(equals(outputs('Compose_participant'), outputs('Compose_agentChannel')), 'Agent', 'Customer')",
+                "Reset_mergeIdx1": {
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "mergeIdx1",
+                    "value": 0
+                  },
                   "runAfter": {
-                    "Compose_participant": [
+                    "Reset_mergeIdx0": [
                       "Succeeded"
                     ]
                   }
                 },
-                "Compose_itemText": {
-                  "type": "Compose",
-                  "inputs": "@trim(substring(variables('mergedLines')[item()], add(indexOf(variables('mergedLines')[item()], ':'), 1), sub(length(variables('mergedLines')[item()]), add(indexOf(variables('mergedLines')[item()], ':'), 1))))",
+                "Reset_mergedLines": {
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "mergedLines",
+                    "value": []
+                  },
                   "runAfter": {
-                    "Compose_participant": [
+                    "Reset_mergeIdx1": [
                       "Succeeded"
                     ]
                   }
                 },
-                "Condition_itemText_not_empty": {
-                  "type": "If",
-                  "expression": {
-                    "not": [
-                      {
-                        "equals": [
-                          "@outputs('Compose_itemText')",
-                          ""
-                        ]
-                      }
-                    ]
+                "Merge_channels_loop": {
+                  "type": "Until",
+                  "expression": "@and(greaterOrEquals(variables('mergeIdx0'), length(body('Filter_channel0'))), greaterOrEquals(variables('mergeIdx1'), length(body('Filter_channel1'))))",
+                  "limit": {
+                    "count": 2000,
+                    "timeout": "PT1H"
                   },
                   "actions": {
-                    "Append_conversationItem": {
-                      "type": "AppendToArrayVariable",
-                      "inputs": {
-                        "name": "conversationItems",
-                        "value": {
-                          "id": "@string(item())",
-                          "participantId": "@outputs('Compose_participant')",
-                          "role": "@outputs('Compose_role')",
-                          "text": "@outputs('Compose_itemText')"
+                    "Condition_channel0_exhausted": {
+                      "type": "If",
+                      "expression": {
+                        "and": [
+                          {
+                            "greaterOrEquals": [
+                              "@variables('mergeIdx0')",
+                              "@length(body('Filter_channel0'))"
+                            ]
+                          }
+                        ]
+                      },
+                      "actions": {
+                        "AppendToArrayVariable_channel1_only": {
+                          "type": "AppendToArrayVariable",
+                          "inputs": {
+                            "name": "mergedLines",
+                            "value": "@{concat('Canal 1: ', body('Filter_channel1')[variables('mergeIdx1')]?['nBest'][0]?['display'])}"
+                          },
+                          "runAfter": {}
+                        },
+                        "Increment_mergeIdx1_only": {
+                          "type": "IncrementVariable",
+                          "inputs": {
+                            "name": "mergeIdx1",
+                            "value": 1
+                          },
+                          "runAfter": {
+                            "AppendToArrayVariable_channel1_only": [
+                              "Succeeded"
+                            ]
+                          }
+                        }
+                      },
+                      "else": {
+                        "actions": {
+                          "Condition_channel1_exhausted": {
+                            "type": "If",
+                            "expression": {
+                              "and": [
+                                {
+                                  "greaterOrEquals": [
+                                    "@variables('mergeIdx1')",
+                                    "@length(body('Filter_channel1'))"
+                                  ]
+                                }
+                              ]
+                            },
+                            "actions": {
+                              "AppendToArrayVariable_channel0_only": {
+                                "type": "AppendToArrayVariable",
+                                "inputs": {
+                                  "name": "mergedLines",
+                                  "value": "@{concat('Canal 0: ', body('Filter_channel0')[variables('mergeIdx0')]?['nBest'][0]?['display'])}"
+                                },
+                                "runAfter": {}
+                              },
+                              "Increment_mergeIdx0_only": {
+                                "type": "IncrementVariable",
+                                "inputs": {
+                                  "name": "mergeIdx0",
+                                  "value": 1
+                                },
+                                "runAfter": {
+                                  "AppendToArrayVariable_channel0_only": [
+                                    "Succeeded"
+                                  ]
+                                }
+                              }
+                            },
+                            "else": {
+                              "actions": {
+                                "Condition_channel0_earlier": {
+                                  "type": "If",
+                                  "expression": {
+                                    "and": [
+                                      {
+                                        "lessOrEquals": [
+                                          "@body('Filter_channel0')[variables('mergeIdx0')]?['offsetInTicks']",
+                                          "@body('Filter_channel1')[variables('mergeIdx1')]?['offsetInTicks']"
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  "actions": {
+                                    "AppendToArrayVariable_channel0_both": {
+                                      "type": "AppendToArrayVariable",
+                                      "inputs": {
+                                        "name": "mergedLines",
+                                        "value": "@{concat('Canal 0: ', body('Filter_channel0')[variables('mergeIdx0')]?['nBest'][0]?['display'])}"
+                                      },
+                                      "runAfter": {}
+                                    },
+                                    "Increment_mergeIdx0_both": {
+                                      "type": "IncrementVariable",
+                                      "inputs": {
+                                        "name": "mergeIdx0",
+                                        "value": 1
+                                      },
+                                      "runAfter": {
+                                        "AppendToArrayVariable_channel0_both": [
+                                          "Succeeded"
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  "else": {
+                                    "actions": {
+                                      "AppendToArrayVariable_channel1_both": {
+                                        "type": "AppendToArrayVariable",
+                                        "inputs": {
+                                          "name": "mergedLines",
+                                          "value": "@{concat('Canal 1: ', body('Filter_channel1')[variables('mergeIdx1')]?['nBest'][0]?['display'])}"
+                                        },
+                                        "runAfter": {}
+                                      },
+                                      "Increment_mergeIdx1_both": {
+                                        "type": "IncrementVariable",
+                                        "inputs": {
+                                          "name": "mergeIdx1",
+                                          "value": 1
+                                        },
+                                        "runAfter": {
+                                          "AppendToArrayVariable_channel1_both": [
+                                            "Succeeded"
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  },
+                                  "runAfter": {}
+                                }
+                              }
+                            },
+                            "runAfter": {}
+                          }
                         }
                       },
                       "runAfter": {}
                     }
                   },
-                  "else": {
-                    "actions": {}
-                  },
                   "runAfter": {
-                    "Compose_itemText": [
-                      "Succeeded"
-                    ],
-                    "Compose_role": [
-                      "Succeeded"
-                    ]
-                  }
-                }
-              },
-              "runAfter": {
-                "Compose_agentChannel": [
-                  "Succeeded"
-                ]
-              },
-              "runtimeConfiguration": {
-                "concurrency": {
-                  "repetitions": 1
-                }
-              }
-            },
-            "Submit_pii_and_resolution": {
-              "type": "Http",
-              "inputs": {
-                "method": "POST",
-                "uri": "@{concat(parameters('languageEndpoint'), '/language/analyze-conversations/jobs?api-version=', parameters('languageApiVersion'))}",
-                "headers": {
-                  "Content-Type": "application/json"
-                },
-                "body": {
-                  "displayName": "@{concat('pii+resolution: ', outputs('Compose_blobName'))}",
-                  "analysisInput": {
-                    "conversations": [
-                      {
-                        "id": "conv1",
-                        "language": "@{substring(parameters('locale'), 0, 2)}",
-                        "modality": "text",
-                        "conversationItems": "@variables('conversationItems')"
-                      }
-                    ]
-                  },
-                  "tasks": [
-                    {
-                      "taskName": "pii",
-                      "kind": "ConversationalPIITask",
-                      "parameters": {
-                        "redactionSource": "text"
-                      }
-                    },
-                    {
-                      "taskName": "resolution",
-                      "kind": "ConversationalSummarizationTask",
-                      "parameters": {
-                        "summaryAspects": [
-                          "issue",
-                          "resolution"
-                        ]
-                      }
-                    }
-                  ]
-                },
-                "authentication": {
-                  "type": "ManagedServiceIdentity",
-                  "audience": "https://cognitiveservices.azure.com"
-                }
-              },
-              "runAfter": {
-                "For_each_mergedLine": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Compose_languageJobUrl": {
-              "type": "Compose",
-              "inputs": "@{coalesce(outputs('Submit_pii_and_resolution')['headers']?['Operation-Location'], outputs('Submit_pii_and_resolution')['headers']?['operation-location'])}",
-              "runAfter": {
-                "Submit_pii_and_resolution": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Reset_languagePollStatus": {
-              "type": "SetVariable",
-              "inputs": {
-                "name": "pollStatus",
-                "value": ""
-              },
-              "runAfter": {
-                "Compose_languageJobUrl": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Poll_language_job": {
-              "type": "Until",
-              "expression": "@or(equals(variables('pollStatus'), 'succeeded'), equals(variables('pollStatus'), 'failed'))",
-              "limit": {
-                "count": 60,
-                "timeout": "PT1H"
-              },
-              "actions": {
-                "Wait_before_check_language": {
-                  "type": "Wait",
-                  "inputs": {
-                    "interval": {
-                      "unit": "Second",
-                      "count": "@parameters('pollIntervalSeconds')"
-                    }
-                  },
-                  "runAfter": {}
-                },
-                "Check_language_status": {
-                  "type": "Http",
-                  "inputs": {
-                    "method": "GET",
-                    "uri": "@{concat(outputs('Compose_languageJobUrl'), '&_cb=', string(ticks(utcNow())))}",
-                    "headers": {
-                      "Cache-Control": "no-cache",
-                      "Pragma": "no-cache"
-                    },
-                    "authentication": {
-                      "type": "ManagedServiceIdentity",
-                      "audience": "https://cognitiveservices.azure.com"
-                    }
-                  },
-                  "runAfter": {
-                    "Wait_before_check_language": [
+                    "Reset_mergedLines": [
                       "Succeeded"
                     ]
                   }
                 },
-                "Update_language_pollStatus": {
+                "Reset_conversationItems": {
                   "type": "SetVariable",
                   "inputs": {
-                    "name": "pollStatus",
-                    "value": "@{toLower(coalesce(body('Check_language_status')?['status'], ''))}"
-                  },
-                  "runAfter": {
-                    "Check_language_status": [
-                      "Succeeded"
-                    ]
-                  }
-                }
-              },
-              "runAfter": {
-                "Reset_languagePollStatus": [
-                  "Succeeded"
-                ]
-              }
-            },
-            "Condition_language_job_succeeded": {
-              "type": "If",
-              "expression": {
-                "and": [
-                  {
-                    "equals": [
-                      "@variables('pollStatus')",
-                      "succeeded"
-                    ]
-                  }
-                ]
-              },
-              "actions": {
-                "Get_language_results": {
-                  "type": "Http",
-                  "inputs": {
-                    "method": "GET",
-                    "uri": "@{outputs('Compose_languageJobUrl')}",
-                    "authentication": {
-                      "type": "ManagedServiceIdentity",
-                      "audience": "https://cognitiveservices.azure.com"
-                    }
-                  },
-                  "runAfter": {}
-                },
-                "Filter_pii_task": {
-                  "type": "Query",
-                  "inputs": {
-                    "from": "@body('Get_language_results')?['tasks']?['items']",
-                    "where": "@equals(item()?['taskName'], 'pii')"
-                  },
-                  "runAfter": {
-                    "Get_language_results": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Filter_resolution_task": {
-                  "type": "Query",
-                  "inputs": {
-                    "from": "@body('Get_language_results')?['tasks']?['items']",
-                    "where": "@equals(item()?['taskName'], 'resolution')"
-                  },
-                  "runAfter": {
-                    "Get_language_results": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Compose_redactedItems": {
-                  "type": "Compose",
-                  "inputs": "@body('Filter_pii_task')[0]?['results']?['conversations'][0]?['conversationItems']",
-                  "runAfter": {
-                    "Filter_pii_task": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Reset_redactedLines": {
-                  "type": "SetVariable",
-                  "inputs": {
-                    "name": "redactedLines",
+                    "name": "conversationItems",
                     "value": []
                   },
                   "runAfter": {
-                    "Compose_redactedItems": [
+                    "Merge_channels_loop": [
                       "Succeeded"
                     ]
                   }
                 },
-                "For_each_conversationItem": {
+                "Compose_agentChannel": {
+                  "type": "Compose",
+                  "inputs": "@{substring(variables('mergedLines')[0], 0, indexOf(variables('mergedLines')[0], ':'))}",
+                  "runAfter": {
+                    "Reset_conversationItems": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "For_each_mergedLine": {
                   "type": "Foreach",
-                  "foreach": "@range(0, length(variables('conversationItems')))",
+                  "foreach": "@range(0, length(variables('mergedLines')))",
                   "actions": {
-                    "Append_redactedLine": {
-                      "type": "AppendToArrayVariable",
-                      "inputs": {
-                        "name": "redactedLines",
-                        "value": "@{concat(variables('conversationItems')[item()]?['participantId'], ': ', coalesce(outputs('Compose_redactedItems')[item()]?['redactedContent']?['text'], '(non disponible)'))}"
+                    "Compose_participant": {
+                      "type": "Compose",
+                      "inputs": "@substring(variables('mergedLines')[item()], 0, indexOf(variables('mergedLines')[item()], ':'))"
+                    },
+                    "Compose_role": {
+                      "type": "Compose",
+                      "inputs": "@if(equals(outputs('Compose_participant'), outputs('Compose_agentChannel')), 'Agent', 'Customer')",
+                      "runAfter": {
+                        "Compose_participant": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Compose_itemText": {
+                      "type": "Compose",
+                      "inputs": "@trim(substring(variables('mergedLines')[item()], add(indexOf(variables('mergedLines')[item()], ':'), 1), sub(length(variables('mergedLines')[item()]), add(indexOf(variables('mergedLines')[item()], ':'), 1))))",
+                      "runAfter": {
+                        "Compose_participant": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Condition_itemText_not_empty": {
+                      "type": "If",
+                      "expression": {
+                        "not": [
+                          {
+                            "equals": [
+                              "@outputs('Compose_itemText')",
+                              ""
+                            ]
+                          }
+                        ]
                       },
-                      "runAfter": {}
+                      "actions": {
+                        "Append_conversationItem": {
+                          "type": "AppendToArrayVariable",
+                          "inputs": {
+                            "name": "conversationItems",
+                            "value": {
+                              "id": "@string(item())",
+                              "participantId": "@outputs('Compose_participant')",
+                              "role": "@outputs('Compose_role')",
+                              "text": "@outputs('Compose_itemText')"
+                            }
+                          },
+                          "runAfter": {}
+                        }
+                      },
+                      "else": {
+                        "actions": {}
+                      },
+                      "runAfter": {
+                        "Compose_itemText": [
+                          "Succeeded"
+                        ],
+                        "Compose_role": [
+                          "Succeeded"
+                        ]
+                      }
                     }
                   },
                   "runAfter": {
-                    "Reset_redactedLines": [
+                    "Compose_agentChannel": [
                       "Succeeded"
                     ]
                   },
@@ -1144,122 +928,377 @@
                     }
                   }
                 },
-                "Filter_issue_summary": {
-                  "type": "Query",
-                  "inputs": {
-                    "from": "@body('Filter_resolution_task')[0]?['results']?['conversations'][0]?['summaries']",
-                    "where": "@equals(item()?['aspect'], 'issue')"
-                  },
-                  "runAfter": {
-                    "Filter_resolution_task": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Filter_resolution_summary": {
-                  "type": "Query",
-                  "inputs": {
-                    "from": "@body('Filter_resolution_task')[0]?['results']?['conversations'][0]?['summaries']",
-                    "where": "@equals(item()?['aspect'], 'resolution')"
-                  },
-                  "runAfter": {
-                    "Filter_resolution_task": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Compose_issueText": {
-                  "type": "Compose",
-                  "inputs": "@{coalesce(first(body('Filter_issue_summary'))?['text'], '')}",
-                  "runAfter": {
-                    "Filter_issue_summary": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Compose_resolutionText": {
-                  "type": "Compose",
-                  "inputs": "@{coalesce(first(body('Filter_resolution_summary'))?['text'], '')}",
-                  "runAfter": {
-                    "Filter_resolution_summary": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Compose_finalTranscriptText": {
-                  "type": "Compose",
-                  "inputs": "@{concat('Fichier source: ', outputs('Compose_blobName'), decodeUriComponent('%0A'), 'Probleme : ', outputs('Compose_issueText'), decodeUriComponent('%0A'), 'Resolution : ', outputs('Compose_resolutionText'), decodeUriComponent('%0A%0A'), '--- Transcription (PII redigee automatiquement) ---', decodeUriComponent('%0A%0A'), join(variables('redactedLines'), decodeUriComponent('%0A')))}",
-                  "runAfter": {
-                    "For_each_conversationItem": [
-                      "Succeeded"
-                    ],
-                    "Compose_issueText": [
-                      "Succeeded"
-                    ],
-                    "Compose_resolutionText": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Compose_txtBlobName": {
-                  "type": "Compose",
-                  "inputs": "@{concat(substring(outputs('Compose_blobName'), 0, lastIndexOf(outputs('Compose_blobName'), '.')), '.txt')}",
-                  "runAfter": {
-                    "Compose_finalTranscriptText": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Write_transcript_blob": {
+                "Submit_pii_and_resolution": {
                   "type": "Http",
                   "inputs": {
-                    "method": "PUT",
-                    "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', outputs('Compose_txtBlobName'))}",
+                    "method": "POST",
+                    "uri": "@{concat(parameters('languageEndpoint'), '/language/analyze-conversations/jobs?api-version=', parameters('languageApiVersion'))}",
                     "headers": {
-                      "x-ms-blob-type": "BlockBlob",
-                      "x-ms-version": "2021-08-06",
-                      "Content-Type": "text/plain; charset=utf-8",
-                      "x-ms-meta-clientid": "@{parameters('clientId')}",
-                      "x-ms-meta-sourcetype": "audio"
+                      "Content-Type": "application/json"
                     },
-                    "body": "@outputs('Compose_finalTranscriptText')",
-                    "authentication": {
-                      "type": "ManagedServiceIdentity",
-                      "audience": "https://storage.azure.com"
-                    }
-                  },
-                  "runAfter": {
-                    "Compose_txtBlobName": [
-                      "Succeeded"
-                    ]
-                  }
-                },
-                "Mark_transcribed": {
-                  "type": "Http",
-                  "inputs": {
-                    "method": "PUT",
-                    "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '/', outputs('Compose_encodedPath'), '?comp=metadata')}",
-                    "headers": {
-                      "x-ms-version": "2021-08-06",
-                      "x-ms-meta-transcribed": "true"
+                    "body": {
+                      "displayName": "@{concat('pii+resolution: ', outputs('Compose_blobName'))}",
+                      "analysisInput": {
+                        "conversations": [
+                          {
+                            "id": "conv1",
+                            "language": "@{substring(parameters('locale'), 0, 2)}",
+                            "modality": "text",
+                            "conversationItems": "@variables('conversationItems')"
+                          }
+                        ]
+                      },
+                      "tasks": [
+                        {
+                          "taskName": "pii",
+                          "kind": "ConversationalPIITask",
+                          "parameters": {
+                            "redactionSource": "text"
+                          }
+                        },
+                        {
+                          "taskName": "resolution",
+                          "kind": "ConversationalSummarizationTask",
+                          "parameters": {
+                            "summaryAspects": [
+                              "issue",
+                              "resolution"
+                            ]
+                          }
+                        }
+                      ]
                     },
                     "authentication": {
                       "type": "ManagedServiceIdentity",
-                      "audience": "https://storage.azure.com"
+                      "audience": "https://cognitiveservices.azure.com"
                     }
                   },
                   "runAfter": {
-                    "Write_transcript_blob": [
+                    "For_each_mergedLine": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Compose_languageJobUrl": {
+                  "type": "Compose",
+                  "inputs": "@{coalesce(outputs('Submit_pii_and_resolution')['headers']?['Operation-Location'], outputs('Submit_pii_and_resolution')['headers']?['operation-location'])}",
+                  "runAfter": {
+                    "Submit_pii_and_resolution": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Reset_languagePollStatus": {
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "pollStatus",
+                    "value": ""
+                  },
+                  "runAfter": {
+                    "Compose_languageJobUrl": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Poll_language_job": {
+                  "type": "Until",
+                  "expression": "@or(equals(variables('pollStatus'), 'succeeded'), equals(variables('pollStatus'), 'failed'))",
+                  "limit": {
+                    "count": 60,
+                    "timeout": "PT1H"
+                  },
+                  "actions": {
+                    "Wait_before_check_language": {
+                      "type": "Wait",
+                      "inputs": {
+                        "interval": {
+                          "unit": "Second",
+                          "count": "@parameters('pollIntervalSeconds')"
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Check_language_status": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "GET",
+                        "uri": "@{concat(outputs('Compose_languageJobUrl'), '&_cb=', string(ticks(utcNow())))}",
+                        "headers": {
+                          "Cache-Control": "no-cache",
+                          "Pragma": "no-cache"
+                        },
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://cognitiveservices.azure.com"
+                        }
+                      },
+                      "runAfter": {
+                        "Wait_before_check_language": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Update_language_pollStatus": {
+                      "type": "SetVariable",
+                      "inputs": {
+                        "name": "pollStatus",
+                        "value": "@{toLower(coalesce(body('Check_language_status')?['status'], ''))}"
+                      },
+                      "runAfter": {
+                        "Check_language_status": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Reset_languagePollStatus": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Condition_language_job_succeeded": {
+                  "type": "If",
+                  "expression": {
+                    "and": [
+                      {
+                        "equals": [
+                          "@variables('pollStatus')",
+                          "succeeded"
+                        ]
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "Get_language_results": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "GET",
+                        "uri": "@{outputs('Compose_languageJobUrl')}",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://cognitiveservices.azure.com"
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Filter_pii_task": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@body('Get_language_results')?['tasks']?['items']",
+                        "where": "@equals(item()?['taskName'], 'pii')"
+                      },
+                      "runAfter": {
+                        "Get_language_results": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Filter_resolution_task": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@body('Get_language_results')?['tasks']?['items']",
+                        "where": "@equals(item()?['taskName'], 'resolution')"
+                      },
+                      "runAfter": {
+                        "Get_language_results": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Compose_redactedItems": {
+                      "type": "Compose",
+                      "inputs": "@body('Filter_pii_task')[0]?['results']?['conversations'][0]?['conversationItems']",
+                      "runAfter": {
+                        "Filter_pii_task": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Reset_redactedLines": {
+                      "type": "SetVariable",
+                      "inputs": {
+                        "name": "redactedLines",
+                        "value": []
+                      },
+                      "runAfter": {
+                        "Compose_redactedItems": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "For_each_conversationItem": {
+                      "type": "Foreach",
+                      "foreach": "@range(0, length(variables('conversationItems')))",
+                      "actions": {
+                        "Append_redactedLine": {
+                          "type": "AppendToArrayVariable",
+                          "inputs": {
+                            "name": "redactedLines",
+                            "value": "@{concat(variables('conversationItems')[item()]?['participantId'], ': ', coalesce(outputs('Compose_redactedItems')[item()]?['redactedContent']?['text'], '(non disponible)'))}"
+                          },
+                          "runAfter": {}
+                        }
+                      },
+                      "runAfter": {
+                        "Reset_redactedLines": [
+                          "Succeeded"
+                        ]
+                      },
+                      "runtimeConfiguration": {
+                        "concurrency": {
+                          "repetitions": 1
+                        }
+                      }
+                    },
+                    "Filter_issue_summary": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@body('Filter_resolution_task')[0]?['results']?['conversations'][0]?['summaries']",
+                        "where": "@equals(item()?['aspect'], 'issue')"
+                      },
+                      "runAfter": {
+                        "Filter_resolution_task": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Filter_resolution_summary": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@body('Filter_resolution_task')[0]?['results']?['conversations'][0]?['summaries']",
+                        "where": "@equals(item()?['aspect'], 'resolution')"
+                      },
+                      "runAfter": {
+                        "Filter_resolution_task": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Compose_issueText": {
+                      "type": "Compose",
+                      "inputs": "@{coalesce(first(body('Filter_issue_summary'))?['text'], '')}",
+                      "runAfter": {
+                        "Filter_issue_summary": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Compose_resolutionText": {
+                      "type": "Compose",
+                      "inputs": "@{coalesce(first(body('Filter_resolution_summary'))?['text'], '')}",
+                      "runAfter": {
+                        "Filter_resolution_summary": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Compose_finalTranscriptText": {
+                      "type": "Compose",
+                      "inputs": "@{concat('Fichier source: ', outputs('Compose_blobName'), decodeUriComponent('%0A'), 'Probleme : ', outputs('Compose_issueText'), decodeUriComponent('%0A'), 'Resolution : ', outputs('Compose_resolutionText'), decodeUriComponent('%0A%0A'), '--- Transcription (PII redigee automatiquement) ---', decodeUriComponent('%0A%0A'), join(variables('redactedLines'), decodeUriComponent('%0A')))}",
+                      "runAfter": {
+                        "For_each_conversationItem": [
+                          "Succeeded"
+                        ],
+                        "Compose_issueText": [
+                          "Succeeded"
+                        ],
+                        "Compose_resolutionText": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Compose_txtBlobName": {
+                      "type": "Compose",
+                      "inputs": "@{concat(substring(outputs('Compose_blobName'), 0, lastIndexOf(outputs('Compose_blobName'), '.')), '.txt')}",
+                      "runAfter": {
+                        "Compose_finalTranscriptText": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Write_transcript_blob": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "PUT",
+                        "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('containerName'), '/', outputs('Compose_txtBlobName'))}",
+                        "headers": {
+                          "x-ms-blob-type": "BlockBlob",
+                          "x-ms-version": "2021-08-06",
+                          "Content-Type": "text/plain; charset=utf-8",
+                          "x-ms-meta-clientid": "@{parameters('clientId')}",
+                          "x-ms-meta-sourcetype": "audio"
+                        },
+                        "body": "@outputs('Compose_finalTranscriptText')",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://storage.azure.com"
+                        }
+                      },
+                      "runAfter": {
+                        "Compose_txtBlobName": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Mark_transcribed": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "PUT",
+                        "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '/', outputs('Compose_encodedPath'), '?comp=metadata')}",
+                        "headers": {
+                          "x-ms-version": "2021-08-06",
+                          "x-ms-meta-transcribed": "true"
+                        },
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://storage.azure.com"
+                        }
+                      },
+                      "runAfter": {
+                        "Write_transcript_blob": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "else": {
+                    "actions": {}
+                  },
+                  "runAfter": {
+                    "Poll_language_job": [
                       "Succeeded"
                     ]
                   }
                 }
               },
               "else": {
-                "actions": {}
+                "actions": {
+                  "Mark_no_speech": {
+                    "type": "Http",
+                    "description": "Nothing recognised in the recording (every phrase had an empty nBest). Flagged transcribed + nospeech so the daily run stops re-submitting it to Speech; nothing is written to kb-<client>.",
+                    "inputs": {
+                      "method": "PUT",
+                      "uri": "@{concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('audioContainerName'), '/', outputs('Compose_encodedPath'), '?comp=metadata')}",
+                      "headers": {
+                        "x-ms-version": "2021-08-06",
+                        "x-ms-meta-transcribed": "true",
+                        "x-ms-meta-nospeech": "true"
+                      },
+                      "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://storage.azure.com"
+                      }
+                    },
+                    "runAfter": {}
+                  }
+                }
               },
               "runAfter": {
-                "Poll_language_job": [
+                "Filter_channel0": [
+                  "Succeeded"
+                ],
+                "Filter_channel1": [
                   "Succeeded"
                 ]
               }
@@ -1278,26 +1317,6 @@
       "runAfter": {
         "Filter_untranscribed": [
           "Succeeded"
-        ]
-      }
-    },
-    "Run_search_indexer": {
-      "type": "Http",
-      "description": "Reindexation automatique : force un passage de l'indexeur texte natif (ix-<clientId>-text) juste apres l'ecriture des .txt, pour que les transcriptions soient interrogeables sans attendre un declenchement manuel. Toujours execute, meme si For_each_blob a eu des echecs individuels (fichiers sources vides, etc.) -- les fichiers reussis doivent quand meme etre indexes.",
-      "inputs": {
-        "method": "POST",
-        "uri": "@{concat('https://', parameters('searchServiceName'), '.search.windows.net/indexers/ix-', parameters('clientId'), '-text/run?api-version=2024-07-01')}",
-        "authentication": {
-          "type": "ManagedServiceIdentity",
-          "audience": "https://search.azure.com/"
-        }
-      },
-      "runAfter": {
-        "For_each_blob": [
-          "Succeeded",
-          "Failed",
-          "Skipped",
-          "TimedOut"
         ]
       }
     }

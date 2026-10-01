@@ -22,7 +22,8 @@
   Logic App run already in progress is followed instead of being started twice. Ctrl+C only
   stops the watching: the runs go on in Azure.
   Audio files are transcribed one at a time (a few minutes each), so a full audio library takes
-  hours; logic-transcribe-<client> re-runs ix-<client>-text itself when it ends.
+  hours. The indexers also run by themselves every hour, so transcripts written after this script
+  ends are picked up without it.
   Windows PowerShell 5.1 or PowerShell 7. ASCII-only source (runbook 9.1).
 #>
 param(
@@ -581,23 +582,29 @@ Start-Indexer $ixDi
 Start-Indexer $ixText
 
 if ($WithMedia) {
-    # 3. Audio runs in the background (one file at a time) and re-runs ix-<client>-text at its end.
-    #    Video starts once ix-<client>-text is idle, since logic-video-index re-runs it at its end too.
+    # 3. Audio runs in the background (one file at a time); the hourly indexer run picks its
+    #    transcripts up. Video is waited for, then ix-<client>-text runs once more for its text.
     Write-Host "`n== Audio / video" -ForegroundColor Cyan
     $audioRun = $null
     try { $audioRun = Start-OrFollow $transcribe } catch { Write-Warning "${transcribe}: $($_.Exception.Message)" }
-    Wait-Indexers @($ixText) $TimeoutMinutes
+    $videoDone = $false
     try {
         $videoRun = Start-OrFollow $videoLa
         $vs = Wait-Run $videoLa $videoRun $TimeoutMinutes
-        if ($vs -eq 'Succeeded') { Write-Host "  $videoLa : Succeeded" -ForegroundColor Green }
-        elseif ($vs -in @('Running', 'Waiting')) { Write-Warning "$videoLa still running after $TimeoutMinutes min; it indexes its output itself when done." }
-        else { Write-Host "  $videoLa : $vs" -ForegroundColor Red; $null = Show-RunErrors $videoLa $videoRun }
+        if ($vs -eq 'Succeeded') { Write-Host "  $videoLa : Succeeded" -ForegroundColor Green; $videoDone = $true }
+        elseif ($vs -in @('Running', 'Waiting')) { Write-Warning "$videoLa still running after $TimeoutMinutes min; the hourly indexer run will pick its text up." }
+        else { Write-Host "  $videoLa : $vs" -ForegroundColor Red }
+        $null = Show-RunErrors $videoLa $videoRun
     } catch { Write-Warning "${videoLa}: $($_.Exception.Message)" }
     if ($audioRun) {
-        Write-Host "  $transcribe : running in the background (one file at a time)"
+        Write-Host "  $transcribe : running in the background (one file at a time, indexed by the hourly indexer run)"
         $n = Show-RunErrors $transcribe $audioRun
         if ($n -eq 0) { Write-Host '    no failure so far' }
+    }
+    Wait-Indexers @($ixText) $TimeoutMinutes
+    if ($videoDone) {
+        Start-Indexer $ixText
+        Wait-Indexers @($ixText) $TimeoutMinutes
     }
     Wait-Indexers @($ixDi) $TimeoutMinutes
 } else {

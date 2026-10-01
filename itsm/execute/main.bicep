@@ -40,10 +40,10 @@
 
 param clientCode string = 'itsm-demo'
 param location string = resourceGroup().location
-param namePrefix string = 'knowledgeengine2'
+param namePrefix string = 'knowledgeengine3'
 param storageAccountName string = 'st${namePrefix}v9'
 param tableName string = 'itsmtickets'
-param keyVaultName string = 'kv-knowledgeengine-v9'
+param keyVaultName string = 'kv-knowledgeengine3-v9'
 param snInstance string = 'dev374242'
 param snUser string = 'svc_ke_itsm'
 param snSecretName string = 'servicenow-svc-ke-itsm-password'
@@ -56,10 +56,10 @@ param allowedGroupNames array = [
 ]
 
 @description('Dedicated Key Vault for one-time secret delivery (temporary passwords / TAPs) -- 3-24 chars, globally unique')
-param deliveryVaultName string = 'kv-ke2-itsm-delivery'
+param deliveryVaultName string = 'kv-ke3-itsm-delivery'
 
 @description('Web app whose managed identity reveals (reads + deletes) delivered secrets')
-param webAppName string = 'app-knowledgeengine2-v9'
+param webAppName string = 'app-knowledgeengine3-v9'
 
 @description('ServiceNow incident close_code used when resolving (Zurich choice list)')
 param incidentCloseCode string = 'Solution provided'

@@ -73,9 +73,9 @@ param containerName string = 'kb-${clientCode}'
 param location string = resourceGroup().location
 
 @description('Project naming prefix — matches infra/main.bicep')
-param namePrefix string = 'knowledgeengine2'
+param namePrefix string = 'knowledgeengine3'
 
-param keyVaultName string = 'kv-knowledgeengine-v9'
+param keyVaultName string = 'kv-knowledgeengine3-v9'
 param storageAccountName string = 'st${namePrefix}v9'
 
 @description('Azure AI Search service — the Logic App triggers ix-<clientCode>-text after writing transcripts, so audio content is searchable without waiting for a manual/scheduled indexer run')
@@ -84,7 +84,7 @@ param searchServiceName string = 'srch-${namePrefix}-v9'
 @description('Key Vault secret name holding the Azure AI Speech resource key')
 param speechSecretName string = 'speech-key'
 
-@description('Azure AI Speech resource endpoint, e.g. https://aif-knowledgeengine2-v9.cognitiveservices.azure.com')
+@description('Azure AI Speech resource endpoint, e.g. https://aif-knowledgeengine3-v9.cognitiveservices.azure.com')
 param speechEndpoint string
 
 @description('Speech-to-text batch transcription locale')
@@ -104,6 +104,18 @@ param pollMaxAttempts int = 60
 
 @description('Create the 5 RBAC role assignments (Key Vault Secrets User, Storage Blob Data Contributor, Storage Account Contributor, Search Service Contributor, Cognitive Services User on the Foundry account). Set to false if they already exist for this identity (e.g. a Logic App being redeployed in place).')
 param createRoleAssignments bool = true
+
+@description('First run of the daily Recurrence trigger, UTC. Default: 1 h 30 after the deployment: the roles granted below are active by then, and the first SharePoint ingestion (1 h after its own deployment) has brought the audio files. Then daily at that time.')
+param firstRunUtc string = dateTimeAdd(utcNow('u'), 'PT90M', 'yyyy-MM-ddTHH:mm:ssZ')
+
+var baseDefinition = loadJsonContent('workflow-definition.json')
+var workflowDefinition = union(baseDefinition, {
+  triggers: {
+    Recurrence: union(baseDefinition.triggers.Recurrence, {
+      recurrence: union(baseDefinition.triggers.Recurrence.recurrence, { startTime: firstRunUtc })
+    })
+  }
+})
 
 var logicAppName = 'logic-transcribe-${clientCode}'
 var keyVaultSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
@@ -153,7 +165,7 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
   }
   properties: {
     state: 'Enabled'
-    definition: loadJsonContent('workflow-definition.json')
+    definition: workflowDefinition
     parameters: {
       storageAccountName: { value: storageAccountName }
       audioContainerName: { value: audioContainerName }
@@ -176,7 +188,7 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
 
 // NOTE — before the first run:
 // 1. Create the Key Vault secret holding the Speech resource key:
-//    az keyvault secret set --vault-name kv-knowledgeengine-v9 --name speech-key --value <speech-key1>
+//    az keyvault secret set --vault-name kv-knowledgeengine3-v9 --name speech-key --value <speech-key1>
 // 2. The audioContainerName container must already exist and contain audio
 //    (it does, populated by the ingestion Logic App — logic-ingest-<client>).
 // 3. containerName (kb-<client>) must already exist (it does, used by ingestion).

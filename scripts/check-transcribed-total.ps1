@@ -16,7 +16,7 @@ chcp 65001 > $null
 
 $ErrorActionPreference = "Stop"
 
-$storageAccount = "stknowledgeengine2v9"
+$storageAccount = "stknowledgeengine3v9"
 $audioContainer = "audio-raw-$ClientCode"
 $apiVersion     = "2021-08-06"
 

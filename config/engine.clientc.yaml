@@ -18,10 +18,13 @@ knowledge:
 
 # Isolation (Jalon 5): tenant match (entraTenantId) always required; group
 # match (entraGroup) required only when the tenant hosts several clients.
-# clientc = Organisation 2, its own external Entra tenant, whole tenant = client
-# (no entraGroup -- every user in this tenant is granted access to clientc).
+# clientc = the demo "other organization" (runbook 6.6): its users sign in from
+# their OWN Entra tenant (ClientForDemo), whole tenant = this client, no
+# entraGroup. Without an external tenant it falls back to this tenant's
+# KE-v9-clientc group. The two lines below are rewritten by
+# scripts/attach-external-tenant.ps1 and scripts/bootstrap-new-tenant.ps1.
 access:
-  entraTenantId: "7bb131d8-9785-4b78-9f70-92d80b535162"   # Jalon 5 -- external tenant "ClientForDemo" (clientfordemo.onmicrosoft.com)
+  entraTenantId: "7bb131d8-9785-4b78-9f70-92d80b535162"   # external tenant, whole tenant = this client (no entraGroup), set by scripts/attach-external-tenant.ps1
 
 # Retrieval parameters (axiom A3 — hierarchy)
 retrieval:

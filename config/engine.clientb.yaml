@@ -19,8 +19,8 @@ knowledge:
 # Isolation (Jalon 5): tenant match (entraTenantId) always required; group
 # match (entraGroup) required only when the tenant hosts several clients.
 access:
-  entraTenantId: "6cdc0a5a-779d-4912-a0b3-455e5fc4d9c6"   # Jalon 5 -- tenant shared by every client hosted here
-  entraGroup: "f82f7ffa-e592-4ba0-9b14-4a4384f63a39"   # KE-v9-clientb (sandbox tenant)
+  entraTenantId: "a50d938b-4d51-449f-bfb7-ddd94df25268"   # set by scripts/bootstrap-new-tenant.ps1
+  entraGroup: "64856401-0e21-4228-81d7-88a041f7bf9d"   # KE-v9-clientb, set by scripts/bootstrap-new-tenant.ps1
 
 # Retrieval parameters (axiom A3 — hierarchy)
 retrieval:

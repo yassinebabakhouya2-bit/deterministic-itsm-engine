@@ -19,10 +19,10 @@
 #>
 param(
     [string]$SnInstance = 'dev374242',
-    [string]$KeyVaultName = 'kv-knowledgeengine-v9',
+    [string]$KeyVaultName = 'kv-knowledgeengine3-v9',
     [string]$SnSecretName = 'servicenow-svc-ke-itsm-password',
     [string]$SnUser = 'svc_ke_itsm',
-    [string]$StorageAccount = 'stknowledgeengine2v9',
+    [string]$StorageAccount = 'stknowledgeengine3v9',
     [string]$Table = 'itsmtickets',
     [string]$Partition = 'itsm-demo'
 )
@@ -57,8 +57,8 @@ function Invoke-Graph([string]$Method, [string]$Path, $Body, [switch]$AllowFail)
 
 $acct = az account show | ConvertFrom-Json
 Write-Host "Signed in as $($acct.user.name) on tenant $($acct.tenantId)" -ForegroundColor Yellow
-if ((Read-Host 'Reset the ITSM demo on this PERSONAL tenant? Type YES') -ne 'YES') { throw 'Aborted.' }
 $domain = ((Invoke-Graph GET '/domains' $null).value | Where-Object { $_.isDefault }).id
+if ((Read-Host "Reset the ITSM demo in tenant $domain ($($acct.tenantId))? Type YES") -ne 'YES') { throw 'Aborted.' }
 
 # ---------------------------------------------------------------- Entra: users
 $userIds = @{}
@@ -90,7 +90,6 @@ foreach ($g in $identities.groups) {
         }
     }
 }
-Write-Host 'Note: the Microsoft 365 group KnowledgeEngineV9 removed by an offboarding test is not a demo group; re-add manually if needed.' -ForegroundColor DarkYellow
 
 # ---------------------------------------------------------------- ServiceNow: reopen the demo tickets
 # stdout only: az warnings on stderr must never end up inside the password
