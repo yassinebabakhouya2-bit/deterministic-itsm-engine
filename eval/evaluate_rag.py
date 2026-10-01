@@ -67,7 +67,7 @@ EVAL_DIR = Path(__file__).resolve().parent
 # Only SYNTHETIC clients are uploaded: real clients' questions/answers never
 # leave clients-local/ (same isolation rule as the golden sets).
 FOUNDRY_PROJECT_ENDPOINT = (
-    "https://aif-knowledgeengine2-v9.services.ai.azure.com/api/projects/proj-knowledgeengine2-v9"
+    "https://aif-knowledgeengine3-v9.services.ai.azure.com/api/projects/proj-knowledgeengine3-v9"
 )
 
 _parser = argparse.ArgumentParser(description="KnowledgeEngine v9 RAG evaluation")
