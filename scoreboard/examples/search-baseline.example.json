@@ -1,0 +1,13 @@
+{
+  "name": "search-baseline",
+  "endpoint": "https://<search-service>.search.windows.net",
+  "index": "idx-{client}",
+  "query_type": "semantic",
+  "semantic_configuration": null,
+  "vector_field": null,
+  "fiche_id_field": "title",
+  "fiche_id_regex": "KB\\d{5,}",
+  "title_field": "title",
+  "top": 20,
+  "auth": "entra"
+}

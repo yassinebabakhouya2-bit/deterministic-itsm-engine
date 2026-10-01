@@ -1,0 +1,6 @@
+{
+  "endpoint": "https://<foundry-account>.openai.azure.com",
+  "deployment": "gpt-4o",
+  "api_version": "2024-10-21",
+  "auth": "entra"
+}

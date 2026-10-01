@@ -1,0 +1,11 @@
+Compte Windows verrouillé
+
+Prérequis
+- Avoir les droits d'administration sur l'Active Directory.
+
+Résolution
+Étape 1 : Vérifiez l'identité de l'utilisateur.
+Étape 2 : Ouvrez la console Utilisateurs et ordinateurs Active Directory.
+Étape 3 : Déverrouillez le compte puis demandez à l'utilisateur de se reconnecter.
+
+Pour toute question, contactez le support au 05 22 12 34 56.
