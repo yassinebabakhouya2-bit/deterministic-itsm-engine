@@ -9,10 +9,10 @@
 # =====================================================================
 param(
   [Parameter(Mandatory = $true)][string]$ClientId,
-  [string]$Service        = "srch-knowledgeengine2-v9",
+  [string]$Service        = "srch-knowledgeengine3-v9",
   [string]$ResourceGroup  = "rg-knowledgeengine-v9",
-  [string]$StorageAccount = "stknowledgeengine2v9",
-  [string]$FunctionApp    = "fn-knowledgeengine2-v9",   # Etape 3 : Function d'enrichissement (voir enrichment/)
+  [string]$StorageAccount = "stknowledgeengine3v9",
+  [string]$FunctionApp    = "fn-knowledgeengine3-v9",   # Etape 3 : Function d'enrichissement (voir enrichment/)
   [string]$SubscriptionId,
   [string]$ApiVersion     = "2026-04-01"   # >= requis pour #Microsoft.Skills.Util.DocumentIntelligenceLayoutSkill + AIServicesByIdentity
 )
@@ -79,7 +79,21 @@ function Put-Resource($collection, $name, $templateFile) {
   $body = Get-Content (Join-Path $PSScriptRoot $templateFile) -Raw
   $body = $body.Replace("__CLIENTID__", $ClientId).Replace("__STORAGE_RESOURCE_ID__", $storageResourceId).Replace("__FN_ENRICH_KEY__", $fnKey)
   $uri  = "$endpoint/$collection/$name`?api-version=$ApiVersion"
-  Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -Body $body | Out-Null
+  # A role granted minutes earlier (infra/modules/roles.bicep: Search -> Cognitive Services
+  # User on Foundry) can take several minutes to reach the Search service, whose skillset
+  # validation then answers "Unable to connect to AI Services using managed identity".
+  # Retry that error only (RBAC propagation), for up to 10 minutes; anything else throws.
+  for ($attempt = 1; $attempt -le 20; $attempt++) {
+    try {
+      Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -Body $body | Out-Null
+      break
+    } catch {
+      $detail = "$($_.ErrorDetails.Message) $($_.Exception.Message)"
+      if (($detail -notmatch 'Unable to connect to AI Services using managed identity') -or ($attempt -ge 20)) { throw }
+      Write-Host "  $collection/$name : Search identity not yet authorized on the AI Services account (RBAC propagation) - retry $attempt/20 in 30 s..."
+      Start-Sleep -Seconds 30
+    }
+  }
   Write-Host "  OK -> $collection/$name"
 }
 

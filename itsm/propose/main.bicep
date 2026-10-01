@@ -33,7 +33,7 @@
 
 param clientCode string = 'itsm-demo'
 param location string = resourceGroup().location
-param namePrefix string = 'knowledgeengine2'
+param namePrefix string = 'knowledgeengine3'
 param storageAccountName string = 'st${namePrefix}v9'
 param tableName string = 'itsmtickets'
 param foundryName string = 'aif-${namePrefix}-v9'

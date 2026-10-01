@@ -65,10 +65,19 @@ param enrichCapacity int = 20
 @description('Creer le deploiement gpt-4o-enrich. La validation preflight d\'ARM evalue le quota AVANT d\'appliquer la reduction de gpt-4o : si elle refuse, deployer une premiere fois avec false (ce qui ramene gpt-4o a 30), puis une seconde fois avec true.')
 param deployEnrichModel bool = true
 
+@description('Capacity (kTPM) of the text-embedding-3-large deployment. Lowered by scripts/bootstrap-new-tenant.ps1 when a new subscription has less quota.')
+param embeddingCapacity int = 120
+
 // ---- GPT-4o deployment (regional Standard, pinned version) ----
 resource gpt4o 'Microsoft.CognitiveServices/accounts/deployments@2025-04-01-preview' = {
   parent: foundry
   name: 'gpt-4o'
+  // dependsOn project: the account accepts ONE write at a time. Without it ARM PUTs the
+  // project and gpt-4o in parallel and one of them fails with RequestConflict ("Another
+  // operation is in progress") -- on every run, not transiently (2026-09-26, runbook 12.4).
+  dependsOn: [
+    project
+  ]
   sku: {
     name: 'Standard' // regional → France Central sovereignty
     capacity: generationCapacity // partage du quota avec gpt-4o-enrich, voir plus haut
@@ -94,7 +103,7 @@ resource embedding 'Microsoft.CognitiveServices/accounts/deployments@2025-04-01-
   ]
   sku: {
     name: 'Standard'
-    capacity: 120 // ~120,000 tokens/min
+    capacity: embeddingCapacity // default 120 = ~120,000 tokens/min
   }
   properties: {
     model: {

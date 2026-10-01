@@ -13,8 +13,8 @@ serviceNowInstance: dev374242
 # Access (deny-by-default, same claim-based model as Jalon 5 / app/auth.py):
 # the signed-in user must come from this tenant AND hold this Entra security group.
 access:
-  entraTenantId: "6cdc0a5a-779d-4912-a0b3-455e5fc4d9c6"
-  entraGroup: "1bcf7b37-d2fd-4f5c-968c-906ddafac988"   # KE-v9-itsm-agents, created 2026-09-25 (runbook 11.6)
+  entraTenantId: "a50d938b-4d51-449f-bfb7-ddd94df25268"   # set by scripts/bootstrap-new-tenant.ps1
+  entraGroup: "7e85cafe-bc3b-49e6-a5d4-1d8d80b9a508"   # KE-v9-itsm-agents, set by scripts/bootstrap-new-tenant.ps1
 
 # Groups an agent may pick when validating a group_add proposal.
 # Must stay in sync with the allowedGroups parameter of itsm/propose/main.bicep.
@@ -25,4 +25,4 @@ allowedGroups:
 
 # Dedicated Key Vault holding one-time secrets (temporary passwords / TAPs) written by the
 # executor (itsm/execute) and revealed ONCE in the review tab to the validating agent, then deleted.
-deliveryKeyVault: kv-ke2-itsm-delivery
+deliveryKeyVault: kv-ke3-itsm-delivery

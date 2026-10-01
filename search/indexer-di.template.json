@@ -4,6 +4,9 @@
   "dataSourceName": "ds-__CLIENTID__",
   "skillsetName": "ss-__CLIENTID__-di",
   "targetIndexName": "idx-__CLIENTID__",
+  "schedule": {
+    "interval": "PT1H"
+  },
   "parameters": {
     "batchSize": 1,
     "maxFailedItems": -1,

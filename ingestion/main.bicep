@@ -31,15 +31,18 @@ param containerName string = 'kb-${clientCode}'
 @description('Destination Blob container name for audio files discovered anywhere in the site (Jalon 7)')
 param audioContainerName string = 'audio-raw-${clientCode}'
 
+@description('Destination Blob container name for video files discovered anywhere in the site (Jalon 8) — never routed to containerName/kb-<client> directly')
+param videoContainerName string = 'video-raw-${clientCode}'
+
 @description('Additional query string on the Graph listing call. Empty in production; "?$top=1" to smoke-test with a single file before a full ingestion.')
 param listQuery string = ''
 
 param location string = resourceGroup().location
 
 @description('Project naming prefix — matches infra/main.bicep')
-param namePrefix string = 'knowledgeengine2'
+param namePrefix string = 'knowledgeengine3'
 
-param keyVaultName string = 'kv-knowledgeengine-v9'
+param keyVaultName string = 'kv-knowledgeengine3-v9'
 param secretName string = 'ingestion-secret-v2'
 param storageAccountName string = 'st${namePrefix}v9'
 
@@ -51,6 +54,18 @@ param appClientId string
 
 @description('Create the 2 RBAC role assignments (Key Vault Secrets User, Storage Blob Data Contributor). Set to false if they already exist for this identity (e.g. a Logic App being redeployed in place).')
 param createRoleAssignments bool = true
+
+@description('First run of the daily Recurrence trigger, UTC. Default: 1 h after the deployment, so the Key Vault / Storage roles granted below are active by then (a run at creation time failed on Get_secret with 403 and the next one came 24 h later). Then daily at that time.')
+param firstRunUtc string = dateTimeAdd(utcNow('u'), 'PT1H', 'yyyy-MM-ddTHH:mm:ssZ')
+
+var baseDefinition = loadJsonContent('workflow-definition.json')
+var workflowDefinition = union(baseDefinition, {
+  triggers: {
+    Recurrence: union(baseDefinition.triggers.Recurrence, {
+      recurrence: union(baseDefinition.triggers.Recurrence.recurrence, { startTime: firstRunUtc })
+    })
+  }
+})
 
 var logicAppName = 'logic-ingest-${clientCode}'
 var keyVaultSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
@@ -72,7 +87,7 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
   }
   properties: {
     state: 'Enabled'
-    definition: loadJsonContent('workflow-definition.json')
+    definition: workflowDefinition
     parameters: {
       siteId: { value: siteId }
       tenantId: { value: tenantId }
@@ -82,6 +97,7 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
       storageAccountName: { value: storageAccountName }
       containerName: { value: containerName }
       audioContainerName: { value: audioContainerName }
+      videoContainerName: { value: videoContainerName }
       clientId: { value: clientCode }
       listQuery: { value: listQuery }
     }
@@ -93,9 +109,14 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
 // needs no additional role assignment, provided the container itself
 // exists before the Logic App's first run (create it once, e.g.
 // `az storage container create --name audio-raw-<client> --account-name
-// stknowledgeengine2v9 --auth-mode login`, or let the PUT blob call create
+// stknowledgeengine3v9 --auth-mode login`, or let the PUT blob call create
 // it implicitly — Azure Blob Storage does NOT auto-create containers on
 // PUT blob, so create it explicitly first).
+// Same applies to videoContainerName (Jalon 8, 2026-09-25): create it once
+// before the first run of a client whose ingestion Logic App now routes
+// video files there, e.g.
+// `az storage container create --name video-raw-<client> --account-name
+// stknowledgeengine3v9 --auth-mode login`.
 
 resource kvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (createRoleAssignments) {
   name: guid(keyVault.id, logicAppName, keyVaultSecretsUserRoleId)

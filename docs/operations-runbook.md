@@ -1708,3 +1708,23 @@ diagnostic asks its questions; once a plan is validated the plan replaces it. Th
 assistant is kept at `/classic` (link "Assistant classique", keeps its saved conversations), so a
 rollback is one redirect line in `app/app.py` (`root`). Not yet in the unified tab: audio/video
 secondary sources and the Assistant's conversation history sidebar.
+
+### 13.8 Corrections session reset mot de passe (2026-09-30)
+- Fiche choisie par l'utilisateur (bouton) = confirmation humaine: passage direct a KB_MATCHED puis plan; la question "Laquelle de ces situations" n'est plus reposee.
+- `required_variables` vaut [] par defaut; la question "application" n'est posee que si requise ou sans candidat.
+- Extrait de fiche lisible (filtre `kb_text`, balisage DI retire).
+- Session terminee (escalade/plan): les reponses ulterieures sont ignorees (plus de messages ajoutes).
+- Redeploiement: `.\deploy-webapp.ps1 -ClientsLocal client-s`.
+
+### 13.9 Refonte : moteur de resolution guidee (2026-09-30)
+Remplace le paquet `orchestration/diagnostic/` (supprime) par `orchestration/guide/`. Plus aucune escalade.
+- Parcours : (1) fiche exacte -> (2) resume des etapes -> (3) accompagnement etape par etape jusqu'a "resolu".
+- Phases : LOCATE, GUIDING, SOLVED (seul etat final), STUCK (attente d'une nouvelle description, non final).
+- Fiche exacte : score reranker >= `exact_score` (2.0) et ecart >= `margin_min` (0.5), recoupe par un juge LLM (temp 0, schema strict) ; en cas d'ambiguite l'utilisateur choisit parmi 3 fiches (boutons) ; apres `max_rounds` (2) clarifications sans choix, la meilleure fiche est prise ("la plus proche"). Seuils NON calibres : `diagnostic:` dans `engine.<client>.yaml`.
+- Guide : resume + etapes (titre court, consigne fidele a la fiche) ; validation en code (chaque etape cite un chunk existant, `verbatim` degrade si faux) ; repli deterministe sur les lignes numerotees de la fiche.
+- Etapes : boutons Fait / Ca ne marche pas / Expliquer / Precedente ; aide basee sur la fiche uniquement (sinon rappel de la consigne) ; apres 2 echecs proposition d'une autre fiche ; "Ce n'est pas la bonne fiche" et "toujours pas resolu" proposent les fiches suivantes ; plus de fiche -> STUCK.
+- Sujets sensibles (MFA, admin, suppression, incident) : bandeau d'alerte, pas d'escalade.
+- Actions = liste fermee (`pick:1-3, done, blocked, explain, back, wrong_fiche, solved_yes, solved_no, none`), validee cote serveur.
+- Webhook ServiceNow : meme route, reponse `state/guide/current_step/outbox` ; `/diag/internal/sweep` est un no-op.
+- Tests : `tests/test_guide_fsm.py`, `tests/test_guide_app.py` (24 passes).
+- Deploiement : `.\deploy-webapp.ps1 -ClientsLocal client-s`.

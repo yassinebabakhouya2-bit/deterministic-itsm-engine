@@ -10,9 +10,9 @@
   clients-local/itsm-demo-credentials.csv (git-ignored). Never commit that file.
 
   Prerequisites:
-    - `az login --tenant <personal tenant>` with an account that is Global Admin
-      (or User Administrator + Privileged Role Administrator) on the PERSONAL tenant.
-      Check with `az account show` first - do NOT run this against an employer or client tenant.
+    - `az login --tenant <target tenant>` with an account that is Global Admin
+      (or User Administrator + Privileged Role Administrator) on that tenant.
+      The script shows the target tenant (domain and ID) and asks for YES before any change.
     - ServiceNow dev instance admin credentials (prompted).
 
   Source is ASCII only on purpose (Windows PowerShell 5.1 pitfall, runbook 9.1).
@@ -77,12 +77,11 @@ function New-DemoPassword {
 # ---------------------------------------------------------------- Safety check
 $acct = az account show | ConvertFrom-Json
 Write-Host "Signed in as $($acct.user.name) on tenant $($acct.tenantId)" -ForegroundColor Yellow
-$confirm = Read-Host "Is this the PERSONAL KnowledgeEngine tenant (not an employer or client tenant)? Type YES to continue"
-if ($confirm -ne 'YES') { throw 'Aborted by operator.' }
-
 if (-not $TenantDomain) {
     $TenantDomain = ((Invoke-Graph -Method GET -Path '/domains').value | Where-Object { $_.isDefault }).id
 }
+$confirm = Read-Host "Create the demo identities in tenant $TenantDomain ($($acct.tenantId))? Type YES to continue"
+if ($confirm -ne 'YES') { throw 'Aborted by operator.' }
 Write-Host "Using domain: $TenantDomain"
 
 # ---------------------------------------------------------------- Entra groups
@@ -221,7 +220,18 @@ $snUserIds = @{}
 foreach ($u in $config.users) {
     $upn = "$($u.nick)@$TenantDomain"
     $existing = Get-SnFirst 'sys_user' "user_name=$($u.nick)"
-    if ($existing) { $snUserIds[$u.nick] = $existing.sys_id; Write-Host "[skip] SN user $($u.nick) exists"; continue }
+    if ($existing) {
+        $snUserIds[$u.nick] = $existing.sys_id
+        if ($existing.email -ne $upn) {
+            # Rebuild on a new tenant (runbook 12): same ServiceNow caller, new Entra UPN. The ITSM
+            # Logic Apps link a ticket to its Entra user by email = UPN, so it must follow.
+            Invoke-Sn PATCH "sys_user/$($existing.sys_id)" @{ email = $upn } | Out-Null
+            Write-Host "[upd ] SN user $($u.nick) email -> $upn" -ForegroundColor Green
+        } else {
+            Write-Host "[skip] SN user $($u.nick) exists"
+        }
+        continue
+    }
     $first, $last = $u.displayName -split " ", 2
     $new = Invoke-Sn POST 'sys_user' @{
         user_name = $u.nick; first_name = $first; last_name = $last

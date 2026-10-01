@@ -48,9 +48,9 @@ param snSecretName string = 'servicenow-svc-ke-itsm-password'
 param location string = resourceGroup().location
 
 @description('Project naming prefix -- matches infra/main.bicep')
-param namePrefix string = 'knowledgeengine2'
+param namePrefix string = 'knowledgeengine3'
 
-param keyVaultName string = 'kv-knowledgeengine-v9'
+param keyVaultName string = 'kv-knowledgeengine3-v9'
 param storageAccountName string = 'st${namePrefix}v9'
 param tableName string = 'itsmtickets'
 
@@ -104,7 +104,7 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
 }
 
 // NOTE -- before the first run, create the secret (see docs/operations-runbook.md 11.4):
-//   az keyvault secret set --vault-name kv-knowledgeengine-v9 --name servicenow-svc-ke-itsm-password --file <tmpfile>
+//   az keyvault secret set --vault-name kv-knowledgeengine3-v9 --name servicenow-svc-ke-itsm-password --file <tmpfile>
 
 resource kvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (createRoleAssignments) {
   name: guid(keyVault.id, logicAppName, keyVaultSecretsUserRoleId)

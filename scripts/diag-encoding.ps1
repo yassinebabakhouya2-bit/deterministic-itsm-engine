@@ -8,7 +8,7 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
 $allNames = az storage blob list `
-    --account-name stknowledgeengine2v9 `
+    --account-name stknowledgeengine3v9 `
     --container-name audio-raw-client-s `
     --auth-mode login `
     --query "[].name" `

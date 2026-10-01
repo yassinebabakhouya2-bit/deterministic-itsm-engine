@@ -246,7 +246,7 @@
         },
         "Compose_blobsJson": {
           "type": "Compose",
-          "description": "XML listing converted to JSON gives an array only for 2+ blobs: one blob is an object, none is null. Normalized to an array here, otherwise Select_blobInfo fails with 1 or 0 files (the run still showed Succeeded because Run_search_indexer always runs last).",
+          "description": "XML listing converted to JSON gives an array only for 2+ blobs: one blob is an object, none is null. Normalized to an array here, otherwise Select_blobInfo fails with 1 or 0 files (and the failure was hidden: the run used to end with an always-run reindex step).",
           "inputs": "@if(equals(outputs('Compose_blobsRaw'), null), createArray(), if(startsWith(string(coalesce(outputs('Compose_blobsRaw'), '')), '['), outputs('Compose_blobsRaw'), createArray(outputs('Compose_blobsRaw'))))",
           "runAfter": {
             "Compose_blobsRaw": [
@@ -1028,26 +1028,6 @@
       "runAfter": {
         "Filter_unindexed": [
           "Succeeded"
-        ]
-      }
-    },
-    "Run_search_indexer": {
-      "type": "Http",
-      "description": "Reindexation automatique : force un passage de l'indexeur texte natif (ix-<clientId>-text) juste apres l'ecriture des .txt video, pour que les transcriptions soient interrogeables sans attendre un declenchement manuel. Toujours execute, meme si For_each_video a eu des echecs individuels.",
-      "inputs": {
-        "method": "POST",
-        "uri": "@{concat('https://', parameters('searchServiceName'), '.search.windows.net/indexers/ix-', parameters('clientId'), '-text/run?api-version=2024-07-01')}",
-        "authentication": {
-          "type": "ManagedServiceIdentity",
-          "audience": "https://search.azure.com/"
-        }
-      },
-      "runAfter": {
-        "For_each_video": [
-          "Succeeded",
-          "Failed",
-          "Skipped",
-          "TimedOut"
         ]
       }
     }

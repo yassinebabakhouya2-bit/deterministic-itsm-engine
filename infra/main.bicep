@@ -10,7 +10,7 @@ targetScope = 'resourceGroup'
 param location string = 'francecentral'
 
 @description('Project naming prefix')
-param namePrefix string = 'knowledgeengine2'
+param namePrefix string = 'knowledgeengine3'
 
 @description('Enable Easy Auth on the demo Web App (require a signed-in Entra ID user). Client-level isolation is handled by app/auth.py (Jalon 5), not by this flag. See app/README.md for how to create the App Registration.')
 param enableEasyAuth bool = true
@@ -36,6 +36,22 @@ param enrichDeployment string = 'gpt-4o-enrich'
 
 @description('Creer le deploiement de modele gpt-4o-enrich. Mettre a false pour un premier passage si la validation preflight refuse le quota (voir infra/modules/foundry.bicep).')
 param deployEnrichModel bool = true
+
+@description('gpt-4o (answer path) capacity in kTPM -- see modules/foundry.bicep. scripts/bootstrap-new-tenant.ps1 lowers it to fit a new subscription quota.')
+param generationCapacity int = 30
+
+@description('gpt-4o-enrich (indexing) capacity in kTPM -- see modules/foundry.bicep.')
+param enrichCapacity int = 20
+
+@description('text-embedding-3-large capacity in kTPM -- see modules/foundry.bicep.')
+param embeddingCapacity int = 120
+
+@description('Deploy (or re-apply) the AI Foundry account, its project and the 3 model deployments. scripts/bootstrap-new-tenant.ps1 passes false when they already exist and are Succeeded: every re-apply PUTs the Cognitive Services account again, which on a new subscription hit RequestConflict and, repeated, the anti-abuse block 715-123420 (runbook 12.4).')
+param deployFoundry bool = true
+
+// Deterministic name: the modules below no longer need the foundry module's outputs,
+// so they still work when deployFoundry is false (they reference the account as existing).
+var foundryAccountName = 'aif-${namePrefix}-v9'
 
 // ---------------------------------------------------------------------
 // Blob storage — hosts KB records per client (private containers)
@@ -63,13 +79,16 @@ module search 'modules/search.bicep' = {
 // ---------------------------------------------------------------------
 // Azure AI Foundry + project + GPT-4o / embedding deployments
 // ---------------------------------------------------------------------
-module foundry 'modules/foundry.bicep' = {
+module foundry 'modules/foundry.bicep' = if (deployFoundry) {
   name: 'foundry'
   params: {
-    foundryName: 'aif-${namePrefix}-v9'
+    foundryName: foundryAccountName
     projectName: 'proj-${namePrefix}-v9'
     location: location
     deployEnrichModel: deployEnrichModel
+    generationCapacity: generationCapacity
+    enrichCapacity: enrichCapacity
+    embeddingCapacity: embeddingCapacity
   }
 }
 
@@ -104,13 +123,14 @@ module enrichFunction 'modules/enrich-function.bicep' = {
   name: 'enrichFunction'
   dependsOn: [
     webapp
+    foundry // explicit now that foundryName no longer comes from its outputs
   ]
   params: {
     functionAppName: 'fn-${namePrefix}-v9'
     hostingPlanName: 'plan-${namePrefix}-v9'
     location: location
     storageAccountName: storage.outputs.storageAccountName
-    foundryName: foundry.outputs.foundryName
+    foundryName: foundryAccountName
     searchServiceName: search.outputs.searchServiceName
     enrichDeployment: enrichDeployment
   }
@@ -122,10 +142,13 @@ module enrichFunction 'modules/enrich-function.bicep' = {
 // ---------------------------------------------------------------------
 module roles 'modules/roles.bicep' = {
   name: 'roles'
+  dependsOn: [
+    foundry // explicit now that foundryName no longer comes from its outputs
+  ]
   params: {
     searchPrincipalId: search.outputs.searchPrincipalId
     storageAccountName: storage.outputs.storageAccountName
-    foundryName: foundry.outputs.foundryName
+    foundryName: foundryAccountName
     searchServiceName: search.outputs.searchServiceName
     webAppPrincipalId: webapp.outputs.webAppPrincipalId
   }
@@ -133,6 +156,6 @@ module roles 'modules/roles.bicep' = {
 
 output storageAccountName string = storage.outputs.storageAccountName
 output searchServiceName string = search.outputs.searchServiceName
-output foundryName string = foundry.outputs.foundryName
+output foundryName string = foundryAccountName
 output webAppHostName string = webapp.outputs.webAppHostName
 output enrichFunctionHostName string = enrichFunction.outputs.functionAppHostName

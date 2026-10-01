@@ -8,7 +8,7 @@
   .\scripts\itsm\grant-graph-app-roles.ps1 -PrincipalId <managedIdentityPrincipalId> -Roles Directory.Read.All
 
   Needs an account allowed to grant admin consent on the tenant (Global Admin /
-  Privileged Role Administrator), signed in with az login on the PERSONAL tenant.
+  Privileged Role Administrator), signed in with az login on the target tenant.
   Source is ASCII only (runbook 9.1).
 #>
 param(
