@@ -1,0 +1,7 @@
+{"ticket_id": "T-1", "client": "clienta", "text": "Outlook reste bloqué au démarrage sur le chargement du profil, erreur 0x80070005.", "expected": ["KB0030001"]}
+{"ticket_id": "T-2", "client": "clienta", "text": "La caméra reste toute noire pendant les réunions dans Teams, personne ne me voit.", "expected": ["KB0030003"]}
+{"ticket_id": "T-3", "client": "clienta", "text": "Le VPN GlobalProtect se déconnecte toutes les 10 minutes, erreur 1722.", "expected": ["KB0030004"]}
+{"ticket_id": "T-4", "client": "clienta", "text": "Mon compte est verrouillé dans Active Directory, je ne peux plus me connecter.", "expected": ["KB0030005"]}
+{"ticket_id": "T-5", "client": "clienta", "text": "L'application reste bloquée au démarrage, erreur 0x80070005.", "expected": ["KB0030001", "KB0030002"]}
+{"ticket_id": "T-6", "client": "clientb", "text": "Outlook reste bloqué au démarrage, erreur 0x80070005.", "expected": ["KB0040001"]}
+{"ticket_id": "T-7", "client": "clienta", "text": "Le clavier du poste ne répond plus du tout depuis ce matin.", "expected": []}
