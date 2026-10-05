@@ -12,7 +12,11 @@ fiche, algorithmically, not asserted.
 This is not a rewrite of the showcase engine; it is a harder, measured
 version of the same diagnostic problem, built incrementally with a
 measurement harness first so every later change is judged against a number,
-not an impression.
+not an impression. It is not a separate product either: as of 2026-10-05 it
+lives in the same repository as the diagnostic engine and the ITSM action
+engine (`deterministic-itsm-engine`, formerly `knowledgeengine-rag-platform`)
+— all three are the same "code decides" principle applied to a different
+decision (which fiche, which step, which ITSM action).
 
 ## The three packages
 

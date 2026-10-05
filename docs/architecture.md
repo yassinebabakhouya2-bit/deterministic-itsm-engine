@@ -6,6 +6,8 @@
 
 AI assistance platform for enterprise IT support, built entirely on Azure, leveraging multimodal knowledge (documents, screenshots, audio, video) from multiple client organizations within a strictly isolated multi-tenant architecture. Deterministic, client-agnostic design: reproducible, traceable answers, no business logic hardcoded into the engine. Extraction, indexing, orchestration, and evaluation all run on managed Azure services — no custom code.
 
+This blueprint covers the **diagnostic engine** described below end to end. The **ITSM action engine** (Jalon 10 — ServiceNow ticket → GPT-4o proposal → deterministic guardrails → human approval → Entra ID execution) is the second application of the same five axioms; see the root `README.md` for how the two share one deterministic core, and `docs/operations-runbook.md` §11 for its own implementation detail.
+
 ## Design principles carried through the architecture
 
 - The 5 axioms (below)

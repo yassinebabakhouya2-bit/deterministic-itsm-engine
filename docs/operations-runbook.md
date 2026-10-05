@@ -38,14 +38,15 @@ session.
 - §11 ITSM action module (Jalon 10) — demo identities, Logic Apps, demo replay
 - §12 Rebuild in a new tenant — `scripts/bootstrap-new-tenant.ps1`
 - §13 Diagnostic engine (deterministic agentic RAG) — Diagnostic tab, ServiceNow webhook, display fixes
+- §14 Repository renamed to `deterministic-itsm-engine` (2026-10-05)
 
 ---
 
 ## §-1. Clone this repository
 
 ```bash
-git clone https://github.com/yassinebabakhouya2-bit/knowledgeengine-rag-platform.git
-cd knowledgeengine-rag-platform
+git clone https://github.com/yassinebabakhouya2-bit/deterministic-itsm-engine.git
+cd deterministic-itsm-engine  # renamed 2026-10-05 from knowledgeengine-rag-platform; existing local clones keep working via `git remote set-url origin ...` (same history).
 ```
 
 Private repo — needs an authenticated GitHub account with access. `git
@@ -1728,3 +1729,34 @@ Remplace le paquet `orchestration/diagnostic/` (supprime) par `orchestration/gui
 - Webhook ServiceNow : meme route, reponse `state/guide/current_step/outbox` ; `/diag/internal/sweep` est un no-op.
 - Tests : `tests/test_guide_fsm.py`, `tests/test_guide_app.py` (24 passes).
 - Deploiement : `.\deploy-webapp.ps1 -ClientsLocal client-s`.
+
+
+## §14. Repository renamed to `deterministic-itsm-engine` (2026-10-05)
+
+- GitHub repo `yassinebabakhouya2-bit/knowledgeengine-rag-platform` renamed to
+  `yassinebabakhouya2-bit/deterministic-itsm-engine` from the repo's GitHub
+  Settings page. GitHub redirects the old URL automatically; existing local
+  clones keep working without any change, but the remote URL was also
+  updated for consistency:
+  ```powershell
+  git remote set-url origin https://github.com/yassinebabakhouya2-bit/deterministic-itsm-engine.git
+  ```
+- Reason: the repo name `knowledgeengine-rag-platform` undersold what the
+  repo actually demonstrates — a deterministic *decision* layer (code
+  decides, never the LLM) applied to two problems: which KB fiche/step to
+  show (diagnostic engine) and which ITSM action to take (Jalon 10 action
+  engine, already closed and validated live). `deterministic-itsm-engine`
+  names the differentiator; both modules stay in this one repo, not split
+  across repos — the earlier plan to split the V10 diagnostic track into its
+  own repo (`deterministic-diagnostic-engine`, created 2026-10-04) was
+  reversed the next day (see `jalon10`/`diagnostic-engine` project memory):
+  V10 continues directly on `main` of this same repo.
+- README.md, CLAUDE.md, `docs/architecture.md` and `docs/v10-deterministic-engine.md`
+  updated the same day to reflect the new name and the unified framing
+  (diagnostic engine + ITSM action engine = two applications of one
+  deterministic core). This runbook's own history above (§0–§13) is left
+  untouched — it is a log of what was actually run, not a document to
+  rewrite after the fact.
+- Local folder name on disk (`C:\V9\knowledgeengine-rag-platform`) was not
+  renamed — purely cosmetic, left as is to avoid re-pointing every open
+  terminal/IDE session; only the GitHub remote name changed.

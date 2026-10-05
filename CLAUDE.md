@@ -1,7 +1,10 @@
 # CLAUDE.md — working rules for this repository
 
-Project: KnowledgeEngine v9 — multi-client Azure RAG platform (private repo
-`yassinebabakhouya2-bit/knowledgeengine-rag-platform`). This file is read by
+Project: Deterministic ITSM Engine (v9 lineage) — multi-client Azure platform
+combining a deterministic diagnostic engine and an ITSM action engine (private
+repo `yassinebabakhouya2-bit/deterministic-itsm-engine`, renamed 2026-10-05 from
+`knowledgeengine-rag-platform` — same repo, same git history, no break). This
+file is read by
 every Claude session (Claude Code, Cowork, or any other surface) that opens
 this repository. That is the point of it: it is the one enforcement
 mechanism that survives across separate conversations and even separate
