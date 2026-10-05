@@ -4,16 +4,33 @@ For each fiche:
 
 1. boilerplate lines of the client's profile are removed, e-mails and phone
    numbers masked;
-2. the rules (segment.py) and the LLM (llm_segment.py) split it into steps,
-   independently;
+2. the LLM (llm_segment.py) splits it into steps; the rules (segment.py) do
+   the same, independently;
 3. every LLM quote must be found in the fiche (text.NormalizedText) or it is
    dropped; a rewording is kept only if it adds no command, path, menu, key or
    code (entities.novel_technical_entities);
-4. the two splits are aligned: agreement gives high confidence, disagreement
-   low confidence;
+4. confidence comes from the LLM checking itself: a second pass, with a
+   different temperature and seed, segments the same fiche again; the two
+   LLM passes are aligned the same way spans are always aligned (align()) —
+   agreement gives high confidence, disagreement low confidence. The rules
+   pass is not part of this signal (see why below); it only fills in
+   structural detail (list level/number, goto, condition) on the matching
+   LLM steps, and its own agreement with the LLM is kept as a diagnostic
+   field ('rules_agreement'), never used to decide status or confidence.
 5. status: 'guided' (high confidence and at least one resolution step),
    'citable' (shown as a source, never guided step by step), or 'info_only'
    (no resolution step).
+
+Why self-consistency and not rules-vs-LLM: the rules pass only finds steps
+when the fiche uses list markers (bullets, numbers, imperative-first lines).
+On a fiche written as free prose it finds nothing, every time, regardless of
+whether the LLM's extraction is any good — so "rules agree with the LLM"
+measures the client's writing style, not the extraction's reliability, and
+guided became nearly unreachable for prose-heavy clients. Self-consistency
+(does the LLM agree with itself, from a fresh pass) measures confidence the
+same way for every client, independently of how its fiches are written, so
+one mechanism now works unmodified for a list-based KB, a prose-based one, or
+a mix.
 
 A step's text is always the fiche's own span. A "si échec" link exists only
 when the fiche writes it.
@@ -35,6 +52,9 @@ from .text import NormalizedText, Scrubber
 DECOMPOSITION_VERSION = 1
 AGREEMENT_THRESHOLD = 0.8
 MATCH_IOU = 0.5
+# the self-check pass: same fiche, different sampling, to see whether the LLM agrees with itself.
+SELF_CHECK_TEMPERATURE = 0.5
+SELF_CHECK_SEED = 97
 
 
 @dataclass
@@ -136,6 +156,7 @@ class Decomposer:
     def __init__(self, profile: Profile | None = None, llm=None, agreement_threshold: float = AGREEMENT_THRESHOLD,
                  scrub: bool = True):
         self.profile = profile
+        self.app_dictionary = profile.dictionary if profile else None
         self.llm = llm
         self.agreement_threshold = agreement_threshold
         self.scrub = scrub
@@ -161,6 +182,7 @@ class Decomposer:
         llm_candidates: list[_Candidate] | None = None
         rejected = 0
         instructions_dropped = 0
+        self_agreement = None
         if self.llm is not None:
             try:
                 segmentation = llm_segment(self.llm, fiche.title, text)
@@ -173,16 +195,43 @@ class Decomposer:
                 segmentation = None
             if segmentation is not None:
                 self._count(segmentation)
-                llm_candidates, rejected, instructions_dropped = self._locate(segmentation, normalized, text)
+                llm_candidates, rejected, instructions_dropped = self._locate(
+                    segmentation, normalized, text, self.app_dictionary
+                )
                 methods["llm"] = segmentation.model or "llm"
                 methods["llm_steps"] = len(llm_candidates) + rejected
                 methods["llm_rejected_quotes"] = rejected
                 methods["llm_malformed"] = segmentation.malformed
+                if llm_candidates:
+                    # self-check: only worth asking again when the first pass actually found something to confirm.
+                    # (if it found nothing, a second "nothing" would be a trivial agreement, not a real signal —
+                    # the fiche already falls back to rules/info_only below regardless.)
+                    try:
+                        segmentation2 = llm_segment(
+                            self.llm, fiche.title, text, temperature=SELF_CHECK_TEMPERATURE, seed=SELF_CHECK_SEED
+                        )
+                    except LLMError as exc:
+                        self.llm_errors += 1
+                        reasons.append(f"LLM self-check pass failed: {exc}")
+                        segmentation2 = None
+                    if segmentation2 is not None and segmentation2.skipped:
+                        segmentation2 = None
+                    if segmentation2 is not None:
+                        self._count(segmentation2)
+                        llm2_candidates, rejected2, _ = self._locate(
+                            segmentation2, normalized, text, self.app_dictionary
+                        )
+                        methods["llm2_steps"] = len(llm2_candidates) + rejected2
+                        self_matches = align(
+                            [(c.start, c.end) for c in llm_candidates], [(c.start, c.end) for c in llm2_candidates]
+                        )
+                        self_total = len(llm_candidates) + len(llm2_candidates)
+                        self_agreement = 2 * len(self_matches) / self_total if self_total else 1.0
+                        methods["self_matched"] = len(self_matches)
         rule_candidates = [self._from_rule(step) for step in rules]
 
         if llm_candidates is None:
             final = rule_candidates
-            agreement = None
             reasons.append("single method: the LLM pass did not run")
         else:
             matches = align([(c.start, c.end) for c in llm_candidates], [(c.start, c.end) for c in rule_candidates])
@@ -190,22 +239,23 @@ class Decomposer:
                 self._merge(llm_candidates[i], rule_candidates[j])
             # The LLM's verified steps lead; when it found none, the rules' steps stay (the fiche stays citable).
             final = llm_candidates if llm_candidates else rule_candidates
-            total = len(rule_candidates) + len(llm_candidates) + rejected
-            agreement = 2 * len(matches) / total if total else 1.0
+            rules_total = len(rule_candidates) + len(llm_candidates) + rejected
+            rules_agreement = 2 * len(matches) / rules_total if rules_total else 1.0
+            methods["rules_agreement"] = round(rules_agreement, 3)
             methods["matched"] = len(matches)
-        methods["agreement"] = None if agreement is None else round(agreement, 3)
+        methods["agreement"] = None if self_agreement is None else round(self_agreement, 3)
 
         final.sort(key=lambda c: c.start)
-        steps = self._build_steps(final, text)
+        steps = self._build_steps(final, text, self.app_dictionary)
         resolution = [s for s in steps if s.role in RESOLUTION_ROLES]
 
-        if agreement is None:
+        if self_agreement is None:
             confidence = "low"
-        elif agreement >= self.agreement_threshold:
+        elif self_agreement >= self.agreement_threshold:
             confidence = "high"
         else:
             confidence = "low"
-            reasons.append(f"the rules and the LLM disagree (agreement {agreement:.2f})")
+            reasons.append(f"two independent LLM passes disagree (agreement {self_agreement:.2f})")
         if rejected:
             reasons.append(f"{rejected} LLM quote(s) not found in the fiche, dropped")
         if instructions_dropped:
@@ -221,7 +271,7 @@ class Decomposer:
 
         entity_counts: Counter = Counter()
         entity_kinds: dict[str, str] = {}
-        for entity in extract_entities(f"{fiche.title}\n{text}"):
+        for entity in extract_entities(f"{fiche.title}\n{text}", self.app_dictionary):
             entity_counts[entity.canonical] += 1
             entity_kinds[entity.canonical] = entity.kind
         references = sorted(
@@ -282,7 +332,7 @@ class Decomposer:
         )
 
     @staticmethod
-    def _locate(segmentation, normalized: NormalizedText, text: str):
+    def _locate(segmentation, normalized: NormalizedText, text: str, app_dictionary=None):
         candidates: list[_Candidate] = []
         rejected = 0
         dropped = 0
@@ -301,7 +351,7 @@ class Decomposer:
             if item.on_failure:
                 candidate.failure_span = normalized.find(item.on_failure, after=span[1])
             if item.instruction:
-                if novel_technical_entities(item.instruction, text[span[0]:span[1]]):
+                if novel_technical_entities(item.instruction, text[span[0]:span[1]], app_dictionary):
                     dropped += 1
                 else:
                     candidate.instruction = item.instruction
@@ -321,11 +371,11 @@ class Decomposer:
             llm.role = rules.role
 
     @staticmethod
-    def _build_steps(candidates: list[_Candidate], text: str) -> list[Step]:
+    def _build_steps(candidates: list[_Candidate], text: str, app_dictionary=None) -> list[Step]:
         steps: list[Step] = []
         for n, c in enumerate(candidates, 1):
             body = text[c.start:c.end]
-            entities = [e.canonical for e in extract_entities(body)]
+            entities = [e.canonical for e in extract_entities(body, app_dictionary)]
             condition_text = text[c.condition[0]:c.condition[1]] if c.condition else None
             after_failure = c.after_failure
             if not after_failure and condition_text and c.condition[0] >= c.start:

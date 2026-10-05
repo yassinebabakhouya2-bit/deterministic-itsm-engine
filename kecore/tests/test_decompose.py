@@ -17,6 +17,12 @@ VPN_ANSWER = {
     ],
 }
 
+# the self-check (2nd) pass finds only one of the three steps the first pass verified: low self-agreement.
+VPN_SELF_CHECK_DISAGREES = {
+    "sections": [{"heading": "Solution", "role": "resolution"}],
+    "steps": [step("Redémarrez ensuite le client GlobalProtect.")],
+}
+
 
 def demo():
     fiches, _ = load_folder(DEMO_KB, "clienta")
@@ -56,11 +62,11 @@ class DecomposeTest(unittest.TestCase):
         self.assertNotIn("05 22", result.text)
 
     def test_a_reworded_quote_is_dropped_and_lowers_confidence(self):
-        llm = FakeLLM({"VPN - déconnexions fréquentes": VPN_ANSWER})
+        llm = FakeLLM({"VPN - déconnexions fréquentes": [VPN_ANSWER, VPN_SELF_CHECK_DISAGREES]})
         result = Decomposer(self.profile, llm).decompose(self.fiches["KB0010002"])
         self.assertEqual((result.status, result.confidence), ("citable", "low"))
         self.assertEqual(result.methods["llm_rejected_quotes"], 1)
-        self.assertEqual(result.methods["agreement"], 0.75)
+        self.assertEqual(result.methods["agreement"], 0.5, "the self-check pass only confirms 1 of the 3 steps")
         self.assertEqual(len(result.steps), 3)
         self.assertNotIn("Videz le cache DNS", " ".join(s.text for s in result.steps))
         self.assertEqual(result.references, ["KB0010008"])
@@ -81,7 +87,8 @@ class DecomposeTest(unittest.TestCase):
 
     def test_llm_without_steps_keeps_the_rules_steps(self):
         result = Decomposer(self.profile, FakeLLM({})).decompose(self.fiches["KB0010003"])
-        self.assertEqual((result.status, result.methods["agreement"]), ("citable", 0.0))
+        self.assertEqual((result.status, result.methods["agreement"]), ("citable", None))
+        self.assertEqual(result.methods["rules_agreement"], 0.0)
         self.assertEqual(len(result.steps), 3)
         self.assertTrue(all(s.sources == ["rules"] for s in result.steps))
 
@@ -106,7 +113,7 @@ class DecomposeTest(unittest.TestCase):
         result = Decomposer(self.profile, llm).decompose(self.fiches["KB0010001"])
         again = DecomposedFiche.from_dict(result.to_dict())
         self.assertEqual(again.to_dict(), result.to_dict())
-        self.assertEqual(llm.calls, ["fiche_steps"])
+        self.assertEqual(llm.calls, ["fiche_steps", "fiche_steps"], "the first pass plus the self-check pass")
 
 
 if __name__ == "__main__":

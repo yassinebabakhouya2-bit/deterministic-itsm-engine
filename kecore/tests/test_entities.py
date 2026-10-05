@@ -7,6 +7,27 @@ def canon(text):
     return [e.canonical for e in extract_entities(text)]
 
 
+class DynamicDictionaryTest(unittest.TestCase):
+    def test_app_dictionary_extends_recognition(self):
+        dictionary = {"harmony": ["Harmony", "ERP Harmony"]}
+        self.assertEqual(canonical_set("L'ERP Harmony est bloqué", kinds=frozenset({"app"})), set())
+        self.assertEqual(
+            canonical_set("L'ERP Harmony est bloqué", kinds=frozenset({"app"}), app_dictionary=dictionary),
+            {"app:harmony"},
+        )
+
+    def test_app_dictionary_does_not_shadow_known_apps(self):
+        # a per-client dictionary must extend the static table, never override "outlook" itself.
+        dictionary = {"harmony": ["Harmony"]}
+        self.assertEqual(
+            canonical_set("Outlook et Harmony sont bloqués", kinds=frozenset({"app"}), app_dictionary=dictionary),
+            {"app:outlook", "app:harmony"},
+        )
+
+    def test_without_a_dictionary_behavior_is_unchanged(self):
+        self.assertEqual(extract_entities("Harmony est bloqué"), extract_entities("Harmony est bloqué", None))
+
+
 class EntityTest(unittest.TestCase):
     def test_error_codes_meet_whatever_their_spelling(self):
         self.assertEqual(

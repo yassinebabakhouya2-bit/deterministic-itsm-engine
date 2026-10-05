@@ -2,9 +2,21 @@ import unittest
 
 from kecore.fiches import Fiche, load_folder
 from kecore.llm import LLMError
-from kecore.profile import Profile, build_profile, remove_boilerplate
+from kecore.profile import Profile, build_dictionary, build_profile, remove_boilerplate
 
 from .helpers import DEMO_KB, FakeLLM, TempDirTestCase
+
+
+def erp_kb(count=4, term="Harmony"):
+    """Fiches that each mention a client-specific business app via a trigger word."""
+    fiches = []
+    for i in range(count):
+        text = (
+            f"# Fiche {i}\n\n## Constat\nL'ERP {term} ne répond plus pour l'utilisateur {i}.\n\n"
+            f"## Pistes\n- Redémarrez l'application {term}.\n- Videz le cache.\n"
+        )
+        fiches.append(Fiche(f"KB00200{i:02d}", "c", f"Fiche {i}", text))
+    return fiches
 
 
 def custom_kb(count=4):
@@ -49,6 +61,43 @@ class ProfileTest(TempDirTestCase):
         profile = Profile("c", headings={"pistes": {"count": 9, "role": "resolution", "source": "llm", "example": "Pistes"}},
                           stable=False)
         self.assertIsNone(profile.role_lookup()("pistes"))
+
+    def test_dictionary_needs_more_than_one_fiche(self):
+        # a term named in a single fiche is noise, not a client's vocabulary.
+        dictionary, usage = build_dictionary(erp_kb(count=2), min_fiches=3)
+        self.assertEqual(dictionary, {})
+        self.assertEqual(usage, {})
+
+    def test_dictionary_keeps_a_term_named_across_fiches(self):
+        dictionary, _ = build_dictionary(erp_kb(count=4), min_fiches=3)
+        self.assertIn("harmony", dictionary)
+        self.assertIn("Harmony", dictionary["harmony"])
+
+    def test_dictionary_ignores_known_products(self):
+        # "application Outlook" should not create a duplicate entry for a name entities.py already knows.
+        dictionary, _ = build_dictionary(erp_kb(count=4, term="Outlook"), min_fiches=3)
+        self.assertEqual(dictionary, {})
+
+    def test_dictionary_llm_clusters_spellings(self):
+        llm = FakeLLM({"__dictionary__": {"products": [{"canonical": "Harmony", "aliases": ["Harmony", "ERP Harmony"]}]}})
+        dictionary, usage = build_dictionary(erp_kb(count=4), llm=llm, min_fiches=3)
+        self.assertEqual(llm.calls, ["software_dictionary"])
+        self.assertEqual(dictionary, {"harmony": ["ERP Harmony", "Harmony"]})
+        self.assertEqual(usage["input_tokens"], 1000)
+
+    def test_dictionary_llm_failure_falls_back_to_deterministic(self):
+        llm = FakeLLM({"__dictionary__": LLMError("quota")})
+        dictionary, usage = build_dictionary(erp_kb(count=4), llm=llm, min_fiches=3)
+        self.assertIn("harmony", dictionary)
+        self.assertEqual(usage, {"error": "quota"})
+
+    def test_build_profile_populates_the_dictionary(self):
+        profile = build_profile("c", erp_kb(count=4), dictionary_min_fiches=3)
+        self.assertIn("harmony", profile.dictionary)
+
+    def test_build_profile_can_skip_the_dictionary(self):
+        profile = build_profile("c", erp_kb(count=4), with_dictionary=False)
+        self.assertEqual(profile.dictionary, {})
 
     def test_save_load_and_boilerplate_removal(self):
         profile = build_profile("c", custom_kb())

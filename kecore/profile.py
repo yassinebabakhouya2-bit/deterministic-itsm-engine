@@ -42,6 +42,11 @@ class Profile:
     stable: bool = True
     stability: float | None = None
     llm_usage: dict = field(default_factory=dict)
+    # V10 pilier 2 — per-client software dictionary, extracted from the corpus, never hand-coded.
+    # {canonical_id: [surface forms seen in the corpus]}. Empty for a profile built before pilier 2,
+    # or when build_profile(..., with_dictionary=False) is used.
+    dictionary: dict[str, list[str]] = field(default_factory=dict)
+    dictionary_usage: dict = field(default_factory=dict)
     version: int = PROFILE_VERSION
 
     def role_lookup(self):
@@ -117,7 +122,85 @@ def _frequent(counter: Counter, total: int, share: float, floor: int) -> set[str
     return {key for key, count in counter.items() if count >= threshold}
 
 
-def build_profile(client: str, fiches, llm=None, heading_share: float = 0.1, boilerplate_share: float = 0.3) -> Profile:
+# --- dynamic software dictionary (V10 pilier 2) --------------------------------------------
+#
+# Replaces the hard-coded APPS table of kecore.entities for client-specific business software
+# (an ERP, a client portal...) that no generic list can know in advance. A fixed OS table stays
+# fine on its own — an operating system is not client-specific — so only applications are built
+# dynamically here. The mechanism is the same for every client: a trigger word ("application",
+# "l'ERP", "le logiciel"...) followed by a capitalized name, counted across distinct fiches, kept
+# only once it is not a one-off. No client name or product name is ever hard-coded.
+
+_DICTIONARY_TRIGGERS = (
+    "application", "applicatif", "logiciel", "outil", "erp", "progiciel", "systeme", "système",
+    "plateforme", "interface", "portail", "module", "solution", "service",
+)
+_DICTIONARY_TRIGGER_RE = re.compile(
+    r"\b(?i:l['’]|le |la |les |l'|un |une |du |de la |notre |votre )*(?i:" + "|".join(_DICTIONARY_TRIGGERS) + r")\s+"
+    # the captured name itself stays case-sensitive: only a capitalized word is a candidate product name.
+    r"([A-Z][\w&-]{1,24}(?:\s+(?:[A-Z][\w&-]{1,24}|&|et|and))*)"
+)
+_DICTIONARY_STOPWORDS = frozenset({
+    "windows", "microsoft", "office", "outlook", "teams", "word", "excel", "powerpoint", "onedrive",
+    "sharepoint", "exchange", "edge", "chrome", "firefox", "citrix", "vpn", "wifi", "active", "directory",
+})
+
+
+def _dictionary_candidates(text: str) -> set[str]:
+    """Candidate surface forms of client software mentioned in one fiche (deduplicated within it)."""
+    found: set[str] = set()
+    for match in _DICTIONARY_TRIGGER_RE.finditer(text):
+        term = " ".join(match.group(1).split())
+        key = term.lower()
+        if key in _DICTIONARY_STOPWORDS or len(key) < 2:
+            continue
+        found.add(term)
+    return found
+
+
+def build_dictionary(fiches, llm=None, min_fiches: int = 3) -> tuple[dict[str, list[str]], dict]:
+    """The client's own software dictionary, built from its corpus (V10 pilier 2).
+
+    Deterministic by default: a candidate becomes a dictionary entry only once it names at
+    least ``min_fiches`` distinct fiches, never from a single mention. With ``llm`` given,
+    near-duplicate spellings of the same product ("Harmony" / "ERP Harmony") are clustered
+    under one canonical id; without it, each distinct spelling stays its own entry — still
+    correct, just less consolidated. Mirrors build_profile's optional LLM step for headings.
+    """
+    fiches = list(fiches)
+    term_counts: Counter = Counter()
+    for fiche in fiches:
+        for term in _dictionary_candidates(fiche.text):
+            term_counts[term] += 1
+
+    kept = sorted({term for term, count in term_counts.items() if count >= min_fiches})
+    usage: dict = {}
+    if not kept:
+        return {}, usage
+
+    if llm is not None:
+        from .llm import LLMError
+        from .llm_segment import llm_dictionary_aliases
+
+        try:
+            clusters, llm_usage = llm_dictionary_aliases(llm, kept)
+            usage = asdict(llm_usage)
+        except LLMError as exc:
+            clusters, usage = {}, {"error": str(exc)}
+        if clusters:
+            return {k: sorted(set(v)) for k, v in clusters.items()}, usage
+
+    # No LLM (or it failed): each surface form is its own entry, canonicalized by slugging.
+    fallback: dict[str, list[str]] = {}
+    for term in kept:
+        canonical = re.sub(r"[^a-z0-9]+", "-", term.lower()).strip("-")
+        if canonical:
+            fallback.setdefault(canonical, []).append(term)
+    return fallback, usage
+
+
+def build_profile(client: str, fiches, llm=None, heading_share: float = 0.1, boilerplate_share: float = 0.3,
+                   with_dictionary: bool = True, dictionary_min_fiches: int = 3) -> Profile:
     fiches = list(fiches)
     total = len(fiches)
     heading_counts: Counter = Counter()
@@ -177,6 +260,12 @@ def build_profile(client: str, fiches, llm=None, heading_share: float = 0.1, boi
     stable = total < 10 or stability >= 0.5
 
     boilerplate = sorted(_frequent(boiler_counts, total, boilerplate_share, 3) - set(heading_counts))
+
+    dictionary: dict[str, list[str]] = {}
+    dictionary_usage: dict = {}
+    if with_dictionary:
+        dictionary, dictionary_usage = build_dictionary(fiches, llm=llm, min_fiches=dictionary_min_fiches)
+
     return Profile(
         client=client,
         fiches=total,
@@ -186,6 +275,8 @@ def build_profile(client: str, fiches, llm=None, heading_share: float = 0.1, boi
         stable=stable,
         stability=round(stability, 3),
         llm_usage=usage,
+        dictionary=dictionary,
+        dictionary_usage=dictionary_usage,
     )
 
 

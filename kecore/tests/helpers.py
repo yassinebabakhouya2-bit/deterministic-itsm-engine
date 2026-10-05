@@ -26,21 +26,36 @@ class TempDirTestCase(unittest.TestCase):
 
 
 class FakeLLM:
-    """Answers by article title; '__headings__' answers the heading-role request."""
+    """Answers by article title; '__headings__' answers the heading-role request.
+
+    An answer can be a single dict (returned every time, e.g. a model that agrees with
+    itself), or a list of dicts consumed in order across successive calls for the same
+    title (to script a self-check pass that disagrees with the first) — the last one
+    repeats once the list is exhausted.
+    """
 
     model_id = "fake-model@test"
 
     def __init__(self, answers: dict):
         self.answers = answers
         self.calls = []
+        self._title_calls: dict[str, int] = {}
 
-    def complete_json(self, system, user, schema, schema_name):
+    def complete_json(self, system, user, schema, schema_name, *, temperature=None, seed=None):
         self.calls.append(schema_name)
         if schema_name == "heading_roles":
             data = self.answers.get("__headings__", {"mappings": []})
+        elif schema_name == "software_dictionary":
+            data = self.answers.get("__dictionary__", {"products": []})
         else:
             title = user.split("\n", 1)[0][len("Article title: "):]
-            data = self.answers.get(title, {"sections": [], "steps": []})
+            entry = self.answers.get(title, {"sections": [], "steps": []})
+            if isinstance(entry, list):
+                index = self._title_calls.get(title, 0)
+                data = entry[min(index, len(entry) - 1)]
+                self._title_calls[title] = index + 1
+            else:
+                data = entry
         if isinstance(data, Exception):
             raise data
         return LLMResult(data, LLMUsage(1000, 200), "fake-model")

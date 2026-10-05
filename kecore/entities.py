@@ -157,6 +157,23 @@ def _dictionary_regex(table: dict[str, list[str]]) -> tuple[re.Pattern, dict[str
 APP_RE, APP_ALIASES = _dictionary_regex(APPS)
 OS_RE, OS_ALIASES = _dictionary_regex(OPERATING_SYSTEMS)
 
+
+def _app_lookup(app_dictionary: dict[str, list[str]] | None) -> tuple[re.Pattern, dict[str, str]]:
+    """The static APP table merged with a client's dynamic dictionary (V10 pilier 2).
+
+    ``app_dictionary`` is per-client, built offline by ``kecore.profile.build_dictionary``
+    from the client's own corpus (never hand-coded). The static OS table stays as-is: an
+    operating system is not client-specific, unlike business applications (SAP, Harmony,
+    BASWARE...). Without a dictionary this returns the precompiled static regex unchanged,
+    so every existing caller keeps its exact current behavior.
+    """
+    if not app_dictionary:
+        return APP_RE, APP_ALIASES
+    merged = {canonical: list(aliases) for canonical, aliases in APPS.items()}
+    for canonical, aliases in app_dictionary.items():
+        merged[canonical] = sorted(set(merged.get(canonical, [])) | {a.lower() for a in aliases} | {canonical})
+    return _dictionary_regex(merged)
+
 _TRAILING = ".,;:!?)»\"'"
 
 
@@ -232,8 +249,13 @@ def _menus_in_line(line: str, offset: int) -> list[Entity]:
     return [Entity("menu", raw, canonical, offset + s, offset + e)]
 
 
-def extract_entities(text: str) -> list[Entity]:
-    """All entities of a text, ordered by position."""
+def extract_entities(text: str, app_dictionary: dict[str, list[str]] | None = None) -> list[Entity]:
+    """All entities of a text, ordered by position.
+
+    ``app_dictionary`` optionally extends the static APP table with a client's own
+    dynamic dictionary (V10 pilier 2) — see ``_app_lookup``. Omitted, behavior is
+    unchanged from before pilier 2.
+    """
     found: list[Entity] = []
 
     def add(kind: str, match_text: str, canonical: str, start: int, end: int) -> None:
@@ -288,7 +310,8 @@ def extract_entities(text: str) -> list[Entity]:
 
     found.extend(_menu_entities(text))
 
-    for pattern, aliases, kind in ((APP_RE, APP_ALIASES, "app"), (OS_RE, OS_ALIASES, "os")):
+    app_re, app_aliases = _app_lookup(app_dictionary)
+    for pattern, aliases, kind in ((app_re, app_aliases, "app"), (OS_RE, OS_ALIASES, "os")):
         for match in pattern.finditer(text):
             key = " ".join(match.group().lower().split())
             add(kind, match.group(), f"{kind}:{aliases[key]}", match.start(), match.end())
@@ -315,20 +338,22 @@ def _drop_nested(entities: list[Entity]) -> list[Entity]:
     return kept
 
 
-def canonical_set(text: str, kinds: frozenset[str] | None = None) -> set[str]:
-    return {e.canonical for e in extract_entities(text) if kinds is None or e.kind in kinds}
+def canonical_set(text: str, kinds: frozenset[str] | None = None,
+                   app_dictionary: dict[str, list[str]] | None = None) -> set[str]:
+    return {e.canonical for e in extract_entities(text, app_dictionary) if kinds is None or e.kind in kinds}
 
 
-def novel_technical_entities(candidate: str, reference: str) -> list[str]:
+def novel_technical_entities(candidate: str, reference: str,
+                              app_dictionary: dict[str, list[str]] | None = None) -> list[str]:
     """Technical entities named in ``candidate`` that ``reference`` does not contain.
 
     Used on any rewording of a step: it may not add a command, a path, a menu,
     a key, an error code or a fiche number that the step itself does not have.
     """
-    reference_entities = canonical_set(reference, TECHNICAL_KINDS)
+    reference_entities = canonical_set(reference, TECHNICAL_KINDS, app_dictionary)
     reference_plain = _plain(reference)
     novel = []
-    for entity in extract_entities(candidate):
+    for entity in extract_entities(candidate, app_dictionary):
         if entity.kind not in TECHNICAL_KINDS or entity.canonical in reference_entities:
             continue
         if entity.kind == "menu":

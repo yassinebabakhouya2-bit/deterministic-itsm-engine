@@ -44,7 +44,8 @@ class CliTest(TempDirTestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("1 guided", err)
         calls = len(fake.calls)
-        self.assertEqual(calls, 6)
+        # 6 fiches, first pass each; only KB0010001 finds steps, so only it gets a self-check 2nd pass.
+        self.assertEqual(calls, 7)
 
         # The real Azure client is built, but replay never calls it.
         code, _, err = run_cli("decompose", DEMO_KB, "--client", "clienta", "--llm-config", config, "--replay",
@@ -52,7 +53,7 @@ class CliTest(TempDirTestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("1 guided", err)
         summary = json.loads((self.path("replayed") / "summary.json").read_text(encoding="utf-8"))
-        self.assertEqual((summary["llm"]["calls"], summary["llm"]["cached"]), (0, 6))
+        self.assertEqual((summary["llm"]["calls"], summary["llm"]["cached"]), (0, 7))
         first = (self.path("recorded") / "fiches.decomposed.jsonl").read_text(encoding="utf-8").splitlines()
         again = (self.path("replayed") / "fiches.decomposed.jsonl").read_text(encoding="utf-8").splitlines()
         self.assertEqual([DecomposedFiche.from_dict(json.loads(l)).steps for l in first],
