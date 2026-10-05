@@ -57,3 +57,5 @@ test_results.txt
 # Local debug artifacts (contain real-client KB excerpts) -- never commit
 turns_*.json
 /zi[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]
+
+llm.json
