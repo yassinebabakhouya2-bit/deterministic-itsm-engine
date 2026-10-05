@@ -93,11 +93,12 @@ class AzureOpenAIChat:
     def from_config(cls, data: dict) -> "AzureOpenAIChat":
         return cls(AzureOpenAIConfig.from_dict(data))
 
-    def complete_json(self, system: str, user: str, schema: dict, schema_name: str) -> LLMResult:
+    def complete_json(self, system: str, user: str, schema: dict, schema_name: str, *,
+                       temperature: float | None = None, seed: int | None = None) -> LLMResult:
         body = {
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "temperature": self.config.temperature,
-            "seed": self.config.seed,
+            "temperature": self.config.temperature if temperature is None else temperature,
+            "seed": self.config.seed if seed is None else seed,
             "max_tokens": self.config.max_tokens,
             "response_format": {"type": "json_schema", "json_schema": {"name": schema_name, "strict": True, "schema": schema}},
         }
@@ -142,12 +143,20 @@ class RecordingLLM:
         self.calls = 0
         self.hits = 0
 
-    def key(self, system: str, user: str, schema: dict, schema_name: str) -> str:
+    def key(self, system: str, user: str, schema: dict, schema_name: str,
+            temperature: float | None = None, seed: int | None = None) -> str:
         request = {"model": self.model_id, "schema_name": schema_name, "schema": schema, "system": system, "user": user}
+        # left out when unset, so a plain call's key (the only kind before this field existed) is unchanged and
+        # keeps reading an existing cache; only a call with an explicit override (the self-check pass) gets a new key.
+        if temperature is not None:
+            request["temperature"] = temperature
+        if seed is not None:
+            request["seed"] = seed
         return hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
-    def complete_json(self, system: str, user: str, schema: dict, schema_name: str) -> LLMResult:
-        key = self.key(system, user, schema, schema_name)
+    def complete_json(self, system: str, user: str, schema: dict, schema_name: str, *,
+                       temperature: float | None = None, seed: int | None = None) -> LLMResult:
+        key = self.key(system, user, schema, schema_name, temperature, seed)
         path = self.cache_dir / key[:2] / f"{key}.json"
         if path.is_file() and self.mode != "refresh":
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -156,7 +165,7 @@ class RecordingLLM:
             return LLMResult(response["data"], LLMUsage(**response.get("usage", {})), response.get("model", ""), cached=True)
         if self.mode == "replay" or self.inner is None:
             raise LLMError("no recorded answer for this request (replay mode)")
-        result = self.inner.complete_json(system, user, schema, schema_name)
+        result = self.inner.complete_json(system, user, schema, schema_name, temperature=temperature, seed=seed)
         self.calls += 1
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {

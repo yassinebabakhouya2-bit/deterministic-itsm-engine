@@ -59,8 +59,8 @@ def build_report(client: str, decomposed: list[DecomposedFiche], profile: Profil
     )
     lines.append("")
     lines.append(
-        "Guided: both methods agree, the fiche can be followed step by step. Citable: shown as a source, never "
-        "guided. Info only: no resolution step."
+        "Guided: a second, independent LLM pass agrees with the first, the fiche can be followed step by step. "
+        "Citable: shown as a source, never guided. Info only: no resolution step."
     )
     lines.append("")
     if llm_stats.get("model"):
