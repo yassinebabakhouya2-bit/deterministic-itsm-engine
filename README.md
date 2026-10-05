@@ -7,6 +7,8 @@ AI assistance platform for enterprise IT support, built on Azure managed service
 
 This repository is the technical showcase: the reusable engine, the infrastructure-as-code, and three synthetic demo clients (Client A/B/C — no real client data). Fully cloud-native: extraction, indexing, orchestration, integration and evaluation all run on managed Azure services — no custom OCR, no self-hosted index, no always-on custom integration code.
 
+A second, newer track lives alongside this showcase engine: **a deterministic diagnostic engine** (`kecore/` · `kefind/` · `scoreboard/`) where the code decides which fiche is shown — never the LLM, never the search index — and every step is verified verbatim against its source. See [`docs/v10-deterministic-engine.md`](docs/v10-deterministic-engine.md).
+
 ## The 5 axioms
 
 | Axiom | Principle |
@@ -38,7 +40,7 @@ flowchart LR
 
 Each client is isolated by a **dedicated Azure AI Search index** (physical isolation, not just a filter), with the `clientId` field projected onto every document and enforced on every query as defense in depth. Users are resolved to a client from their Entra ID tenant and security group; an unknown tenant or group sees nothing (deny-by-default).
 
-See [`docs/architecture.md`](docs/architecture.md) for the full technical blueprint, [`docs/ingestion-pipeline.md`](docs/ingestion-pipeline.md) for the SharePoint → Blob → Search flow, and [`docs/operations-runbook.md`](docs/operations-runbook.md) for deployment and operations.
+See [`docs/architecture.md`](docs/architecture.md) for the full technical blueprint, [`docs/ingestion-pipeline.md`](docs/ingestion-pipeline.md) for the SharePoint → Blob → Search flow, [`docs/operations-runbook.md`](docs/operations-runbook.md) for deployment and operations, and [`docs/v10-deterministic-engine.md`](docs/v10-deterministic-engine.md) for the deterministic diagnostic engine track.
 
 ## Azure stack
 
@@ -88,7 +90,10 @@ config/         Per-client configuration (engine.<client>.yaml) and ITSM configu
 eval/           Golden datasets and evaluation script (Client A/B/C, synthetic)
 kb/             Synthetic knowledge base content for the three demo clients
 demo/           Static demo build
-docs/           Architecture blueprint, ingestion pipeline, operations runbook
+docs/           Architecture blueprint, ingestion pipeline, operations runbook, deterministic engine track
+scoreboard/     Measurement harness — replays labeled tickets, reports metrics with confidence intervals
+kecore/         KB fiche decomposition into verified steps (verbatim checks, per-client writing profile + dictionary)
+kefind/         Deterministic 5-step RAG built on kecore (understand · search · filter · decide · compose)
 ```
 
 ## Deployment
@@ -128,6 +133,10 @@ Onboarding a new client never touches the engine: a new `config/engine.<client>.
 | Iterative diagnostic (multi-turn, screenshot reading with GPT-4o vision, password redaction) | ✅ Built |
 | ITSM action module (ServiceNow + Entra ID, human approval, one-time secret delivery) | ✅ Built |
 | Video (Azure Video Indexer) | 🟡 Partial — service deployed, scheduled pipeline pending |
+| Measurement harness + KB decomposition (`scoreboard`, `kecore`) | ✅ Built — tested on real client KB (242 fiches) |
+| Deterministic RAG (`kefind`, 5-step) | ✅ Built — not yet calibrated on real labeled tickets |
+| Deterministic engine, pillar 2 — dynamic per-client dictionary | 🟡 In progress — offline extraction shipped, online feedback loop pending |
+| Deterministic engine, pillars 1, 3–8 | 🟢 Planned — see `docs/v10-deterministic-engine.md` |
 | Copilot Studio agent | 🟢 Planned |
 
 ---
