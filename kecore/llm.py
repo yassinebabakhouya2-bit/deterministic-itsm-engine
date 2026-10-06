@@ -125,19 +125,45 @@ class AzureOpenAIChat:
         )
 
 
+class FileRecordStore:
+    """The record as files under one folder: ``<key[:2]>/<key>.json``."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+
+    def read(self, relative: str) -> str | None:
+        path = self.root / relative
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+
+    def write(self, relative: str, text: str) -> None:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
 class RecordingLLM:
     """Answers from the record when the same request was made before.
 
     mode 'record': read the record, call the model on a miss and record it;
     'replay': read the record only (a miss is an error, nothing is called);
     'refresh': always call the model and overwrite the record.
+
+    Where the record lives is a ``store`` (``read(relative) -> str | None``, ``write(relative, text)``):
+    a folder by default (``cache_dir``), a blob container when the engine runs in Azure. The layout
+    and the keys are the same in both, so a record made in one place replays in the other.
     """
 
-    def __init__(self, inner, cache_dir: str | Path, mode: str = "record", model_id: str | None = None):
+    def __init__(self, inner, cache_dir: str | Path | None = None, mode: str = "record", model_id: str | None = None,
+                 store=None):
         if mode not in ("record", "replay", "refresh"):
             raise ValueError("mode must be 'record', 'replay' or 'refresh'")
+        if store is None:
+            if cache_dir is None:
+                raise ValueError("RecordingLLM needs a cache_dir or a store")
+            store = FileRecordStore(cache_dir)
         self.inner = inner
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.store = store
         self.mode = mode
         self.model_id = model_id or getattr(inner, "model_id", "unknown")
         self.calls = 0
@@ -157,9 +183,10 @@ class RecordingLLM:
     def complete_json(self, system: str, user: str, schema: dict, schema_name: str, *,
                        temperature: float | None = None, seed: int | None = None) -> LLMResult:
         key = self.key(system, user, schema, schema_name, temperature, seed)
-        path = self.cache_dir / key[:2] / f"{key}.json"
-        if path.is_file() and self.mode != "refresh":
-            record = json.loads(path.read_text(encoding="utf-8"))
+        relative = f"{key[:2]}/{key}.json"
+        raw = self.store.read(relative) if self.mode != "refresh" else None
+        if raw is not None:
+            record = json.loads(raw)
             self.hits += 1
             response = record["response"]
             return LLMResult(response["data"], LLMUsage(**response.get("usage", {})), response.get("model", ""), cached=True)
@@ -167,14 +194,13 @@ class RecordingLLM:
             raise LLMError("no recorded answer for this request (replay mode)")
         result = self.inner.complete_json(system, user, schema, schema_name, temperature=temperature, seed=seed)
         self.calls += 1
-        path.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             "model_id": self.model_id,
             "schema_name": schema_name,
             "response": {"data": result.data, "usage": asdict(result.usage), "model": result.model},
         }
-        path.write_text(json.dumps(record, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        self.store.write(relative, json.dumps(record, ensure_ascii=False, indent=1) + "\n")
         return result
 
 

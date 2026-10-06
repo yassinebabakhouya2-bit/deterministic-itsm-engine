@@ -94,6 +94,7 @@ docs/           Architecture blueprint, ingestion pipeline, operations runbook (
 scoreboard/     Measurement harness — replays labeled tickets, reports metrics with confidence intervals
 kecore/         KB fiche decomposition into verified steps (verbatim checks, per-client writing profile + dynamic dictionary, self-consistency)
 kefind/         Deterministic 5-step RAG built on kecore (understand · search · filter · decide · compose)
+kecore_func/    Azure Function running the kecore decomposition (Durable Functions, blob storage, managed identity)
 ```
 
 ## Deployment
@@ -133,7 +134,7 @@ Onboarding a new client never touches the engine: a new `config/engine.<client>.
 | 8 | Video (Azure AI Video Indexer) | 🟡 Partial — service deployed, scheduled pipeline pending |
 | 9 | GraphRAG multimodal + iterative diagnostic (deterministic state machine, no escalation) | ✅ Closed — see `orchestration/guide/` |
 | 10 | **ITSM action engine** (ServiceNow + Entra ID, GPT-4o proposal + deterministic guardrails, human approval, execution, one-time secret delivery) | ✅ **Closed, validated live end to end** — replayable demo (`scripts/itsm/reset-demo.ps1`) |
-| V10 | Deterministic diagnostic track (`scoreboard`, `kecore`, `kefind`) — measurement harness, KB decomposition with self-consistency, 5-step deterministic RAG | 🟡 In progress — see [`docs/v10-deterministic-engine.md`](docs/v10-deterministic-engine.md) |
+| V10 | Deterministic diagnostic track (`scoreboard`, `kecore`, `kefind`) — measurement harness, KB decomposition with self-consistency, dynamic per-client dictionary, 5-step deterministic RAG | 🟡 In progress — moving to Azure-native (Bicep): slices 1–2 of 7 deployed, KB decomposition runs in Azure with exact parity — see [`docs/v10-deterministic-engine.md`](docs/v10-deterministic-engine.md) |
 | — | Copilot Studio agent | 🟢 Planned |
 
 Convention: one jalon = one dedicated conversation, commit/push at every significant step, operations logged live in `docs/operations-runbook.md` (see `CLAUDE.md`).

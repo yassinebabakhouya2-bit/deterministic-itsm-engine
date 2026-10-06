@@ -39,6 +39,8 @@ session.
 - §12 Rebuild in a new tenant — `scripts/bootstrap-new-tenant.ps1`
 - §13 Diagnostic engine (deterministic agentic RAG) — Diagnostic tab, ServiceNow webhook, display fixes
 - §14 Repository renamed to `deterministic-itsm-engine` (2026-10-05)
+- §15 V10 on Azure — slice 1: `fn-kecore` Function App, per-client containers (2026-10-06)
+- §16 V10 on Azure — slice 2: kecore decomposition in the Function, parity test (2026-10-06)
 
 ---
 
@@ -1760,3 +1762,198 @@ Remplace le paquet `orchestration/diagnostic/` (supprime) par `orchestration/gui
 - Local folder name on disk (`C:\V9\knowledgeengine-rag-platform`) was not
   renamed — purely cosmetic, left as is to avoid re-pointing every open
   terminal/IDE session; only the GitHub remote name changed.
+
+
+## §15. V10 on Azure — slice 1: `fn-kecore` Function App, per-client containers (2026-10-06)
+
+Context: on 2026-10-05 the V10 track (kecore / kefind / scoreboard) stopped
+running as local CLIs; everything moves to Azure in Bicep (plan and slices in
+`docs/v10-deterministic-engine.md`, "Azure-native migration"). Slice 1 is
+infrastructure only: `infra/modules/kecore.bicep`, also wired into
+`infra/main.bicep` so a fresh `bootstrap-new-tenant.ps1` creates it.
+
+What it creates (no application code yet):
+- Function App `fn-kecore-knowledgeengine3-v9` on the existing B1 plan
+  `plan-knowledgeengine3-v9`, Python 3.11, system identity, identity-based host
+  storage, alwaysOn; Log Analytics `log-fn-kecore-knowledgeengine3-v9` +
+  Application Insights `appi-fn-kecore-knowledgeengine3-v9`.
+- Containers `kecore-<client>` and `tickets-<client>` for clienta, clientb,
+  clientc, client-s (private).
+- Roles of the Function's identity: Storage Blob Data Owner, Storage Queue Data
+  Contributor, Storage Table Data Contributor (storage account), Cognitive
+  Services OpenAI User (Foundry account).
+
+### 15.1 Deploy (module alone — does not touch the other resources)
+
+Validated beforehand with `bicep build` and `bicep lint` (0 warning in the
+module). Deploying the module on its own, rather than `main.bicep`, avoids
+re-applying the Web App's Easy Auth settings, whose secret is only passed at
+deploy time. Every default of the module matches the live naming.
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+az account show --query "{tenant:tenantId, subscription:name}" -o table   # must be the platform's subscription
+az deployment group create --resource-group rg-knowledgeengine-v9 --name kecore-slice1 `
+  --template-file infra/modules/kecore.bicep -o table
+```
+
+### 15.2 Verify
+
+```powershell
+az functionapp show -g rg-knowledgeengine-v9 -n fn-kecore-knowledgeengine3-v9 --query "{state:state, principal:identity.principalId}" -o table
+az storage container list --account-name stknowledgeengine3v9 --auth-mode login --query "[].name" -o tsv |
+  Select-String "^(kecore|tickets)-"   # PowerShell filter: no '||' inside a JMESPath passed through az.cmd
+$p = az functionapp show -g rg-knowledgeengine-v9 -n fn-kecore-knowledgeengine3-v9 --query identity.principalId -o tsv
+az role assignment list --assignee $p --all --query "[].roleDefinitionName" -o tsv
+```
+
+Expected: `Running`; 8 containers; the 4 roles above. The Function App answers
+its default page until slice 2 deploys code — that is normal.
+
+### 15.3 Drop a client's ITSM export (client-s: EasyVista, no API)
+
+The raw export goes to `tickets-<client>/raw/`, uncompressed (CSV, XLSX, JSON or
+JSONL — what `scoreboard/importers.py` reads; `.gz` is not read). It holds
+personal data (names, e-mails) until slice 4's Function scrubs it into a Table
+and deletes the raw blob: do not copy it anywhere else.
+
+```powershell
+az storage blob upload --account-name stknowledgeengine3v9 --auth-mode login `
+  --container-name tickets-client-s --name "raw/<export file name>" --file "<path to the export>"
+```
+
+A 403 `AuthorizationPermissionMismatch` means the signed-in user lacks
+Storage Blob Data Contributor on `stknowledgeengine3v9` (the bootstrap's
+`prereqs` phase normally grants it).
+
+**Status 2026-10-06: deployed (`kecore-slice1` Succeeded).**
+
+
+## §16. V10 on Azure — slice 2: kecore decomposition in the Function, parity test (2026-10-06)
+
+Prerequisite: §15 deployed (Function App, containers, roles).
+
+What changed in the repo:
+- `kecore/fiches.py`: documents are read from bytes (`read_document_bytes`) and in an
+  OS-independent order (`document_sort_key`: case-insensitive, separator-agnostic — the order
+  Windows gave the reference runs). `load_folder` and the Function share
+  `fiches_from_documents`. Order matters: duplicate ids keep the first file, and the profile
+  keeps the first spelling it meets for each heading, which is part of an LLM record key.
+- `kecore/llm.py`: `RecordingLLM` takes a `store` (folder by default, blob container in Azure),
+  same layout and keys.
+- `kecore_func/`: the Function (see its README). `kecore_pipeline.py` holds the steps and is
+  tested in memory, including "same result as a local run" and "replay calls nothing".
+- `scripts/deploy-kecore-function.ps1`.
+
+**Parity proven before deploying (2026-10-06):** the pipeline code, run in the Cowork sandbox
+on the local copy of `kb-client-s/Kbs` and the local record, in replay mode, gave exactly the
+2026-10-01 reference (`client-s-v2`): 243 documents, 242 fiches (same `KB0068` unreadable
+warning), 163 guided / 22 citable / 57 info_only, 2228 / 2228 steps verified, mean agreement
+0.919, **0 model calls, 462 answers from the record, 0 errors**. python-docx 1.2.0 and pypdf
+6.18.0 give that same text; they are pinned in `kecore_func/requirements.txt`. The only replay
+miss is the dictionary clustering call (`with_dictionary`), which postdates the reference: it
+falls back to the deterministic dictionary and changes no status.
+
+### 16.1 Upload the LLM record (once)
+
+455 files, about 2.5 MB, from the reference runs. After this, `clients-local/kecore/` is no
+longer needed by anything (slice 7 removes it).
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+az storage blob upload-batch --account-name stknowledgeengine3v9 --auth-mode login `
+  --destination kecore-client-s --destination-path llm-cache `
+  --source clients-local\kecore\llm-cache --overwrite false -o none
+```
+
+### 16.2 Deploy the code
+
+```powershell
+.\scripts\deploy-kecore-function.ps1
+```
+
+Expected last lines: the function names `kecore_start`, `kecore_run`, `kecore_extract`,
+`kecore_profile`, `kecore_decompose`, `kecore_report`.
+
+### 16.3 Parity run on Azure (replay: no model call, no cost)
+
+```powershell
+$fn = 'fn-kecore-knowledgeengine3-v9'
+$key = az functionapp keys list --resource-group rg-knowledgeengine-v9 --name $fn --query functionKeys.default -o tsv
+$body = @{ client = 'client-s'; source_prefix = 'Kbs/'; mode = 'replay' } | ConvertTo-Json
+$run = Invoke-RestMethod -Method Post -Uri "https://$fn.azurewebsites.net/api/kecore/runs?code=$key" -Body $body -ContentType 'application/json'
+do { Start-Sleep -Seconds 30; $s = Invoke-RestMethod $run.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending', 'Running')
+$s.output | ConvertTo-Json -Depth 5
+```
+
+Expected output: `fiches 242, guided 163, citable 22, info_only 57, steps 2228,
+steps_verified 2228, mean_agreement 0.919`, and under `llm`: `calls 0, cached 462, errors 0`.
+
+If it differs:
+- `fiches` is not 242: the content of `kb-client-s/Kbs/` changed since 2026-10-01 (daily
+  SharePoint ingestion). Compare the blob listing with the reference before anything else.
+- `errors` above 0: record keys missed. Check that the app setting `KECORE_AOAI_ENDPOINT` has
+  the host `aif-knowledgeengine3-v9.cognitiveservices.azure.com` (it is part of every key)
+  and that the build installed the pinned python-docx / pypdf.
+- The run's files are under `kecore-client-s/runs/<run_id>/`; `report.md` is the readable one.
+
+### 16.4 Normal runs
+
+Same request with `"mode": "record"`: answers already in the record are reused, only new or
+changed fiches call the model. `limit` (first N fiches) is useful for a quick check on a new
+client. Each run keeps its own folder; `latest.json` points to the last completed one.
+
+### 16.5 No function loaded after a deployment (2026-10-06, first deployment)
+
+Symptom: right after the first deployment, `az functionapp function list` printed nothing and
+`POST /api/kecore/runs` answered 404; still nothing after a restart.
+
+Root cause, two things, read from `FunctionAppLogs` and the host itself:
+- the roles of §15 had been created a minute before: the host's health check reported
+  `Unable to access AzureWebJobsStorage ... AuthorizationPermissionMismatch` from 19:40 to 19:41
+  UTC (identity-based host storage, RBAC propagation), then recovered on its own;
+- the function list Azure Resource Manager keeps stayed empty because the triggers had not been
+  synced once the host was up. The host itself was `Running` and served the 6 functions.
+
+The code was never at fault (it imports and registers the 6 functions in a clean environment).
+
+Fix: `deploy-kecore-function.ps1` now syncs the triggers and asks the host directly, through
+Azure Resource Manager (management.azure.com, reachable through Zscaler), until it lists the
+functions. The same check by hand:
+
+```powershell
+$rg = 'rg-knowledgeengine-v9'; $fn = 'fn-kecore-knowledgeengine3-v9'
+$sub = az account show --query id -o tsv
+$base = "https://management.azure.com/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.Web/sites/$fn"
+az rest --method post --url "$base/syncfunctiontriggers?api-version=2022-03-01"
+az rest --method get --url "$base/hostruntime/admin/host/status?api-version=2022-03-01"
+az rest --method get --url "$base/hostruntime/admin/functions?api-version=2022-03-01" --query "[].name" -o tsv
+```
+
+Host errors are in `FunctionAppLogs` (workspace `log-fn-kecore-knowledgeengine3-v9`). From this
+machine the query only works with Zscaler off: Zscaler intercepts TLS to the Log Analytics API
+(`CERTIFICATE_VERIFY_FAILED`); the portal's Logs blade works either way.
+
+```powershell
+$ws = az monitor log-analytics workspace show -g $rg -n "log-$fn" --query customerId -o tsv
+az monitor log-analytics query -w $ws --analytics-query "FunctionAppLogs | where TimeGenerated > ago(2h) and Level in ('Error','Warning') | project TimeGenerated, Message, ExceptionMessage | order by TimeGenerated desc | take 25" -o table
+```
+
+### 16.6 Parity run on Azure — PASS (2026-10-06 20:07 UTC)
+
+Run `20261006T200741Z-b61cb7`, mode `replay`, completed in under 2 minutes:
+
+| | Reference 2026-10-01 (local) | Azure 2026-10-06 |
+| --- | --- | --- |
+| Fiches | 242 | 242 |
+| Guided / citable / info_only | 163 / 22 / 57 | 163 / 22 / 57 |
+| Steps verified | 2228 / 2228 | 2228 / 2228 |
+| Mean agreement | 0.919 | 0.919 |
+| Model calls / from the record / errors | 215 / 247 / 0 (record mode) | 0 / 462 / 0 |
+
+The decomposition of the real client-s KB now runs in Azure with the same result, at no model
+cost. The versioned map of the KB is in `kecore-client-s/runs/20261006T200741Z-b61cb7/`
+(`profile.json`, `decomposed/`, `fiches.decomposed.jsonl`, `report.md`, `summary.json`);
+`latest.json` points to it.
+
+**Status 2026-10-06: slices 1 and 2 deployed and verified on Azure.**

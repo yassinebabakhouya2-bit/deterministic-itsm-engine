@@ -63,12 +63,6 @@ python -m kecore show clients-local\kecore\clienta\fiches.decomposed.jsonl KB001
 `fiches.decomposed.jsonl`, `profile.json`, `report.md` (the gate of the slice, the fiches to look at, references
 to fiches missing from the KB) and `summary.json`.
 
-Without Azure, on the synthetic demo KB (French on purpose, like the fiches it imitates):
-
-```powershell
-python -m kecore decompose kecore\examples\kb-demo --client clienta
-```
-
 ## Tests
 
 ```powershell

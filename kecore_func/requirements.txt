@@ -1,0 +1,11 @@
+# fn-kecore (V10 slice 2). kecore itself needs nothing beyond the standard library;
+# python-docx and pypdf are pinned to the versions whose extracted text matches the
+# 2026-10-01 reference run (the LLM record is keyed on that exact text): changing them
+# can change the text, hence the keys, hence re-pay every call. Re-run the parity test
+# (docs/operations-runbook.md §16) before moving either pin.
+azure-functions
+azure-functions-durable
+azure-identity>=1.17
+azure-storage-blob>=12.19
+python-docx==1.2.0
+pypdf==6.18.0

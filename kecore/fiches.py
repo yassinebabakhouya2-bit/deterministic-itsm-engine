@@ -11,6 +11,7 @@ so that the engine, the search index and the scoreboard name fiches alike.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 from dataclasses import dataclass, field
@@ -49,12 +50,12 @@ class Fiche:
         return data
 
 
-def _read_docx(path: Path) -> str:
+def _read_docx(data: bytes) -> str:
     try:
         import docx
     except ImportError:
         raise InputError("reading .docx needs python-docx (pip install python-docx)") from None
-    document = docx.Document(str(path))
+    document = docx.Document(io.BytesIO(data))
     lines: list[str] = []
     for paragraph in document.paragraphs:
         text = paragraph.text.strip()
@@ -78,22 +79,29 @@ def _read_docx(path: Path) -> str:
     return "\n".join(lines)
 
 
-def _read_pdf(path: Path) -> str:
+def _read_pdf(data: bytes) -> str:
     try:
         import pypdf
     except ImportError:
         raise InputError("reading .pdf needs pypdf (pip install pypdf)") from None
-    reader = pypdf.PdfReader(str(path))
+    reader = pypdf.PdfReader(io.BytesIO(data))
     return "\n\n".join((page.extract_text() or "") for page in reader.pages)
 
 
-def read_document(path: Path) -> str:
-    suffix = path.suffix.lower()
+def read_document_bytes(name: str, data: bytes) -> str:
+    """Text of one document from its bytes: the same parsing wherever the bytes come from
+    (a local folder, or a blob read by the Azure Function)."""
+    suffix = Path(name).suffix.lower()
     if suffix == ".docx":
-        return _read_docx(path)
+        return _read_docx(data)
     if suffix == ".pdf":
-        return _read_pdf(path)
-    return decode_bytes(path.read_bytes())[0]
+        return _read_pdf(data)
+    return decode_bytes(data)[0]
+
+
+def read_document(path: Path) -> str:
+    path = Path(path)
+    return read_document_bytes(path.name, path.read_bytes())
 
 
 _EMPHASIS_RE = re.compile(r"(\*{1,3}|_{2,3}|`)")
@@ -124,17 +132,31 @@ def fiche_id_for(name: str, title: str, pattern) -> str:
     return strip_document_path(name)
 
 
-def load_folder(folder: str | Path, client: str, id_regex: str | None = DEFAULT_FICHE_REGEX) -> tuple[list[Fiche], list[str]]:
-    folder = Path(folder)
+def document_sort_key(relative: str) -> tuple[str, ...]:
+    """Order in which documents are read: case-insensitive and separator-agnostic.
+
+    It is the order Windows gave the reference runs (sorting WindowsPath objects compares
+    lowercased parts), now identical on every OS, so a run on Linux in Azure reads the same
+    documents in the same order. Order matters twice: duplicate fiche ids keep the first file,
+    and the profile keeps the first spelling it meets for each heading.
+    """
+    return tuple(part.lower() for part in relative.replace("\\", "/").split("/"))
+
+
+def fiches_from_documents(documents, client: str, id_regex: str | None = DEFAULT_FICHE_REGEX) -> tuple[list[Fiche], list[str]]:
+    """Fiches from ``(relative_name, read)`` pairs, ``read()`` returning the document's bytes.
+
+    The one place a document becomes a fiche, for a local folder (``load_folder``) and for blobs
+    read in Azure alike: same order, same text extraction, same title and id rules.
+    """
     pattern = compile_pattern(id_regex)
     fiches: list[Fiche] = []
     warnings: list[str] = []
     seen: dict[str, str] = {}
-    paths = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in DOCUMENT_EXTENSIONS)
-    for path in paths:
-        relative = str(path.relative_to(folder))
+    for relative, read in sorted(documents, key=lambda item: document_sort_key(item[0])):
+        name = relative.replace("\\", "/").rsplit("/", 1)[-1]
         try:
-            text = clean_text(read_document(path))
+            text = clean_text(read_document_bytes(name, read()))
         except InputError as exc:
             warnings.append(f"{relative}: {exc}")
             continue
@@ -146,14 +168,21 @@ def load_folder(folder: str | Path, client: str, id_regex: str | None = DEFAULT_
             continue
         title = extract_title(text)
         if not title or keyword_role(heading_key(title)) is not None:
-            title = path.stem  # a first line such as "Description" is a section, not a title
-        fiche_id = fiche_id_for(path.name, title, pattern)
+            title = Path(name).stem  # a first line such as "Description" is a section, not a title
+        fiche_id = fiche_id_for(name, title, pattern)
         if fiche_id in seen:
             warnings.append(f"{relative}: same fiche id {fiche_id} as {seen[fiche_id]}, ignored")
             continue
         seen[fiche_id] = relative
         fiches.append(Fiche(fiche_id=fiche_id, client=client, title=title, text=text, source=relative))
     return fiches, warnings
+
+
+def load_folder(folder: str | Path, client: str, id_regex: str | None = DEFAULT_FICHE_REGEX) -> tuple[list[Fiche], list[str]]:
+    folder = Path(folder)
+    paths = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in DOCUMENT_EXTENSIONS]
+    documents = [(str(p.relative_to(folder)), p.read_bytes) for p in paths]
+    return fiches_from_documents(documents, client, id_regex)
 
 
 def import_fiches(path: str | Path, client: str, body_cols: list[str], id_col: str, title_col: str | None = None,

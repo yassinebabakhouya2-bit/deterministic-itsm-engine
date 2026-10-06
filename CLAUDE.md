@@ -86,6 +86,12 @@ rather than leaving it for the next person to rediscover.
   operator to fix data (like the ones referenced in the runbook) is not
   "the pipeline" and is fine; anything meant to run continuously or be
   deployed as part of the system is not.
+- Nothing that is part of the system runs on, or writes to, an operator's
+  machine — V10 (kecore/kefind/scoreboard) included, decided 2026-10-05:
+  compute runs in Azure (Functions, the Web App), data lives in Azure
+  Storage, infrastructure is Bicep. Do not add a CLI or script that
+  produces engine data under `clients-local/`; that folder only holds
+  deployment parameters and per-client configs.
 - `git add`/`commit`/`push` always run from Yassine's own terminal, never
   from the Claude device bridge (`device_bash`): non-interactive credential
   prompts fail there, and even a read-only git command from that bridge has

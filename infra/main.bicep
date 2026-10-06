@@ -137,6 +137,28 @@ module enrichFunction 'modules/enrich-function.bicep' = {
 }
 
 // ---------------------------------------------------------------------
+// V10 deterministic engine (kecore / kefind / scoreboard) on Azure.
+// Slice 1: Function App + per-client containers (kecore-<client>,
+// tickets-<client>) + RBAC, no application code yet. Same shared B1 plan
+// as the Web App and the enrichment Function. See modules/kecore.bicep
+// and docs/v10-deterministic-engine.md ("Azure-native migration").
+// ---------------------------------------------------------------------
+module kecore 'modules/kecore.bicep' = {
+  name: 'kecore'
+  dependsOn: [
+    webapp // creates the shared plan
+    foundry
+  ]
+  params: {
+    namePrefix: namePrefix
+    location: location
+    hostingPlanName: 'plan-${namePrefix}-v9'
+    storageAccountName: storage.outputs.storageAccountName
+    foundryName: foundryAccountName
+  }
+}
+
+// ---------------------------------------------------------------------
 // RBAC — Search's managed identity reads Blob & calls the embedding;
 // the Web App's managed identity queries Search & calls the LLM (Jalon 4)
 // ---------------------------------------------------------------------
@@ -159,3 +181,4 @@ output searchServiceName string = search.outputs.searchServiceName
 output foundryName string = foundryAccountName
 output webAppHostName string = webapp.outputs.webAppHostName
 output enrichFunctionHostName string = enrichFunction.outputs.functionAppHostName
+output kecoreFunctionAppName string = kecore.outputs.functionAppName
