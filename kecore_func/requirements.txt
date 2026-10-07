@@ -7,5 +7,6 @@ azure-functions
 azure-functions-durable
 azure-identity>=1.17
 azure-storage-blob>=12.19
+azure-data-tables>=12.5
 python-docx==1.2.0
 pypdf==6.18.0

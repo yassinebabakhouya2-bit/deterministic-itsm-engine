@@ -17,6 +17,18 @@ POST /api/kecore/find  (function key)  {"client": "client-s", "text": "<ticket>"
      model call first turns the ticket into search terms (kefind.interpret), recorded under the
      hash of the request in kecore-<client>/find-cache/: the same ticket gets the same terms.
      The KB map of a run is read once and kept in memory (4 maps at most).
+
+POST /api/kecore/tickets/scrub  (function key)  {"client": "client-s"}
+  -> scrubs every raw export under tickets-<client>/raw/*.csv (kecore.tickets.scrub: personal
+     columns dropped, e-mail/phone masked in free text), writes one Table row per ticket, and
+     deletes the raw export. No label, no judgment.
+
+POST /api/kecore/tickets/runs  (function key)  {"client": "client-s", "run_id": null,
+                                                 "interpret": true, "limit": 200}
+  -> one Durable run of every scrubbed ticket through kefind's funnel, unlabeled: tallies what
+     the funnel actually does (fiche shown / question asked / abstain, and why) -- a first signal
+     before any ticket is hand-labeled. No correctness judgment: that needs labels (scoreboard,
+     later). Same batching shape as /kecore/runs.
 """
 
 from __future__ import annotations
@@ -33,6 +45,7 @@ import azure.functions as func
 
 import kecore_pipeline as pipeline
 import kefind_service as finder
+import tickets_service as tickets_svc
 from kecore.llm import AzureOpenAIChat, RecordingLLM
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -47,6 +60,18 @@ def storage():
 
         _storage = BlobStorage()
     return _storage
+
+
+_table = None
+
+
+def table():
+    global _table
+    if _table is None:
+        from kecore_table import TableStorage
+
+        _table = TableStorage()
+    return _table
 
 
 def allowed_clients() -> list[str]:
@@ -173,3 +198,58 @@ def kecore_find(req: func.HttpRequest) -> func.HttpResponse:
     llm = find_llm(payload["client"]) if payload["interpret"] else None
     return func.HttpResponse(json.dumps(finder.respond(kb_map, payload, llm=llm), ensure_ascii=False),
                              mimetype="application/json")
+
+
+@app.route(route="kecore/tickets/scrub", methods=["POST"])
+def kecore_tickets_scrub(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _error(400, "a JSON body is expected")
+    try:
+        payload = tickets_svc.validate_tickets_request(body, allowed_clients())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    report = tickets_svc.scrub(storage(), table(), payload["client"])
+    return func.HttpResponse(json.dumps(report, ensure_ascii=False), mimetype="application/json")
+
+
+@app.route(route="kecore/tickets/runs", methods=["POST"])
+@app.durable_client_input(client_name="client")
+async def kecore_tickets_start(req: func.HttpRequest, client) -> func.HttpResponse:
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _error(400, "a JSON body is expected")
+    try:
+        payload = tickets_svc.validate_run_request(body, allowed_clients())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    instance_id = await client.start_new("tickets_run", client_input=payload)
+    return client.create_check_status_response(req, instance_id)
+
+
+@app.orchestration_trigger(context_name="context")
+def tickets_run(context: df.DurableOrchestrationContext):
+    payload = context.get_input()
+    count = yield context.call_activity("tickets_count", payload)
+    if not count:
+        return {"client": payload["client"], "tickets": 0, "error": "no scrubbed tickets for this client yet"}
+    ranges = pipeline.batches(count, tickets_svc.RUN_BATCH_SIZE)
+    parts = yield context.task_all(
+        [context.call_activity("tickets_run_batch", {**payload, "start": start, "end": end}) for start, end in ranges]
+    )
+    return tickets_svc.merge_runs(payload["client"], parts)
+
+
+@app.activity_trigger(input_name="payload")
+def tickets_count(payload: dict) -> int:
+    return tickets_svc.ticket_count(table(), payload["client"], payload["limit"])
+
+
+@app.activity_trigger(input_name="payload")
+def tickets_run_batch(payload: dict) -> dict:
+    # the ticket text is neither logged nor stored; only the model's search terms are recorded,
+    # in the same per-client cache kecore/find already uses (find-cache/)
+    llm = find_llm(payload["client"]) if payload["interpret"] else None
+    return tickets_svc.run_batch(storage(), table(), payload, payload["start"], payload["end"], llm=llm)

@@ -30,3 +30,9 @@ class BlobStorage:
 
     def write(self, container: str, name: str, data: bytes) -> None:
         self._service.get_blob_client(container, name).upload_blob(data, overwrite=True)
+
+    def delete(self, container: str, name: str) -> None:
+        try:
+            self._service.get_blob_client(container, name).delete_blob()
+        except ResourceNotFoundError:
+            pass

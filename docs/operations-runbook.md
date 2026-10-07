@@ -2120,3 +2120,78 @@ unaffected). Always commit (or at minimum stash) pending work before running a h
 This cost a round of re-recovering the slice 3 code straight from the last deployed package in
 Azure (`/api/vfs/data/SitePackages/` on the Function App's Kudu site, since
 `WEBSITE_RUN_FROM_PACKAGE` is unset and the live code is a mounted zip, not a `wwwroot` tree).
+
+## 18. Slice 4: real tickets, scrubbed and run blank (2026-10-08)
+
+The client has no KB field on its tickets (confirmed: no ticket's "Résolution" text names a KB
+number), and hand-labeling isn't happening yet. So slice 4 starts reduced: get the real export
+into a shape `kefind` can read, and run every ticket through the funnel once, unlabeled, to see
+the shape of what comes back (fiche / question / abstain, and why). No accuracy number yet —
+that needs labels (even 20-30 would do) and is the scoreboard, still ahead.
+
+### 18.1 What's new
+
+- `kecore/tickets.py` -- `scrub(data: bytes) -> (list[Ticket], ScrubReport)`. Parses the real
+  EasyVista export (`;`-separated, quoted fields with embedded newlines -- `csv` module, never
+  hand-split), drops the width-indicator row that isn't a ticket, drops every column that names a
+  person (`Bénéficiaire`, `Demandeur`, `Intervenant en cours`, `Enregistré par`,
+  `Résolu par (intervenant)`) entirely rather than masking it, and masks e-mail/phone in the free
+  text that's kept (`kecore.text.Scrubber`, the same mechanism KB decomposition already uses).
+  `Ticket.to_entity(client)` gives one Azure Table entity, French column names slugged into valid
+  Table property names (ASCII, `[A-Za-z_][A-Za-z0-9_]*`).
+- `kecore_func/kecore_table.py` -- `TableStorage`, the Function's managed identity against the
+  same storage account's Table endpoint (no key). One table (`KECORE_TICKETS_TABLE`, default
+  `tickets`), `PartitionKey` = client, `RowKey` = ticket id.
+- `kecore_func/tickets_service.py` -- the route logic: `scrub` (reads every
+  `tickets-<client>/raw/*.csv`, writes Table rows, deletes the raw export), `run_batch` (one
+  Durable-batch slice of a client's scrubbed tickets through `kefind.funnel.find`, interpretation
+  included when asked, tallied by `kind`/`reason` only), `merge_runs`.
+- `kecore_func/kecore_blob.py` gained `delete(container, name)` (raw export removed once scrubbed).
+- `kecore_func/kecore_pipeline.py` gained `Storage.delete(...)` on the protocol and
+  `ticket_container(client) -> "tickets-<client>"`.
+- Two new routes in `kecore_func/function_app.py`:
+  - `POST /api/kecore/tickets/scrub` `{"client": "client-s"}` -- synchronous (one CSV parse +
+    Table upserts, fast enough for a plain HTTP route).
+  - `POST /api/kecore/tickets/runs` `{"client": "client-s", "run_id": null, "interpret": true,
+    "limit": 200}` -- Durable, same shape as `/kecore/runs`: an orchestrator (`tickets_run`) calls
+    `tickets_count` then fans out `tickets_run_batch` activities (`RUN_BATCH_SIZE = 25`,
+    `kecore_pipeline.batches`) and merges the tallies. `run_id: null` uses the client's latest
+    `kecore` run (same as `/kecore/find`'s default).
+- `azure-data-tables>=12.5` added to `kecore_func/requirements.txt` (was only in the repo root's).
+- Infra: no Bicep change needed -- `infra/modules/kecore.bicep` already provisions the
+  `tickets-<client>` containers and already grants the Function's managed identity
+  `storageTableDataContributor` (slice-1 anticipated this).
+
+Tests: `kecore/tests/test_tickets.py` (10), `kecore_func/tests/test_tickets_service.py` (23,
+in-memory storage/table stubs, no Azure needed). Full suite: 93 (kecore) + 94 (kefind) + 23
+(kecore_func) = 210 passing.
+
+### 18.2 Raw export: where it goes
+
+The raw CSV goes to `tickets-<client>/raw/<file>.csv` in Blob storage -- **never** the client's
+SharePoint (§17.6) and never git (`.gitignore`'s `*.csv` rule). `/tickets/scrub` deletes it once
+it's in the Table, so the raw export never lingers.
+
+### 18.3 Deploy + scrub + run (PowerShell)
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+.\scripts\deploy-kecore-function.ps1
+
+$key = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group <rg> --query "functionKeys.default" -o tsv
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+
+# upload the raw export to tickets-client-s/raw/ first (az storage blob upload or the portal), then:
+Invoke-RestMethod -Method Post -Uri "$base/kecore/tickets/scrub?code=$key" `
+  -ContentType "application/json" -Body '{"client":"client-s"}'
+
+$run = Invoke-RestMethod -Method Post -Uri "$base/kecore/tickets/runs?code=$key" `
+  -ContentType "application/json" -Body '{"client":"client-s","limit":500}'
+Start-Sleep -Seconds 5
+Invoke-RestMethod -Uri $run.statusQueryGetUri
+```
+
+The run's final output is `{"client", "run_id", "tickets", "empty", "kinds": {...}, "reasons":
+{...}}` -- a distribution, not a score. `kinds` splits fiche/question/abstain; `reasons` is
+`kefind.funnel`'s own reason codes for each. Nothing here says whether a shown fiche was the
+*right* one -- that's the scoreboard, once tickets are labeled.

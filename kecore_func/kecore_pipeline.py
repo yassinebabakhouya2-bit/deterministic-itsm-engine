@@ -51,6 +51,8 @@ class Storage(Protocol):
 
     def write(self, container: str, name: str, data: bytes) -> None: ...
 
+    def delete(self, container: str, name: str) -> None: ...
+
 
 def kb_container(client: str) -> str:
     return f"kb-{client}"
@@ -58,6 +60,10 @@ def kb_container(client: str) -> str:
 
 def kecore_container(client: str) -> str:
     return f"kecore-{client}"
+
+
+def ticket_container(client: str) -> str:
+    return f"tickets-{client}"
 
 
 def layout(run_id: str) -> dict[str, str]:

@@ -107,7 +107,7 @@ Two choices made with the decision:
 | 1 | Bicep: Function App, `kecore-<client>` / `tickets-<client>` containers, RBAC (`infra/modules/kecore.bicep`) | ✅ Deployed 2026-10-06 — runbook §15 |
 | 2 | kecore on Azure + parity test on the 242 real fiches (`kecore_func/`) | ✅ Deployed 2026-10-06; parity PASS on Azure: 242 fiches, 163 / 22 / 57, 2228 / 2228, mean agreement 0.919, 0 model calls — runbook §16 |
 | 3 | Finding the fiche from entities and the graph: client dictionary on the ticket, a graph between fiches, text only breaking ties | ✅ Deployed 2026-10-07; confirmed on real client-s data (242 fiches) — runbook §17.7 |
-| 4 | Tickets (ServiceNow poll on the PDI, export upload for client-s), labeling tab, scoreboard on Azure | 🟢 Planned |
+| 4 | Tickets (ServiceNow poll on the PDI, export upload for client-s), labeling tab, scoreboard on Azure | 🟡 In progress 2026-10-08 — real export scrubbed into Table Storage and run blank (unlabeled) through `kefind`, tallied; labeling tab and scoreboard wait on the client having labeled tickets — runbook §18 |
 | 5 | kefind in the live Diagnostic + pilier 2 loop + dictionary review tab | 🟢 Planned |
 | 6 | Bridge to the ITSM action engine + work-note write-back | 🟢 Planned |
 | 7 | Remove the local-writing CLIs and `clients-local/kecore` (after upload) | 🟢 Planned |
@@ -159,8 +159,12 @@ me connecter à Windows") first missed — the interpretation prompt asked only
 for the fix ("unlock account"), never the problem's own state ("account
 locked"), so it never met "LOCKED ACCOUNT"'s title. Fixed by rephrasing the
 prompt to ask for both; the same ticket then reaches
-"KB0120- LOCKED ACCOUNT" directly. A full run across many real, labeled
-tickets with calibrated thresholds is slice 4.
+"KB0120- LOCKED ACCOUNT" directly. The client has no KB field on its tickets and is not
+ready to label by hand yet, so slice 4 started reduced: scrub the real export into Table
+Storage and run every ticket through the funnel once, unlabeled, to see the shape of what
+comes back (fiche / question / abstain, and why) -- no accuracy number without labels, and
+that part (even 20-30 labeled tickets would do) stays ahead, along with the scoreboard and
+threshold calibration. Runbook §18.
 
 ## Working rules for this track
 
