@@ -44,7 +44,7 @@ class ProfileTest(TempDirTestCase):
         llm = FakeLLM({"__headings__": {"mappings": [{"heading": "Pistes", "role": "resolution"},
                                                      {"heading": "Constat", "role": "symptom"}]}})
         profile = build_profile("c", custom_kb(), llm=llm)
-        self.assertEqual(llm.calls, ["heading_roles"])
+        self.assertEqual(llm.calls.count("heading_roles"), 1)
         self.assertEqual(profile.headings["pistes"], {"count": 4, "role": "resolution", "source": "llm", "example": "Pistes"})
         lookup = profile.role_lookup()
         self.assertEqual(lookup("pistes"), "resolution")

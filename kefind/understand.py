@@ -84,10 +84,14 @@ def _fallback_symptom(text: str, limit: int = 160) -> str:
     return (cut.rsplit(" ", 1)[0] if " " in cut else cut) + "..."
 
 
-def understand(llm, raw_text: str) -> TicketUnderstanding:
-    """Temps 1 : nettoyage + entités (code), symptôme/application/contexte (LLM, validé)."""
+def understand(llm, raw_text: str, app_dictionary: dict[str, list[str]] | None = None) -> TicketUnderstanding:
+    """Temps 1 : nettoyage + entités (code), symptôme/application/contexte (LLM, validé).
+
+    ``app_dictionary`` est le dictionnaire du client (``Profile.dictionary``), celui avec lequel
+    ses fiches ont été lues : le ticket est lu avec le même, sinon une application propre au
+    client ne se retrouverait jamais des deux côtés."""
     text = clean_text(raw_text)
-    entities = extract_entities(text)
+    entities = extract_entities(text, app_dictionary)
     result = TicketUnderstanding(raw_text=raw_text, text=text, entities=entities)
     if llm is None:
         result.symptom = _fallback_symptom(text)

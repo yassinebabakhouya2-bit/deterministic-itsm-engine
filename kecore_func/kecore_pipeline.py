@@ -7,9 +7,11 @@ separate, retryable Durable Functions activity and nothing lives on an operator'
   profile    fiches.jsonl                         -> runs/<run>/profile.json
   decompose  fiches.jsonl[start:end] + profile    -> runs/<run>/decomposed/<index>.json
   report     decomposed/*                         -> runs/<run>/{fiches.decomposed.jsonl, report.md,
-                                                     summary.json} and latest.json
+                                                     summary.json, graph.json} and latest.json
 
-Every run keeps its own folder: the map of a client's KB is versioned, never overwritten.
+Every run keeps its own folder: the map of a client's KB is versioned, never overwritten. The map
+kefind finds fiches on (slice 3) is that folder: fiches.decomposed.jsonl (verified steps and
+entities), profile.json (the client's dictionary) and graph.json (relations between fiches).
 The LLM record lives in kecore-<client>/llm-cache/ with the same layout and keys as the local
 record it replaces, so a run in mode "replay" re-reads earlier answers and never calls the model.
 
@@ -29,9 +31,12 @@ from kecore.decompose import DecomposedFiche, Decomposer
 from kecore.fiches import DOCUMENT_EXTENSIONS, Fiche, fiches_from_documents
 from kecore.profile import Profile, build_profile
 from kecore.report import build_report
+from kefind.graph import build_graph
 
 MODES = ("replay", "record")
 LLM_RECORD_PREFIX = "llm-cache/"
+LATEST = "latest.json"
+DICTIONARY_DECISIONS = "dictionary-decisions.json"
 DEFAULT_BATCH = 10
 MAX_BATCH = 50
 _PREFIX_RE = re.compile(r"^[\w\-. /]{0,200}$")
@@ -64,7 +69,8 @@ def layout(run_id: str) -> dict[str, str]:
         "decomposed": base + "fiches.decomposed.jsonl",
         "report": base + "report.md",
         "summary": base + "summary.json",
-        "latest": "latest.json",
+        "graph": base + "graph.json",
+        "latest": LATEST,
     }
 
 
@@ -109,25 +115,28 @@ def batches(count: int, size: int) -> list[list[int]]:
 
 
 class StorageRecordStore:
-    """kecore.llm.RecordingLLM store in kecore-<client>/llm-cache/, same layout as the local record."""
+    """kecore.llm.RecordingLLM store in kecore-<client>/llm-cache/, same layout as the local record.
 
-    def __init__(self, storage: Storage, client: str):
+    ``prefix`` keeps another record apart: the interpretation of tickets lives in find-cache/."""
+
+    def __init__(self, storage: Storage, client: str, prefix: str = LLM_RECORD_PREFIX):
         self.storage = storage
         self.container = kecore_container(client)
+        self.prefix = prefix
 
     def read(self, relative: str) -> str | None:
-        data = self.storage.read(self.container, LLM_RECORD_PREFIX + relative)
+        data = self.storage.read(self.container, self.prefix + relative)
         return None if data is None else data.decode("utf-8")
 
     def write(self, relative: str, text: str) -> None:
-        self.storage.write(self.container, LLM_RECORD_PREFIX + relative, text.encode("utf-8"))
+        self.storage.write(self.container, self.prefix + relative, text.encode("utf-8"))
 
 
 def _jsonl(items) -> bytes:
     return "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items).encode("utf-8")
 
 
-def _read_jsonl(data: bytes) -> list[dict]:
+def read_jsonl(data: bytes) -> list[dict]:
     return [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
 
 
@@ -144,7 +153,7 @@ def _require(storage: Storage, container: str, name: str) -> bytes:
 
 def _load_fiches(storage: Storage, payload: dict) -> list[Fiche]:
     data = _require(storage, kecore_container(payload["client"]), layout(payload["run_id"])["fiches"])
-    return [Fiche(**{k: v for k, v in item.items() if k in _FICHE_FIELDS}) for item in _read_jsonl(data)]
+    return [Fiche(**{k: v for k, v in item.items() if k in _FICHE_FIELDS}) for item in read_jsonl(data)]
 
 
 def _load_profile(storage: Storage, payload: dict) -> Profile:
@@ -171,14 +180,33 @@ def extract(storage: Storage, payload: dict) -> dict:
     return {"documents": len(names), "fiches": len(fiches), "warnings": warnings}
 
 
+def dictionary_rejected(storage: Storage, client: str) -> list[str]:
+    """The dictionary entries a person rejected (ids or spellings), from kecore-<client>/dictionary-decisions.json:
+    {"rejected": ["general", "montereau"]}. Missing file: nothing rejected."""
+    data = storage.read(kecore_container(client), DICTIONARY_DECISIONS)
+    if data is None:
+        return []
+    try:
+        decisions = json.loads(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{DICTIONARY_DECISIONS} is not valid JSON ({exc})") from None
+    rejected = decisions.get("rejected", []) if isinstance(decisions, dict) else None
+    if not isinstance(rejected, list) or not all(isinstance(item, str) for item in rejected):
+        raise ValueError(f'{DICTIONARY_DECISIONS} must look like {{"rejected": ["<entry id or spelling>", ...]}}')
+    return rejected
+
+
 def profile(storage: Storage, payload: dict, llm=None) -> dict:
     fiches = _load_fiches(storage, payload)
-    learned = build_profile(payload["client"], fiches, llm=llm, with_dictionary=payload["with_dictionary"])
+    rejected = dictionary_rejected(storage, payload["client"]) if payload["with_dictionary"] else []
+    learned = build_profile(payload["client"], fiches, llm=llm, with_dictionary=payload["with_dictionary"],
+                            dictionary_rejected=rejected)
     storage.write(kecore_container(payload["client"]), layout(payload["run_id"])["profile"], _json(learned.to_dict()))
     return {
         "headings": len(learned.headings),
         "stable": learned.stable,
         "dictionary": len(learned.dictionary),
+        "dictionary_rejected": len(learned.dictionary_rejected),
         "llm": {**_llm_counts(llm), "heading_roles": learned.llm_usage, "dictionary": learned.dictionary_usage},
     }
 
@@ -196,7 +224,8 @@ def decompose(storage: Storage, payload: dict, start: int, end: int, llm=None) -
 
 def report(storage: Storage, payload: dict, ranges: list[list[int]], profile_stats: dict, batch_stats: list[dict],
            warnings: list[str], model_id: str | None) -> dict:
-    """Gathers the run: the same report and summary as a local run, plus latest.json."""
+    """Gathers the run: the same report and summary as a local run, the graph between fiches
+    (kefind.graph, code only) and latest.json."""
     container = kecore_container(payload["client"])
     paths = layout(payload["run_id"])
     decomposed = []
@@ -216,12 +245,16 @@ def report(storage: Storage, payload: dict, ranges: list[list[int]], profile_sta
             "output_tokens": sum(b.get("output_tokens", 0) for b in batch_stats),
         }
     markdown, summary = build_report(payload["client"], decomposed, _load_profile(storage, payload), llm_stats, warnings)
+    graph = build_graph(decomposed)
     storage.write(container, paths["decomposed"], _jsonl(d.to_dict() for d in decomposed))
     storage.write(container, paths["report"], markdown.encode("utf-8"))
     storage.write(container, paths["summary"], _json(summary))
+    storage.write(container, paths["graph"], _json(graph.to_dict()))
     keys = ("fiches", "guided", "citable", "info_only", "steps", "steps_verified", "mean_agreement")
     short = {key: summary.get(key) for key in keys}
     short["llm"] = summary.get("llm", {})
+    short["dictionary"] = profile_stats.get("dictionary")
+    short["graph"] = graph.stats()
     short["run_id"] = payload["run_id"]
     storage.write(container, paths["latest"], _json({"run_id": payload["run_id"], "summary": short}))
     return short

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 
 from .decompose import DecomposedFiche, summarize_kb
 from .profile import Profile
@@ -21,6 +22,37 @@ def _short(text: str, limit: int = 70) -> str:
 
 def _pct(part: int, whole: int) -> str:
     return "–" if not whole else f"{100 * part / whole:.1f}%"
+
+
+def _dictionary_section(profile: Profile, decomposed: list[DecomposedFiche]) -> list[str]:
+    """The client's dictionary, for a person to check: what is not a product gets rejected for good."""
+    stats = profile.dictionary_stats or {}
+    if not profile.dictionary and not profile.dictionary_rejected and not stats:
+        return []
+    lines = ["## Client dictionary", ""]
+    if stats:
+        lines.append(
+            f"Candidates: {stats.get('trigger_terms', 0)} after a trigger word, {stats.get('name_candidates', 0)} from the "
+            f"document names; products named by the LLM: {stats.get('llm_products', '–')}; spellings dropped because "
+            f"the fiches do not write them: {len(stats.get('dropped_by_corpus_check', []))}."
+        )
+        lines.append("")
+    if profile.dictionary:
+        counts = Counter(c for d in decomposed for c in {e["canonical"] for e in d.entities})
+        lines += ["| Entry | Spellings | Fiches |", "| --- | --- | --- |"]
+        for key, spellings in sorted(profile.dictionary.items()):
+            lines.append(f"| {_cell(key)} | {_cell(', '.join(spellings))} | {counts.get('app:' + key, 0)} |")
+        lines.append("")
+    else:
+        lines += ["No entry.", ""]
+    lines.append(
+        "An entry that is not a product is removed for good by adding its id under \"rejected\" in the client's "
+        "dictionary decisions (`kecore-<client>/dictionary-decisions.json` in Azure); the next run leaves it out."
+    )
+    if profile.dictionary_rejected:
+        lines.append("Rejected: " + ", ".join(_cell(r) for r in profile.dictionary_rejected) + ".")
+    lines.append("")
+    return lines
 
 
 def build_report(client: str, decomposed: list[DecomposedFiche], profile: Profile | None, llm_stats: dict,
@@ -92,6 +124,7 @@ def build_report(client: str, decomposed: list[DecomposedFiche], profile: Profil
             lines.append(f"Boilerplate removed from every fiche ({len(profile.boilerplate)} lines), e.g.:")
             lines += [f"- {_short(line, 90)}" for line in profile.boilerplate[:5]]
             lines.append("")
+        lines += _dictionary_section(profile, decomposed)
 
     citable = sorted((d for d in decomposed if d.status == "citable"), key=lambda d: (d.methods.get("agreement") or 0))
     if citable:

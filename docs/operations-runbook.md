@@ -1957,3 +1957,166 @@ cost. The versioned map of the KB is in `kecore-client-s/runs/20261006T200741Z-b
 `latest.json` points to it.
 
 **Status 2026-10-06: slices 1 and 2 deployed and verified on Azure.**
+
+## 17. Slice 3: finding the fiche by entities and the graph (2026-10-07)
+
+`kefind.funnel.find` — entities first, the client's graph next, BM25F text only to break ties;
+the code decides at every step, the LLM only proposes (dictionary candidates, ticket search
+terms). New in the repo: `kefind/graph.py`, `kefind/funnel.py`, `kefind/interpret.py`,
+`kefind/funnel_engine.py`; `kecore/profile.py`'s dictionary now also mines product names from
+document names (LLM-classified, corpus-verified, permanently human-rejectable); the report adds
+a `graph` to the run's summary; the profile step reads `dictionary-decisions.json`;
+`kefind_service.py` and the `kecore_find` route (interpretations recorded in
+`kecore-<client>/find-cache/`). `scripts/deploy-kecore-function.ps1` ships `kefind/` with
+`kecore/`.
+
+### 17.1 The client-s dictionary: common words in, products out (found 2026-10-06)
+
+The deterministic dictionary (trigger words only) held `desk` and `request` as "applications"
+(from "the service Desk", "service Request") and missed every real product (VEEAM, Unity,
+AutoCAD, LogMeIn, Palo Alto...), because client-s names its products in document names without
+any trigger word ("How to Install AutoCad", "VEEAM-Appel_Support"). Fix, in
+`kecore.profile.build_dictionary`:
+- a candidate must be written as a name: at least 80% of its occurrences capitalized, links and
+  paths aside ("Desk" 54%, "Request" 32%, against AutoCAD 100%, VEEAM 98%, Unity 94%);
+- the words written like names in the document names are candidates too (71 on client-s, in 2
+  fiches or more but not in most of them, which code alone cannot tell from a product);
+- one model call per run keeps the products among the candidates and groups their spellings
+  under a canonical name (`kecore.llm_segment.llm_dictionary_products`);
+- the code verifies: a proposed alias is kept only if it shares a word with an actual candidate
+  and occurs in 2+ fiches of the corpus — the model cannot invent anything;
+- an entry a person rejects in `kecore-<client>/dictionary-decisions.json` never comes back.
+
+Tests in `kecore/tests/test_profile.py`.
+
+### 17.2 Deploy the code
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+.\scripts\deploy-kecore-function.ps1
+$fn = 'fn-kecore-knowledgeengine3-v9'
+$key = az functionapp keys list --resource-group rg-knowledgeengine-v9 --name $fn --query functionKeys.default -o tsv
+```
+
+### 17.3 New map of client-s (record: one model call, for the dictionary)
+
+```powershell
+$body = @{ client = 'client-s'; source_prefix = 'Kbs/'; mode = 'record' } | ConvertTo-Json
+$run = Invoke-RestMethod -Method Post -Uri "https://$fn.azurewebsites.net/api/kecore/runs?code=$key" -Body $body -ContentType 'application/json'
+do { Start-Sleep -Seconds 30; $s = Invoke-RestMethod $run.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending', 'Running')
+$s.output | ConvertTo-Json -Depth 5
+(az rest --method get --url "https://stknowledgeengine3v9.blob.core.windows.net/kecore-client-s/runs/$($s.output.run_id)/profile.json" --resource https://storage.azure.com --headers "x-ms-version=2021-08-06" | ConvertFrom-Json).dictionary
+```
+
+Expected (2026-10-07, real run): 242 fiches, 163/22/57, 2228/2228 verified, mean agreement
+0.919, one live model call (the dictionary), `graph` with 242 fiches / 231 with a number / 12
+references / 11 duplicate groups / 2 number conflicts / 0 superseded.
+
+### 17.4 Reject what is not a product
+
+The ids of the entries to drop go in `kecore-client-s/dictionary-decisions.json`, then the run
+of 17.3 is made again: the dictionary's answer is already in the record (same candidates, same
+request), so it costs no call; the code applies the rejection. The JSON goes through a temporary
+file, deleted right after: PowerShell strips the quotes of a JSON argument given to `az`.
+
+```powershell
+$tmp = New-TemporaryFile
+'{"rejected": ["<entry id>"]}' | Set-Content -Path $tmp -Encoding ascii
+az storage blob upload --account-name stknowledgeengine3v9 --auth-mode login --container-name kecore-client-s `
+  --name dictionary-decisions.json --file $tmp --overwrite -o none
+Remove-Item $tmp
+```
+
+### 17.5 Ask for a fiche
+
+```powershell
+function Find-Fiche([string]$Text, [bool]$Interpret = $true, [string[]]$Answers = @()) {
+    $b = @{ client = 'client-s'; text = $Text; answers = $Answers; interpret = $Interpret } | ConvertTo-Json
+    $r = Invoke-RestMethod -Method Post -Uri "https://$fn.azurewebsites.net/api/kecore/find?code=$key" `
+        -Body ([Text.Encoding]::UTF8.GetBytes($b)) -ContentType 'application/json; charset=utf-8'
+    $shown = if ($r.fiche) { $r.fiche.label } else { $r.decision.question }
+    '{0} [{1}] {2}' -f $r.decision.kind, $r.decision.reason, $shown
+}
+# code only
+Find-Fiche 'Comment vider le cache Teams ?' $false
+```
+
+### 17.6 What slice 3 does not do yet
+
+- A fiche kecore marks `info_only` (no resolution step) is never returned.
+- Two fiches that are really close still give a question.
+- The thresholds (`kefind.funnel.FunnelConfig`) are starting values; real tickets measure and
+  calibrate them in slice 4.
+- Raw ITSM ticket exports hold personal data (names, e-mails). They go to
+  `tickets-<client>/raw/` in Azure, never to the client's SharePoint library: the daily
+  ingestion Logic App copies that whole library into `kb-<client>` and the hourly text indexer
+  does not exclude `.csv`, so a raw export dropped there gets indexed and searchable alongside
+  the KB. If one is uploaded there by mistake, move it to `tickets-<client>/raw/`, delete it from
+  SharePoint before the next daily ingestion run, and never commit it to git (`.gitignore` now
+  excludes `*.csv` / `*.csv.gz` repo-wide).
+
+### 17.7 First real run on Azure (2026-10-07): confirmed and one fix
+
+Deployed and run on client-s's real 242 fiches (`run_id 20261007T195803Z-aeb2ac`). Confirmed
+against the sandbox prediction, exactly: 242/163/22/57 fiches, 2228/2228 steps verified, mean
+agreement 0.919; `graph` stats (242 fiches, 231 with a number, 12 references, 11 duplicate
+groups, 2 number conflicts); the real 20-entry dictionary (GPT-4o) matches the hand-simulated
+one closely. Three of four `Find-Fiche` calls matched the prediction exactly (Teams cache,
+AutoCAD license by title match, English "account locked" ticket with no interpretation) — the
+funnel, the graph and the title-match mechanism are confirmed working in production.
+
+**Bug found: a French ticket with interpretation missed its own fiche.**
+`Find-Fiche "Mon compte est bloqué, je n'arrive plus à me connecter à Windows"` (interpret=true)
+returned `question [text_only_close_choice]` with three unrelated fiches, instead of
+`KB0120- LOCKED ACCOUNT`.
+
+Root cause, from the call's full trace (`$r | ConvertTo-Json -Depth 8`):
+- the `entities` step found nothing — the ticket has no error code, no application, nothing
+  technical; its only OS mention ("Windows", no version) is not in
+  `kecore.entities.OPERATING_SYSTEMS` (only `windows 10`/`windows 11`/`windows server`), and by
+  design the OS never filters anyway (`kefind/funnel.py`'s own docstring: "Le système
+  d'exploitation ne filtre jamais"). So the funnel fell to `text_only` mode (pure BM25F over all
+  175 candidates) — expected behavior for a ticket with no identifying entity, not a bug by
+  itself.
+- the real bug is in `kefind/interpret.py`'s prompt: it told the model to give "the usual fix
+  when it is well known (for example 'unlock account', ...)" — only the resolution action, never
+  the problem's state. The model dutifully returned `"unlock account"`, never `"account
+  locked"`/`"locked account"`. Fiche titles name the problem's state ("LOCKED ACCOUNT"), not the
+  fix, so `unlock` never lexically meets `locked` and KB0120's title-match bonus (`named()`,
+  needs 2 matched title words) never triggered. The ticket's own French words ("compte",
+  "bloque") did get tokenized and used — confirmed by the trace — so the filter and ranking code
+  worked exactly as designed; only the terms the model chose to propose were one-sided.
+
+Fix (`kefind/interpret.py`, prompt only, same validation/record-and-replay mechanism, no logic
+change): the system prompt now explicitly asks for both the problem's state phrasing
+("account locked", "compte bloqué") and the fix ("unlock account"), explaining that knowledge-base
+titles name the state, not the action. `RecordingLLM`'s cache key hashes the system prompt, so
+this invalidates the existing cached answer for this ticket and forces one fresh live call.
+
+**Dictionary: one rejection.** Of the real run's 20 entries, one entry is the client's own parent
+company name, not a software product — rejected via 17.4 (the exact spelling is not reproduced
+here; see the real `dictionary-decisions.json` in Azure, never in git). `unity` (possibly an
+internal PC-migration program name rather than the game engine) and `miracast` (a display
+standard, not a vendor product) are kept: both still work as useful entities even if the
+classification label is imprecise.
+
+**Status 2026-10-07: confirmed on Azure (run_id 20261007T204049Z-215423). `dictionary-decisions.json`
+holds the client's parent-company name as its one rejected entry; dictionary now 19 entries. The
+retest of the failing ticket now returns `fiche [text_only_close_title_match] KB0120- LOCKED
+ACCOUNT` directly. Slice 3 closed pending slice 4 (tickets, calibration).**
+
+### 17.8 Never the real client names in git (2026-10-07)
+
+The repo's git history (32 of 49 commits, 2 commit messages) held the client's real parent-company
+and production-client names in several older commits. Scrubbed with `git filter-repo
+--replace-text` (regex, case-insensitive, whole word) and force-pushed on all branches. Anyone
+with another clone or fork of this repo must delete it and re-clone — the old commit SHAs no
+longer exist upstream. If the repo was ever public, GitHub's cached views of already-merged PRs
+can still show the old names; only GitHub support can purge that cache.
+
+**Caution for next time**: `git filter-repo --force` resets the working tree to the rewritten
+HEAD, discarding any uncommitted changes on already-tracked files (new, untracked files are
+unaffected). Always commit (or at minimum stash) pending work before running a history rewrite.
+This cost a round of re-recovering the slice 3 code straight from the last deployed package in
+Azure (`/api/vfs/data/SitePackages/` on the Function App's Kudu site, since
+`WEBSITE_RUN_FROM_PACKAGE` is unset and the live code is a mounted zip, not a `wwwroot` tree).

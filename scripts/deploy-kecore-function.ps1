@@ -1,5 +1,5 @@
 # deploy-kecore-function.ps1 -- V10 slice 2
-# Deploys the kecore Function code (kecore_func/ plus the kecore package) to the
+# Deploys the kecore Function code (kecore_func/ plus the kecore and kefind packages) to the
 # Function App created by infra/modules/kecore.bicep (slice 1).
 #
 # Same packaging method as deploy-webapp.ps1 and bootstrap-new-tenant.ps1: zip built
@@ -31,6 +31,7 @@ $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.Zi
 try {
     Add-Tree $zip (Join-Path $root 'kecore_func') ''
     Add-Tree $zip (Join-Path $root 'kecore') 'kecore/'
+    Add-Tree $zip (Join-Path $root 'kefind') 'kefind/'
 } finally {
     $zip.Dispose()
 }

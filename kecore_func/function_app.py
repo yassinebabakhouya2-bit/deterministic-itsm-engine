@@ -1,4 +1,4 @@
-"""fn-kecore — the V10 KB decomposition, run in Azure (slice 2).
+"""fn-kecore — the V10 KB decomposition (slice 2) and the fiche finder (slice 3), run in Azure.
 
 POST /api/kecore/runs  (function key)  {"client": "client-s", "source_prefix": "Kbs/",
                                          "mode": "replay" | "record", "batch_size": 10,
@@ -9,10 +9,19 @@ The run: extract -> profile -> decompose (batches in parallel, at most 4 at a ti
 host.json) -> report. Each step is an activity that reads from and writes to blob storage
 (kecore_pipeline.py); kecore itself is unchanged. Identity: the Function's managed identity,
 for blob storage and for Azure OpenAI alike. A client not listed in KECORE_CLIENTS is refused.
+
+POST /api/kecore/find  (function key)  {"client": "client-s", "text": "<ticket>",
+                                         "answers": ["app:teams"], "run_id": null, "interpret": true}
+  -> the decision (fiche / question / abstain), its trace, and the fiche's verified steps.
+     The decision is code (kefind_service.py, kefind.funnel). With "interpret" (default), one
+     model call first turns the ticket into search terms (kefind.interpret), recorded under the
+     hash of the request in kecore-<client>/find-cache/: the same ticket gets the same terms.
+     The KB map of a run is read once and kept in memory (4 maps at most).
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import urllib.parse
@@ -23,6 +32,7 @@ import azure.durable_functions as df
 import azure.functions as func
 
 import kecore_pipeline as pipeline
+import kefind_service as finder
 from kecore.llm import AzureOpenAIChat, RecordingLLM
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -123,3 +133,43 @@ def kecore_report(payload: dict) -> dict:
         storage(), payload, payload["ranges"], payload["profile_stats"], payload["batch_stats"],
         payload["warnings"], model_id(),
     )
+
+
+_chat = None
+
+
+def find_llm(client: str) -> RecordingLLM:
+    """The model that interprets tickets, behind the client's record (kecore-<client>/find-cache/)."""
+    global _chat
+    if _chat is None:
+        _chat = AzureOpenAIChat.from_config(llm_config())
+    return RecordingLLM(_chat, mode="record", store=pipeline.StorageRecordStore(storage(), client, prefix="find-cache/"))
+
+
+@functools.lru_cache(maxsize=4)
+def _kb_map(client: str, run_id: str):
+    # a run's folder never changes once written: its map can be kept as long as the process lives
+    return finder.load_map(storage(), client, run_id)
+
+
+@app.route(route="kecore/find", methods=["POST"])
+def kecore_find(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _error(400, "a JSON body is expected")
+    try:
+        payload = finder.validate_find_request(body, allowed_clients())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    run_id = payload["run_id"] or finder.latest_run(storage(), payload["client"])
+    if not run_id:
+        return _error(404, "no KB map for this client yet: start a run with POST /api/kecore/runs")
+    try:
+        kb_map = _kb_map(payload["client"], run_id)
+    except FileNotFoundError:
+        return _error(404, "no KB map for this run (unknown or unfinished run)")
+    # the ticket text is neither logged nor stored; only the model's search terms are recorded
+    llm = find_llm(payload["client"]) if payload["interpret"] else None
+    return func.HttpResponse(json.dumps(finder.respond(kb_map, payload, llm=llm), ensure_ascii=False),
+                             mimetype="application/json")

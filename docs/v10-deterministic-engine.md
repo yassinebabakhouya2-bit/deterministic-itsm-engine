@@ -51,8 +51,8 @@ one — is organized as eight dependency-ordered pillars:
 | # | Pillar | Status |
 |---|---|---|
 | 1 | Structure induction (per-client archetype detection, query enrichment) | 🟢 Planned |
-| 2 | Dynamic per-client entity dictionary (replaces `kecore.entities.APPS`) | 🟡 In progress — offline corpus scan (`kecore.profile.build_dictionary`) shipped; the online feedback loop's rules (`kecore.pending`, storage-agnostic, human-validated) are written and tested, its Azure side (Table + review tab, `observe` on live questions) is slice 5 below. Known gap: `kefind.understand` extracts ticket entities without the client's dictionary, so a client-specific app named in a ticket never earns the entity bonus — fixed in slice 5 |
-| 3 | Knowledge-graph relations between fiches (replaces the no-op `kefind.graph_filter`) | 🟢 Planned — needs pillar 2 and a real embedding service |
+| 2 | Dynamic per-client entity dictionary (replaces `kecore.entities.APPS`) | 🟡 In progress — offline corpus scan (`kecore.profile.build_dictionary`) now also mines product names out of document names (not just trigger words), classified by one LLM call per run and verified against the corpus, with a permanent human-rejection file (`dictionary-decisions.json`, runbook §17.4). `kefind.funnel` applies the run's dictionary to the ticket. The online feedback loop (`kecore.pending`, human-validated) is written and tested; its Azure side (Table + review tab) is slice 5 |
+| 3 | Knowledge-graph relations between fiches (replaces the no-op `kefind.graph_filter`) | ✅ Done for the deterministic track — `kefind.graph` (duplicates, number conflicts, references, prerequisites, supersession), pure code, no embeddings needed; used by `kefind.funnel` to prune candidates before ranking |
 | 4 | Canonical ingestion schema | 🟢 Planned |
 | 5 | Bayesian step ordering (p/C ratio) | 🟢 Planned — needs pillar 2 |
 | 6 | Conformal abstention (replaces fixed `kefind.decide.Thresholds`) | 🟢 Planned — calibration must use only validated tickets, never raw production ones |
@@ -106,11 +106,61 @@ Two choices made with the decision:
 |---|---|---|
 | 1 | Bicep: Function App, `kecore-<client>` / `tickets-<client>` containers, RBAC (`infra/modules/kecore.bicep`) | ✅ Deployed 2026-10-06 — runbook §15 |
 | 2 | kecore on Azure + parity test on the 242 real fiches (`kecore_func/`) | ✅ Deployed 2026-10-06; parity PASS on Azure: 242 fiches, 163 / 22 / 57, 2228 / 2228, mean agreement 0.919, 0 model calls — runbook §16 |
-| 3 | Finding the fiche from entities and the graph: client dictionary on the ticket, entity index `idx-<client>-fiches`, graph between fiches; text only breaks ties | 🟢 Next |
+| 3 | Finding the fiche from entities and the graph: client dictionary on the ticket, a graph between fiches, text only breaking ties | ✅ Deployed 2026-10-07; confirmed on real client-s data (242 fiches) — runbook §17.7 |
 | 4 | Tickets (ServiceNow poll on the PDI, export upload for client-s), labeling tab, scoreboard on Azure | 🟢 Planned |
 | 5 | kefind in the live Diagnostic + pilier 2 loop + dictionary review tab | 🟢 Planned |
 | 6 | Bridge to the ITSM action engine + work-note write-back | 🟢 Planned |
 | 7 | Remove the local-writing CLIs and `clients-local/kecore` (after upload) | 🟢 Planned |
+
+## How the funnel finds a fiche (slice 3)
+
+`kefind.funnel.find` replaces the 5-step `kefind` pipeline above for the
+"which fiche" decision. Entities first, the graph next, text only to break
+ties — the code decides at every step, never the LLM:
+
+1. **Interpretation** (`kefind.interpret`, the only model call in the path):
+   turns the ticket into English and French search terms, and names the
+   likely application. The model proposes; the code verifies each term (at
+   most 12, 6 words each, no error code / fiche number / path / command /
+   URL / menu / contact detail absent from the ticket) and drops anything
+   that fails. These terms never filter and never decide — they only widen
+   the text-ranking step below.
+2. **Entities**: `kecore.entities.extract_entities`, with the same client
+   dictionary used to read the fiches. An entity absent from the map is
+   ignored and traced.
+3. **Filter by levels**, most informative first: a technician's own answers
+   to a prior question, a cited fiche number (resolved through the graph),
+   identifiers (error code, event, ServiceNow KB number), update number,
+   application, technical elements (path, registry, command, URL, menu,
+   shortcut). A fiche passes a level if it carries at least one of the
+   ticket's entities there; it must pass every level kept. When no fiche
+   passes, the least informative level is dropped and the attempt retried
+   (traced). The operating system never filters — a ticket mentions it too
+   often in passing — it only drives a disambiguating question.
+4. **Graph** (`kefind.graph`): a duplicate becomes its canonical fiche, a
+   replaced fiche the fiche replacing it.
+5. **Text**: BM25F over the structure kecore extracted (title ×3, symptom
+   and cause ×2, steps ×1, body ×1), with the ticket's own words and the
+   interpretation's terms. Text only ranks the fiches the entities and the
+   graph already kept.
+6. **Decision** by thresholds: a fiche clearly ahead → shown directly; close
+   fiches where only one repeats at least two words of its own title (name
+   of the document included, at least one informative) → that fiche; close
+   fiches an entity could tell apart → a question on that entity; no entity
+   at all → a stricter text-only search across the whole map, a question
+   asking the application if it comes close, otherwise abstention.
+
+Measured on Azure (runbook §17.7, 2026-10-07), real model, real dictionary
+on the 242 real client-s fiches: 3 of 4 spot-checked tickets matched a
+hand-written prediction exactly on the first try (Teams cache, AutoCAD
+licence by title match, an English "account locked" ticket needing no
+interpretation at all); the 4th ("Mon compte est bloqué, je n'arrive plus à
+me connecter à Windows") first missed — the interpretation prompt asked only
+for the fix ("unlock account"), never the problem's own state ("account
+locked"), so it never met "LOCKED ACCOUNT"'s title. Fixed by rephrasing the
+prompt to ask for both; the same ticket then reaches
+"KB0120- LOCKED ACCOUNT" directly. A full run across many real, labeled
+tickets with calibrated thresholds is slice 4.
 
 ## Working rules for this track
 

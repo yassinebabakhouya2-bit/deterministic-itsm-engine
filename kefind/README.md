@@ -5,7 +5,86 @@
 reste. Il réutilise `kecore` (nettoyage, entités, décomposition des fiches,
 appels LLM enregistrables) et s'expose comme un moteur `scoreboard`.
 
-## Le pipeline
+## V10, tranche 3 : trouver la fiche par les entités (`kefind.funnel`)
+
+Depuis le 2026-10-06, la fiche se trouve **par le code, entités d'abord** ; le texte ne fait
+plus que départager. Le LLM n'intervient qu'en amont, pour **interpréter** le ticket
+(`kefind.interpret`, voir plus bas) ; il ne filtre ni ne décide.
+
+```
+carte du KB d'un client (un run kecore, figé et versionné)
+  fiches décomposées (étapes vérifiées, entités) + profil (dictionnaire) + graphe (kefind.graph)
+
+ticket
+  │ 0. INTERPRÉTER (LLM, facultatif) termes de recherche anglais + français, vérifiés par le code
+  │ 1. ENTITÉS     kecore.entities, AVEC LE MÊME DICTIONNAIRE que les fiches ;
+  │                une entité absente de la carte est ignorée (et tracée)
+  │ 2. FILTRE      niveaux, du plus informatif au moins informatif :
+  │                réponses du technicien > numéro de fiche cité (KB0052, via le graphe)
+  │                > code d'erreur / événement / n° KB ServiceNow > mise à jour > application
+  │                > chemin, registre, commande, URL, menu, raccourci.
+  │                Dans un niveau : AU MOINS UNE entité ; entre niveaux : TOUS.
+  │                Rien ne passe -> le dernier niveau est retiré, puis le précédent (tracé).
+  │                L'OS ne filtre jamais (cité en passant) ; il sert aux questions.
+  │ 3. GRAPHE      doublon -> fiche canonique ; fiche remplacée -> celle qui la remplace
+  │ 4. TEXTE       BM25F sur la structure kecore (titre x3 dont nom du document,
+  │                symptôme/cause x2, étapes x1, corps x1), mots du ticket + termes
+  │                de l'interprétation : classe, ne choisit pas
+  │ 5. DÉCISION    fiche / question / abstain (FunnelConfig)
+  ▼
+Finding (kind, reason, fiche_id, fiches, question, options, trace)
+```
+
+**Quand une fiche est montrée directement.** Si une entité forte l'a désignée (réponse du
+technicien, numéro de fiche, code d'erreur ou d'événement, mise à jour) ; ou si le ticket (ou son
+interprétation) reprend au moins deux mots de son titre, nom du document compris, dont un au
+moins informatif (présent dans au plus 25 % des fiches). Quand plusieurs fiches sont proches par
+le texte et qu'une seule a son titre ainsi repris, c'est elle. Sinon la fiche est **proposée**
+avec les suivantes (question « laquelle de ces fiches ? », trois au plus) : sans identifiant ni
+titre, un vocabulaire proche ne suffit pas à affirmer. Plusieurs fiches proches et une entité qui les sépare : la question porte sur
+cette entité (« l'application concernée est-elle outlook ou teams ? »), et la réponse revient
+dans `answers` (`["app:teams"]`), qui filtre au premier niveau.
+
+**Le graphe (`kefind.graph`).** Numéro de chaque fiche (id ou titre) ; doublons = textes
+partageant au moins 80 % de leurs suites de 5 mots, ou même numéro et au moins 50 % ; même numéro
+mais textes différents = *conflit de numéro*, jamais fusionné (client-s : KB0076 et KB0339 sont
+chacun deux fiches distinctes) ; références et prérequis (numéro cité dans le texte, dans une
+étape « prérequis ») ; remplacement (« remplace la fiche KB0052 », « replaced by KB0120 »).
+
+**Interpréter (`kefind.interpret`).** Un ticket en français et une fiche en anglais ne partagent
+aucun mot (« compte bloqué » contre « LOCKED ACCOUNT »). Le LLM reçoit le seul ticket et rend des
+termes de recherche en anglais et en français, avec le correctif usuel quand il est connu
+(« Teams écran blanc » donne « clear Teams cache ») et l'application. Le code vérifie chaque terme :
+12 au plus, 6 mots au plus, aucun code d'erreur, numéro de fiche, chemin, commande, URL, menu ou
+raccourci absent du ticket, aucune adresse ni téléphone. Les termes s'ajoutent aux mots du ticket
+pour le texte ; ils ne filtrent jamais (une application proposée par le LLM n'est pas une
+entité du ticket). La réponse est enregistrée sous l'empreinte de la requête : même ticket, mêmes
+termes. Sans LLM, ou s'il échoue, la recherche se fait sur le ticket seul.
+
+**Ce que la carte apporte en plus de kecore.** Un titre partagé par plusieurs fiches est un
+intitulé de modèle, pas un titre (« General Information » ouvre 198 des 242 fiches client-s) :
+le nom du document le remplace, pour l'affichage comme pour le texte. Les entités du nom du
+document sont ajoutées à celles de la fiche (même code, même dictionnaire).
+
+```python
+from kefind.funnel import KBMap, find
+kb_map = KBMap("clienta", fiches, dictionary=profile.dictionary)   # graphe construit si absent
+finding = find(kb_map, "L'application reste bloquée, erreur 0x80070005")
+finding.kind, finding.question        # "question", "... l'application concernée est-elle outlook ou teams ?"
+find(kb_map, "...", answers=["app:teams"]).fiche_id                   # "KB0030002"
+```
+
+En Azure : `POST /api/kecore/find` (`kecore_func/kefind_service.py`, interprétation par défaut,
+`"interpret": false` pour le code seul). Pour `scoreboard` : `kefind.funnel_engine:factory`
+(`{"fiches_path": ..., "profile_path": ..., "funnel": {...}}`), ou `FunnelEngine(..., llm=...)`
+pour mesurer avec l'interprétation.
+Les seuils de `FunnelConfig` sont des valeurs de départ, à calibrer sur des tickets étiquetés
+(tranche 4).
+
+Le pipeline d'origine ci-dessous (recherche fusionnée, décision par score) reste en place pour
+comparaison sur le scoreboard.
+
+## Le pipeline d'origine (5 temps)
 
 ```
 ticket texte

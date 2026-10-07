@@ -59,3 +59,8 @@ turns_*.json
 /zi[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]
 
 llm.json
+
+# Raw ITSM exports (tickets) hold personal data (names, e-mails): they never enter the repository.
+# They go to tickets-<client>/raw/ in Azure (runbook 15.3) and are scrubbed there (slice 4).
+*.csv
+*.csv.gz
