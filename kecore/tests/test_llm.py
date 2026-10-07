@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from kecore.azure import RestClient, TokenProvider
+from kecore.azure import AzureError, RestClient, TokenProvider
 from kecore.llm import AzureOpenAIChat, AzureOpenAIConfig, LLMError, RecordingLLM
 from kecore.llm_segment import SCHEMA_NAME, llm_segment, schema
 
@@ -79,6 +79,39 @@ class AzureOpenAITest(unittest.TestCase):
             AzureOpenAIConfig.from_dict({"endpoint": "https://<foundry-account>.openai.azure.com"})
         with self.assertRaisesRegex(ValueError, "unknown LLM setting"):
             AzureOpenAIConfig.from_dict({"endpoint": "https://a.openai.azure.com", "model": "x"})
+
+
+class TransportRetryTest(unittest.TestCase):
+    """A transport-level failure (DNS, connect, read timeout) retries like a 429/5xx, then
+    surfaces through the client's own error_class -- never the generic AzureError -- so a caller
+    that only catches its configured error type (kefind.interpret catching LLMError) degrades
+    instead of crashing."""
+
+    def client(self, transport, retries=3):
+        tokens = TokenProvider("entra", scope="https://cognitiveservices.azure.com/.default",
+                               credential=FakeCredential(), clock=lambda: 0)
+        return RestClient("https://acct.openai.azure.com", "2024-10-21", tokens, transport=transport,
+                          sleep=lambda s: None, retries=retries, error_class=LLMError)
+
+    def test_a_timeout_that_then_succeeds_is_retried_silently(self):
+        calls = []
+
+        def transport(method, url, headers, body, timeout):
+            calls.append(1)
+            if len(calls) < 3:
+                raise AzureError("cannot reach host: timed out")
+            return 200, {"ok": True}, {}
+
+        result = self.client(transport).request("POST", "/x")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(calls), 3)
+
+    def test_a_timeout_that_never_recovers_raises_the_client_s_own_error_class_not_azure_error(self):
+        def transport(method, url, headers, body, timeout):
+            raise AzureError("cannot reach host: timed out")
+
+        with self.assertRaises(LLMError):
+            self.client(transport, retries=2).request("POST", "/x")
 
 
 class RecordingTest(TempDirTestCase):

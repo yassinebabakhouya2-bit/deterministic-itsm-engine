@@ -138,7 +138,19 @@ class RestClient:
         refreshed = False
         attempt = 0
         while True:
-            response = self.transport(method, url, self.tokens.headers(), body, self.timeout)
+            try:
+                response = self.transport(method, url, self.tokens.headers(), body, self.timeout)
+            except AzureError as exc:
+                # a transport-level failure (DNS, connect, read timeout) never reaches the status
+                # checks below, so it gets its own retry here -- same backoff as a 429/5xx, then
+                # surfaces through the caller's own error_class (e.g. LLMError), never the generic
+                # AzureError, so callers that only catch their own error type (kefind.interpret)
+                # see it and degrade instead of crashing.
+                if attempt < self.retries:
+                    self.sleep(_retry_delay({}, attempt))
+                    attempt += 1
+                    continue
+                raise self.error_class(str(exc)) from None
             status, payload = response[0], response[1]
             headers = response[2] if len(response) > 2 else {}
             if status == 401 and self.tokens.auth == "entra" and not refreshed:

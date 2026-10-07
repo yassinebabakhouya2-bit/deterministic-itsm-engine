@@ -2195,3 +2195,25 @@ The run's final output is `{"client", "run_id", "tickets", "empty", "kinds": {..
 {...}}` -- a distribution, not a score. `kinds` splits fiche/question/abstain; `reasons` is
 `kefind.funnel`'s own reason codes for each. Nothing here says whether a shown fiche was the
 *right* one -- that's the scoreboard, once tickets are labeled.
+
+### 18.4 Bug: a network timeout crashed the whole ticket run (2026-10-07)
+
+**Symptom.** The first real `/kecore/tickets/runs` call (370 scrubbed tickets, `interpret: true`)
+failed after ~8 minutes: `tickets_run_batch` raised `AzureError: cannot reach
+.../gpt-4o/chat/completions: timed out`, and Durable Functions' `task_all` failed the whole
+orchestration on that one batch — no partial tally from the other batches that had already
+finished.
+
+**Root cause.** `RestClient.request` (`kecore/azure.py`) retries on HTTP 429/500/502/503/504, but
+a genuine transport-level failure (DNS, connect, read timeout) is raised by `urllib_transport`
+*before* any status code exists, as a hardcoded `AzureError` -- bypassing retry entirely, and
+ignoring the `error_class=LLMError` `AzureOpenAIChat` configures. `kefind.interpret.interpret`
+only catches `LLMError` by design (a failed interpretation should degrade to "no terms", never
+crash the batch) -- so the raw `AzureError` fell straight through.
+
+**Fix.** `RestClient.request` now catches a transport-level `AzureError`, retries it exactly like
+a 429/5xx (same backoff), and on final failure raises through the client's own `error_class`
+instead of the hardcoded `AzureError`. `kecore/tests/test_llm.py::TransportRetryTest` covers both
+paths (retried-then-succeeds, retried-then-degrades-to-LLMError). No behavior change for a
+request that never times out. Full suite: 95 (kecore) + 94 (kefind) + 23 (kecore_func) = 212
+passing.
