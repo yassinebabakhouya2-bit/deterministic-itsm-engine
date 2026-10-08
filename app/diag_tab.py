@@ -62,7 +62,8 @@ TABLE = "diagsessions"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_MIMES = {"image/png", "image/jpeg", "image/webp"}
 STATE_LABELS = {"LOCATE": "Recherche de la fiche", "GUIDING": "Résolution guidée",
-                "SOLVED": "Résolu", "STUCK": "En attente d'une nouvelle description"}
+                "SOLVED": "Résolu", "OPEN": "Diagnostic ouvert",
+                "STUCK": "En attente d'une nouvelle description"}
 # Messages between pages travel as codes: a crafted link cannot make this site show its own text.
 MESSAGES = {
     "empty": "Collez un texte ou joignez une capture.",
@@ -191,7 +192,8 @@ def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None)
         cfg = deps["load_engine_config"](client_id)
         index = cfg["knowledge"]["index"]
         gen = cfg["generation"]
-        headers = {"Authorization": f"Bearer {deps['search_token']()}"}
+        token = deps["search_token"]()
+        headers = {"Authorization": f"Bearer {token}"}
         th = Thresholds(**{k: v for k, v in (cfg.get("diagnostic") or {}).items()
                            if k in Thresholds.__dataclass_fields__})
 
@@ -201,8 +203,12 @@ def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None)
         def fetch_chunks(parent_id):
             return deps["fetch_document_chunks"]([parent_id], index, headers, client_id=client_id).get(parent_id, [])
 
+        # open_answer (the free-form fallback, the classic/Diagnostic merge) reuses orchestration/answer.py's own
+        # engine end to end, including its own retrieval -- client_id/cfg/search_bearer_token are
+        # for that call alone, search_docs/fetch_chunks above stay the Diagnostic's own adapters.
         index_ports = build_ports(aoai=deps["aoai"], model=gen["model"], seed=gen["seed"], search_docs=search_docs,
-                                  fetch_chunks=fetch_chunks, images=images, thresholds=th)
+                                  fetch_chunks=fetch_chunks, images=images, thresholds=th,
+                                  client_id=client_id, cfg=cfg, search_bearer_token=token)
         return with_engine(index_ports, deps.get("engine"), client_id)
 
     service = GuideService(store, ports_factory)
@@ -536,7 +542,14 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 
 {% for m in s.messages %}
 {% if m.role == 'user' and m.kind == 'text' %}<div class="msg u"><span class="mut">Vous{% if m.images %} · {{ m.images }} capture(s){% endif %}</span><br>{{ m.text }}</div>
-{% elif m.kind == 'help' %}<div class="msg h"><span class="mut">Aide · étape {{ m.step }}</span><br><div style="white-space:pre-wrap">{{ m.text }}</div></div>
+{% elif m.kind == 'help' %}<div class="msg h"><span class="mut">Aide · étape {{ m.step }}</span><br><div style="white-space:pre-wrap">{{ m.text }}</div>
+{% if m.from_kb %}<div style="margin-top:6px"><span class="badge b-verb">Trouvé dans la fiche</span></div>{% else %}<div class="mut" style="margin-top:6px">Ce point n'est pas détaillé dans la fiche.</div>{% endif %}</div>
+{% elif m.kind == 'answer' %}<div class="msg h"><span class="mut">Diagnostic{% if m.confidence_label %} · Confiance {{ m.confidence_label }}{% endif %}</span><br>
+<div style="white-space:pre-wrap">{{ m.text }}</div>
+{% if m.primary_source and m.primary_source.title %}<div class="mut" style="margin-top:6px">Source : {{ m.primary_source.title }}</div>{% endif %}
+{% for rs in m.related_sources %}<div class="mut">· {{ rs.title }}</div>{% endfor %}
+{% if m.next_check %}<div class="mut" style="margin-top:6px">Prochaine vérification : {{ m.next_check }}</div>{% endif %}
+{% if m.ambiguous %}<div class="mut" style="margin-top:6px">⚠ Réponse ambiguë{% if m.unanswerable_reason %} — {{ m.unanswerable_reason }}{% endif %}</div>{% endif %}</div>
 {% elif m.kind == 'notice' %}<div class="msg"><span class="mut">{{ m.text }}</span></div>
 {% elif m.kind == 'done' %}{% endif %}{% endfor %}
 
@@ -580,7 +593,13 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <div class="row" style="margin-top:0"><button class="lnk" type="submit" name="action" value="wrong_fiche">Ce n'est pas la bonne fiche</button></div>
 {% endif %}
 
-<div class="card"{% if not g and not s.choices %} id="focus"{% endif %}><div class="mut">{% if g %}Une question ou un blocage sur cette étape ? Décrivez-le ou joignez une capture.{% elif s.state == 'STUCK' %}Décrivez le problème autrement ou joignez une capture.{% else %}Précisez le problème pour affiner la recherche (optionnel).{% endif %}</div>
+{% if s.state == 'OPEN' %}
+<div class="card" id="focus"><b>Est-ce résolu ?</b>
+<div class="row"><button class="ok" type="submit" name="action" value="solved_yes">✓ Oui, résolu</button>
+<button class="alt" type="submit" name="action" value="solved_no">✗ Non, pas encore</button></div></div>
+{% endif %}
+
+<div class="card"{% if not g and not s.choices and s.state != 'OPEN' %} id="focus"{% endif %}><div class="mut">{% if g %}Une question ou un blocage sur cette étape ? Décrivez-le ou joignez une capture.{% elif s.state == 'OPEN' %}Continuez à décrire le problème ou joignez une capture : je poursuis le diagnostic.{% elif s.state == 'STUCK' %}Décrivez le problème autrement ou joignez une capture.{% else %}Précisez le problème pour affiner la recherche (optionnel).{% endif %}</div>
 <textarea name="text" placeholder="Votre message…"></textarea>
 <div class="row"><input type="file" name="screenshot" accept="image/png,image/jpeg,image/webp" multiple>
 <button type="submit">Envoyer</button></div></div>

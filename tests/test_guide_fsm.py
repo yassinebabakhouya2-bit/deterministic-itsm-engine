@@ -23,13 +23,22 @@ def draft(n=3, applicable=True):
             "verification": ["Le probleme a disparu."]}
 
 
-def ports(cands=None, judge=None, build=None, help_=None, **kw):
+def open_answer_of(text="Essayez de redémarrer l'application.", **extra):
+    def open_answer(st, query):
+        return {"answer": text, "confidence_label": "Moyenne", "confidence_level": "medium",
+                "primary_source": {"title": "KB-OPEN", "used": True, "sourceType": "text"},
+                "related_sources": [], **extra}
+    return open_answer
+
+
+def ports(cands=None, judge=None, build=None, help_=None, open_=None, **kw):
     cands = cands if cands is not None else [cand("A", 3.5), cand("B", 1.0)]
     return Ports(
         extract_variables=lambda t: [], detect_risks=lambda st: [], retrieve=lambda st: list(cands),
         ocr=lambda refs: ([], False), judge=judge or (lambda st, c: None), load_chunks=lambda pid: dict(CHUNKS),
         build_guide=build or (lambda st, c, ch: draft()),
         help_step=help_ or (lambda st, step, ch, t: {"text": "aide:" + t, "found_in_kb": True, "source_chunk_id": "k1_0"}),
+        open_answer=open_ or open_answer_of(),
         thresholds=kw.get("th", Thresholds()))
 
 
@@ -119,14 +128,15 @@ def test_wrong_fiche_proposes_others_and_never_the_rejected_one():
     assert [c.parent_id for c in r.state.choices] == ["B", "C"]
 
 
-def test_problem_persists_moves_to_next_fiche_and_runs_out_without_escalating():
+def test_problem_persists_moves_to_next_fiche_and_falls_back_to_an_open_answer():
     p = ports([cand("A", 3.5)])
     st = advance(new(), ev("x", kind="created"), p, T0).state
     for _ in range(3):
         st = advance(st, ev(action="done"), p, T0).state
     r = advance(st, ev(action="solved_no"), p, T0)
-    assert r.state.phase == Phase.STUCK and r.outbox[-1]["level"] == "stuck"
-    # a new description reopens the search, with the rejected list reset
+    assert r.state.phase == Phase.OPEN and r.outbox[-1]["kind"] == "answer"
+    assert r.state.open_turns[-1].answer == "Essayez de redémarrer l'application."
+    # a new description reopens the deterministic search, with the rejected list reset
     r2 = advance(r.state, ev("autre description"), p, T0)
     assert r2.state.phase == Phase.GUIDING
 
@@ -161,9 +171,47 @@ def test_check_guide_downgrades_false_verbatim_and_rejects_ghost_chunks():
     assert check_guide(d, CHUNKS) is None
 
 
-def test_no_candidate_waits_instead_of_escalating():
+def test_no_candidate_falls_back_to_an_open_answer_instead_of_escalating():
     r = advance(new(), ev("x", kind="created"), ports(cands=[]), T0)
-    assert r.state.phase == Phase.STUCK and r.state.phase != Phase.SOLVED
+    assert r.state.phase == Phase.OPEN and r.state.phase != Phase.SOLVED
+    assert r.outbox == [{"kind": "answer", "text": "Essayez de redémarrer l'application.",
+                         "confidence_label": "Moyenne", "confidence_level": "medium", "ambiguous": False,
+                         "unanswerable_reason": None, "primary_source": {"title": "KB-OPEN", "sourceType": "text"},
+                         "related_sources": [], "next_check": None, "closed": False}]
+
+
+def test_a_fiche_found_after_an_open_answer_resolves_it_and_a_confirmed_fix_closes_the_session():
+    p = ports(cands=[])
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    assert st.phase == Phase.OPEN
+    p2 = ports([cand("A", 3.5)])                       # the next turn's extra detail finds a fiche
+    r = advance(st, ev("ca fait une erreur 0x80070005"), p2, T0)
+    assert r.state.phase == Phase.GUIDING and r.state.guide.parent_id == "A"
+
+
+def test_open_answer_solved_yes_closes_the_session_with_its_own_source_as_the_title():
+    st = advance(new(), ev("x", kind="created"), ports(cands=[]), T0).state
+    r = advance(st, ev(action="solved_yes"), ports(cands=[]), T0)
+    assert r.state.phase == Phase.SOLVED and r.outbox[-1] == {"kind": "done", "title": "KB-OPEN"}
+
+
+def test_open_answer_solved_no_just_prompts_for_more_without_calling_the_model_again():
+    calls = []
+    def tracking_open(st, q):
+        calls.append(q)
+        return open_answer_of()(st, q)
+    p = ports(cands=[], open_=tracking_open)
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    assert calls == ["x"]
+    r = advance(st, ev(action="solved_no"), p, T0)
+    assert r.state.phase == Phase.OPEN and r.outbox[0]["kind"] == "notice" and calls == ["x"]
+
+
+def test_open_answer_falls_back_to_a_stuck_notice_if_the_model_itself_fails():
+    def broken(st, q):
+        raise RuntimeError("aoai down")
+    r = advance(new(), ev("x", kind="created"), ports(cands=[], open_=broken), T0)
+    assert r.state.phase == Phase.STUCK and r.outbox[-1]["level"] == "stuck"
 
 
 def test_same_event_is_idempotent_and_empty_events_do_nothing():

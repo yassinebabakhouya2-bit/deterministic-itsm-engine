@@ -45,12 +45,13 @@ class FakeAoai:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(out)))])
 
 
-def make_app(me="alice", clients=("client-s",), itsm=False, strong=True, engine=None, writeback=None):
+def make_app(me="alice", clients=("client-s",), itsm=False, strong=True, engine=None, writeback=None, aoai=None,
+            no_candidates=False):
     hit = lambda pid, score: {"parent_id": pid, "title": pid, "chunk_id": pid + "_0", "chunk": CHUNK, "@search.rerankerScore": score}
-    docs = [hit("K1", 3.8), hit("K2", 1.0)] if strong else [hit("K1", 2.0), hit("K2", 1.9)]
+    docs = [] if no_candidates else ([hit("K1", 3.8), hit("K2", 1.0)] if strong else [hit("K1", 2.0), hit("K2", 1.9)])
     deps = dict(
         allowed_clients=lambda: list(clients), user_id=lambda: me, display_name=lambda: me.title(),
-        itsm_access=itsm if callable(itsm) else (lambda: itsm), search_token=lambda: "tok", aoai=FakeAoai(),
+        itsm_access=itsm if callable(itsm) else (lambda: itsm), search_token=lambda: "tok", aoai=aoai or FakeAoai(),
         load_engine_config=lambda c: {"knowledge": {"index": "idx"}, "generation": {"model": "m", "seed": 1}},
         retrieve_hierarchy=lambda q, index, n, a, h, client_id=None: (docs, []),
         fetch_document_chunks=lambda pids, index, h, client_id=None: {
@@ -104,7 +105,26 @@ def test_blocked_step_shows_help_text():
     c = app.test_client()
     sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "x"}))
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "text": "je ne trouve pas"})
-    assert "Cherchez l&#39;icone engrenage." in c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
+    page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
+    assert "Cherchez l&#39;icone engrenage." in page and "Trouvé dans la fiche" in page
+
+
+def test_a_question_not_covered_by_the_fiche_says_so_instead_of_a_badge():
+    class UngroundedAoai(FakeAoai):
+        def _create(self, **kw):
+            if kw["response_format"]["json_schema"]["name"] == "guide_help":
+                out = {"answer_fr": "", "found_in_kb": False, "source_chunk_id": "c1"}
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(out)))])
+            return super()._create(**kw)
+
+    app, _ = make_app(aoai=UngroundedAoai())
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "x"}))
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "text": "question hors fiche"})
+    page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
+    assert "n'est pas détaillé dans la fiche" in page and "Trouvé dans la fiche" not in page
+
+
 
 
 def test_bad_action_and_cross_origin_are_refused():
@@ -408,3 +428,49 @@ def test_a_pending_write_back_says_the_executor_polls_every_two_minutes():
     assert "toutes les 2 minutes" in page
     wb.rows[("client-s", f"{sid}-work_note")]["executionStatus"] = "success"
     assert "toutes les 2 minutes" not in page_of(c, sid)
+
+
+# -------------------------------------------------------- V10 slice 7 (merge): open fallback
+def fake_diagnostic_query_core_keyless(client_id, query, prior_turns, token, aoai,
+                                       image_b64=None, image_mime=None, cfg=None):
+    return {"answer": "Essayez de redémarrer le poste, puis relancez l'application.",
+            "ambiguous": False, "unanswerable_reason": None,
+            "primary_source": {"title": "KB-OPEN", "used": True, "sourceType": "text"},
+            "related_sources": [{"title": "KB-ANNEXE", "used": True, "sourceType": "text"}],
+            "prochaine_verification": "Vérifiez si le message d'erreur revient.",
+            "diagnostic_termine": False, "detected_error_codes": [], "screen_reading": None,
+            "_trace": {"primary_reranker_score": 2.0}}
+
+
+def test_no_fiche_matches_falls_back_to_the_classic_assistants_own_answer(monkeypatch):
+    import guide.ports as ports_mod
+    monkeypatch.setattr(ports_mod, "diagnostic_query_core_keyless", fake_diagnostic_query_core_keyless)
+    app, _ = make_app(no_candidates=True)
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "problème jamais vu"}))
+    page = page_of(c, sid)
+    assert "Diagnostic ouvert" in page and "Confiance Moyenne" in page
+    assert "Essayez de redémarrer le poste" in page
+    assert "KB-OPEN" in page and "Vérifiez si le message d&#39;erreur revient." in page
+    assert 'value="solved_yes"' in page and 'value="solved_no"' in page
+
+
+def test_the_deterministic_engine_still_gets_first_and_repeated_refusal_before_the_open_answer(monkeypatch):
+    import guide.ports as ports_mod
+    monkeypatch.setattr(ports_mod, "diagnostic_query_core_keyless", fake_diagnostic_query_core_keyless)
+    app, _ = make_app(engine=FakeEngine(), no_candidates=True)
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "mot de passe expiré"}))
+    page = page_of(c, sid)
+    assert "par le moteur déterministe" in page and "Diagnostic ouvert" not in page  # kefind wins when it can
+
+
+def test_resolving_from_the_open_answer_closes_the_session(monkeypatch):
+    import guide.ports as ports_mod
+    monkeypatch.setattr(ports_mod, "diagnostic_query_core_keyless", fake_diagnostic_query_core_keyless)
+    app, _ = make_app(no_candidates=True)
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "problème jamais vu"}))
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "solved_yes"})
+    page = page_of(c, sid)
+    assert "Problème résolu" in page

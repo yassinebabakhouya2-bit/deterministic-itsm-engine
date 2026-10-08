@@ -2568,3 +2568,37 @@ Yassine ran KB0120 (17 steps) end to end and validated a work note on `INC001000
   lands there on load, no custom script needed, instead of the top of a session that has grown long.
 
 Tests: `tests/test_guide_app.py` (90 app tests total).
+
+### 19.10 Fusion de l'assistant « classique » dans le Diagnostic guidé (2026-10-08)
+
+Les deux assistants (RAG classique en page d'accueil, Diagnostic guidé pas-à-pas) répondaient à la
+même question de deux façons séparées. Décision : garder `kefind` comme seul décideur de fiche, et
+n'utiliser le moteur de réponse libre de l'assistant classique que lorsque `kefind` et l'index de
+recherche n'ont rien trouvé -- jamais l'inverse, et sans dupliquer son code RAG.
+
+- Nouvelle phase `Phase.OPEN` (`orchestration/guide/contracts.py`, `fsm.py`) : atteinte quand
+  `_locate()` épuise tous les candidats déterministes et indexés sans rien trouver. Un nouveau port
+  `open_answer` (`orchestration/guide/ports.py::make_open_answer`) appelle directement
+  `orchestration/answer.py::diagnostic_query_core_keyless` -- la même fonction que l'UI classique
+  (`app/app.py`) appelle à chaque tour -- pour une réponse libre ancrée sur le corpus du client.
+  `KefindPorts.open_answer` (`kefind_ports.py`) délègue toujours tout de suite au fallback : le
+  moteur déterministe ne participe jamais à une réponse ouverte, il ne décide que des fiches.
+- Depuis `OPEN`, tout nouveau message de l'utilisateur (hors "C'est fait." / "Ça ne marche pas.")
+  relance `_locate()` avec le contexte enrichi avant de retenter une réponse ouverte si toujours
+  rien trouvé -- `kefind` garde toujours la première chance. "C'est fait." referme la session
+  (`Phase.SOLVED`, titre pris sur la source principale de la réponse ouverte) ; "Ça ne marche pas."
+  redemande une précision sans nouvel appel au modèle.
+- `GuideState.open_turns` (8 au plus) donne à chaque nouvel appel l'historique des échanges ouverts
+  précédents (`prior_turns`), pour que le fil de la conversation reste cohérent.
+- Si le port `open_answer` lève une exception (modèle ou réseau), repli sur `Phase.STUCK` comme
+  filet de sécurité -- cette phase ne sert plus que ce cas, le "rien trouvé" général va désormais en
+  `OPEN`.
+- Page de session (`app/diag_tab.py`) : étiquette "Diagnostic ouvert", rendu du message `answer`
+  (badge de confiance, source principale, sources liées, prochaine vérification), carte "Est-ce
+  résolu ?" avec les deux boutons en phase `OPEN`.
+
+Tests: `tests/` 99 (était 90) -- `test_guide_fsm.py` (nouvelle phase, réponse ouverte, repli sur
+STUCK), `test_kefind_ports.py` (délégation systématique au fallback), `test_guide_app.py` (bout en
+bout avec `monkeypatch.setattr(guide.ports, "diagnostic_query_core_keyless", ...)`, puisque
+`diagnostic_query_core_keyless` appelle Azure Search directement et ne passe pas par le
+`FakeAoai` des autres tests du fichier).

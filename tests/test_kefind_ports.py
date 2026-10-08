@@ -64,6 +64,7 @@ def fallback(cands=None):
                                                   "source_chunk_id": "k1", "verbatim_from_kb": True}]},
         help_step=lambda st, step, ch, t: {"text": "aide " + ",".join(sorted(ch)), "found_in_kb": True,
                                            "source_chunk_id": next(iter(ch))},
+        open_answer=lambda st, q: {"answer": "ouvert: " + q},
         thresholds=Thresholds())
 
 
@@ -187,6 +188,14 @@ def test_legacy_and_pinned_ids_are_read_alike():
 def test_without_an_engine_the_ports_are_unchanged():
     fb = fallback()
     assert with_engine(fb, None, "client-s") is fb
+
+
+def test_open_answer_always_delegates_to_the_fallback_never_the_engine():
+    engine = Engine(fiche_decision())
+    p = with_engine(fallback(), engine, "client-s")
+    st = new()
+    assert p.open_answer(st, "une question ouverte") == {"answer": "ouvert: une question ouverte"}
+    assert not any(c[0] == "find" for c in engine.calls)   # open_answer never asks the engine to decide
 
 
 def test_step_titles_are_short_and_whole():

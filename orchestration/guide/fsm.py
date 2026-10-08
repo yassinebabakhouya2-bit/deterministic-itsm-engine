@@ -5,9 +5,14 @@ LOCATE  -> find the exact fiche (retrieval score + margin, cross-checked by an L
            unanswered clarifications the best fiche is taken as "approximate").
 GUIDING -> the fiche's steps are shown, then walked one by one (done / blocked /
            explain / back); help comes from the fiche only.
+OPEN    -> no fiche matches (deterministically or by search): the free-form
+           diagnostic answers instead (the classic assistant's own engine,
+           reused -- never a second, duplicated answer path), grounded in the
+           KB and this conversation; the next message gives the deterministic
+           search another try before falling back to OPEN again.
 SOLVED  -> the user confirmed. A fiche that does not solve it, or a wrong fiche,
-           leads to the next candidate; with none left the session waits (STUCK)
-           for a new description. Nothing is ever handed off automatically.
+           leads to the next candidate; with none left OPEN answers instead.
+           Nothing is ever handed off automatically.
 
 Termination: every event triggers a bounded amount of work (<= 5 fiche attempts,
 2 guide drafts each); the session itself only advances on user events."""
@@ -20,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .contracts import (TERMINAL, Choice, Event, Guide, GuideState, GuideStep, KbCandidate,
-                        OcrFinding, Phase, Variable)
+                        OcrFinding, OpenTurn, Phase, Variable)
 from .textutil import kb_text, norm
 
 MAX_SEEN = 60
@@ -47,6 +52,7 @@ class Ports:
     load_chunks: Callable[[str], Dict[str, str]]
     build_guide: Callable[[GuideState, KbCandidate, Dict[str, str]], dict]
     help_step: Callable[[GuideState, GuideStep, Dict[str, str], str], dict]
+    open_answer: Callable[[GuideState, str], dict]
     thresholds: Thresholds = field(default_factory=Thresholds)
 
 
@@ -214,6 +220,46 @@ def _stuck(st: GuideState, out: List[dict], text: str) -> None:
     out.append({"kind": "notice", "level": "stuck", "text": text})
 
 
+def _turn_query(evt: Event) -> str:
+    """What this turn asked, for the free-form fallback's own query -- it reasons on the
+    conversation's full text already (open_answer is handed the state too), but the model
+    does better grounded on what was JUST said than on the whole history squashed flat."""
+    text = (evt.text or "").strip()
+    return text or ("Capture d'écran jointe : que montre-t-elle ?" if evt.attachments else "")
+
+
+def _open_answer(st: GuideState, p: Ports, out: List[dict], evt: Event) -> None:
+    """No fiche matches, deterministically (kefind) or by search: the free-form diagnostic
+    answers instead of a dead end -- the classic assistant's own engine (orchestration/answer.py's
+    diagnostic_query_core_keyless), reused rather than duplicated. Still never decides a fiche;
+    it only reasons in prose, grounded in the KB and this conversation's own history."""
+    st.phase, st.choices, st.guide, st.selected_parent_id = Phase.OPEN, [], None, None
+    query = _turn_query(evt)
+    try:
+        res = p.open_answer(st, query) or {}
+    except Exception:
+        _stuck(st, out, "Je n'ai plus de fiche à vous proposer et l'assistant ouvert ne répond pas "
+                        "pour l'instant. Décrivez le problème autrement ou joignez une capture.")
+        return
+    answer = (res.get("answer") or "").strip()
+    primary = res.get("primary_source") or {}
+    st.open_turns = (st.open_turns + [OpenTurn(
+        query=query[:1000], answer=answer[:1500],
+        primary_title=primary.get("title") if primary.get("used") else None,
+        error_codes=list(res.get("detected_error_codes") or [])[:10],
+        screen_reading=(res.get("screen_reading") or "")[:500] or None,
+    )])[-6:]
+    out.append({"kind": "answer", "text": answer[:4000] or "Je n'ai pas trouvé de réponse grounded "
+                "dans la base : décrivez le problème autrement ou joignez une capture.",
+                "confidence_label": res.get("confidence_label"), "confidence_level": res.get("confidence_level"),
+                "ambiguous": bool(res.get("ambiguous")), "unanswerable_reason": res.get("unanswerable_reason"),
+                "primary_source": ({"title": primary.get("title"), "sourceType": primary.get("sourceType")}
+                                    if primary.get("used") and primary.get("title") else None),
+                "related_sources": [{"title": s.get("title"), "sourceType": s.get("sourceType")}
+                                    for s in (res.get("related_sources") or []) if s.get("used") and s.get("title")][:3],
+                "next_check": res.get("next_check"), "closed": bool(res.get("closed"))})
+
+
 def _locate(st: GuideState, evt: Event, p: Ports, out: List[dict], force_choice: bool = False,
             picked: Optional[KbCandidate] = None) -> None:
     th = p.thresholds
@@ -224,8 +270,7 @@ def _locate(st: GuideState, evt: Event, p: Ports, out: List[dict], force_choice:
         cands = [c for c in p.retrieve(st) if c.parent_id not in st.rejected_parent_ids][:5]
         st.candidates = cands
         if not cands:
-            _stuck(st, out, "Je n'ai plus de fiche à vous proposer. Décrivez le problème autrement "
-                            "(application, message exact) ou joignez une capture : je relance la recherche.")
+            _open_answer(st, p, out, evt)
             return
         top = cands[0]
         strong = top.reranker_score >= th.exact_score and (len(cands) == 1 or margin(cands) >= th.margin_min)
@@ -257,7 +302,7 @@ def _locate(st: GuideState, evt: Event, p: Ports, out: List[dict], force_choice:
         out.append({"kind": "choose", "choices": [c.model_dump() for c in st.choices],
                     "strong": strong, "round": st.locate_rounds})
         return
-    _stuck(st, out, "Aucune fiche ne correspond pour l'instant. Décrivez le problème autrement ou joignez une capture.")
+    _open_answer(st, p, out, evt)
 
 
 # ------------------------------------------------------------------ guiding
@@ -307,6 +352,29 @@ def _guiding(st: GuideState, evt: Event, p: Ports, out: List[dict]) -> None:
                     "offer_other": st.step_attempts >= 2})
 
 
+def _open(st: GuideState, evt: Event, p: Ports, out: List[dict]) -> None:
+    """Free-form fallback mode: solved_yes/solved_no close the loop exactly like GUIDING's
+    verify step; anything else is a new turn -- rejected fiches are cleared (same as leaving
+    STUCK always did) so the deterministic search gets a genuinely fresh shot with the extra
+    context, falling back to another open answer if it still finds nothing."""
+    act = evt.action
+    if act == "solved_yes":
+        st.phase = Phase.SOLVED
+        title = st.open_turns[-1].primary_title if st.open_turns and st.open_turns[-1].primary_title else "votre diagnostic"
+        out.append({"kind": "done", "title": title})
+        return
+    if act == "solved_no":
+        out.append({"kind": "notice", "level": "info",
+                    "text": "D'accord, décrivez ce qui se passe maintenant ou joignez une nouvelle capture : "
+                            "je poursuis le diagnostic."})
+        return
+    said = _ingest(st, evt, p)
+    if not said and not evt.attachments:
+        return
+    st.rejected_parent_ids, st.locate_rounds = [], 0
+    _locate(st, evt, p, out)
+
+
 # ------------------------------------------------------------------ entry
 
 def advance(state: GuideState, evt: Event, p: Ports, now=None) -> StepResult:
@@ -320,6 +388,8 @@ def advance(state: GuideState, evt: Event, p: Ports, now=None) -> StepResult:
         return StepResult(st, out)
     if st.phase == Phase.GUIDING and st.guide:
         _guiding(st, evt, p, out)
+    elif st.phase == Phase.OPEN:
+        _open(st, evt, p, out)
     else:
         if st.phase == Phase.STUCK:
             st.rejected_parent_ids, st.locate_rounds, st.phase = [], 0, Phase.LOCATE

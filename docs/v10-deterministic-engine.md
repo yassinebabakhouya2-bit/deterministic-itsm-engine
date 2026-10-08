@@ -112,6 +112,8 @@ Two choices made with the decision:
 | 6 | Bridge to the ITSM action engine + work-note write-back | 🟡 Deployed 2026-10-08 in dry run (nothing written to ServiceNow until the PDI test, runbook §19.7) — an ITSM agent validates the note (fiche and steps only), its own Logic App writes it into the incident, dry run first; the bridge is the handover (incident assigned to KE-Automation with the proposed action, picked up by `itsm/poll`) (runbook §19.3) |
 | 7 | Remove the local-writing CLIs and `clients-local/kecore` (after upload) | 🟢 Planned |
 
+The classic assistant's own free-form RAG answer (`orchestration/answer.py::diagnostic_query_core_keyless`) is now also the Diagnostic's fallback when `kefind` and the search index find no fiche (`Phase.OPEN`, runbook §19.10) — `kefind` still decides every fiche; the fallback never does.
+
 ## How the funnel finds a fiche (slice 3)
 
 `kefind.funnel.find` replaces the 5-step `kefind` pipeline above for the

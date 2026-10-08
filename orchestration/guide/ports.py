@@ -1,5 +1,12 @@
 """Real ports of the guided engine: strict-schema model calls (temperature 0, seeded),
-risk rules, retrieval adapter. Model output is validated by code before it can matter."""
+risk rules, retrieval adapter. Model output is validated by code before it can matter.
+
+open_answer (make_open_answer, below) is the one port NOT backed by this module's own
+strict-schema calls: it reuses orchestration/answer.py's diagnostic_query_core_keyless --
+the classic assistant's own engine -- for the free-form fallback when no fiche matches,
+deterministically or by search. Importing a sibling of this package (not a subpackage of
+it) works because app/app.py puts orchestration/ on sys.path before importing anything
+that imports this module; tests do the same (see tests/test_guide_app.py)."""
 from __future__ import annotations
 
 import base64
@@ -7,6 +14,8 @@ import hashlib
 import json
 import re
 from typing import Callable, Dict, List, Optional, Tuple
+
+from answer import diagnostic_query_core_keyless
 
 from .contracts import GuideState, KbCandidate, OcrFinding, Variable
 from .fsm import Ports, Thresholds
@@ -188,11 +197,53 @@ def make_help_step(aoai, model: str, seed: int):
     return help_step
 
 
+def _open_confidence(score: Optional[float]):
+    """Same coarse, DISPLAY-ONLY bucket as app/app.py's _confidence() -- duplicated (3 lines)
+    rather than imported: app.py imports this package, so a reverse import would be circular."""
+    if score is None:
+        return None, None
+    if score >= 2.5:
+        return "Élevée", "high"
+    if score >= 1.5:
+        return "Moyenne", "medium"
+    return "Faible", "low"
+
+
+def make_open_answer(aoai, client_id: str, cfg: dict, search_bearer_token: str,
+                     images: Dict[str, Tuple[bytes, str]]):
+    """Free-form fallback: the classic assistant's own engine (diagnostic_query_core_keyless),
+    reused rather than duplicated, so an open-ended question still gets answered instead of a
+    dead end when no fiche -- deterministic or indexed -- matches. `images`: the request's own
+    screenshots (ports_factory's closure, same as make_ocr), at most the first one -- the model
+    call takes a single image, same limit the classic assistant's own UI has always had."""
+    def open_answer(st: GuideState, query: str) -> dict:
+        img_b64 = img_mime = None
+        if images:
+            data, mime = next(iter(images.values()))
+            img_b64, img_mime = base64.b64encode(data).decode("ascii"), mime
+        prior_turns = [{"query": t.query, "answer_text": t.answer,
+                        "primary_source": {"title": t.primary_title, "used": True} if t.primary_title else None,
+                        "detected_error_codes": t.error_codes, "screen_reading": t.screen_reading}
+                       for t in st.open_turns]
+        raw = diagnostic_query_core_keyless(client_id, query or "Décrivez le problème.", prior_turns,
+                                            search_bearer_token, aoai, image_b64=img_b64, image_mime=img_mime,
+                                            cfg=cfg)
+        label, level = _open_confidence((raw.get("_trace") or {}).get("primary_reranker_score"))
+        return {"answer": raw.get("answer"), "confidence_label": label, "confidence_level": level,
+                "ambiguous": raw.get("ambiguous"), "unanswerable_reason": raw.get("unanswerable_reason"),
+                "primary_source": raw.get("primary_source"), "related_sources": raw.get("related_sources") or [],
+                "next_check": raw.get("prochaine_verification"), "closed": raw.get("diagnostic_termine"),
+                "detected_error_codes": raw.get("detected_error_codes") or [], "screen_reading": raw.get("screen_reading")}
+    return open_answer
+
+
 def build_ports(*, aoai, model: str, seed: int, search_docs, fetch_chunks, images,
-                thresholds: Optional[Thresholds] = None) -> Ports:
+                thresholds: Optional[Thresholds] = None, client_id: Optional[str] = None,
+                cfg: Optional[dict] = None, search_bearer_token: Optional[str] = None) -> Ports:
     return Ports(
         extract_variables=make_extract_variables(aoai, model, seed), detect_risks=detect_risks,
         retrieve=make_retrieve(search_docs), ocr=make_ocr(aoai, model, seed, images),
         judge=make_judge(aoai, model, seed), load_chunks=make_load_chunks(fetch_chunks),
         build_guide=make_build_guide(aoai, model, seed), help_step=make_help_step(aoai, model, seed),
+        open_answer=make_open_answer(aoai, client_id, cfg, search_bearer_token, images),
         thresholds=thresholds or Thresholds())

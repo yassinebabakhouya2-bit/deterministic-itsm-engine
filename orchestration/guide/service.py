@@ -198,7 +198,7 @@ class GuideService:
             result = StepResult(st, [{"kind": "notice", "level": "error",
                                       "text": f"Erreur technique ({type(exc).__name__}). Réessayez dans un instant."}])
         for m in result.outbox:
-            if m["kind"] in ("help", "notice", "done"):
+            if m["kind"] in ("help", "notice", "done", "answer"):
                 messages.append({"ts": now.isoformat(), "role": "assistant", **m})
         record = dict(record)
         self._write_state(record, result.state, messages, now)

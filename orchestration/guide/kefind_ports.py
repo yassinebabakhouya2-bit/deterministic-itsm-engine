@@ -182,11 +182,16 @@ class KefindPorts:
     def help_step(self, st: GuideState, step: GuideStep, chunks: Dict[str, str], user_text: str) -> dict:
         return self.fallback.help_step(st, step, chunks, user_text)
 
+    def open_answer(self, st: GuideState, query: str) -> dict:
+        """The free-form fallback is not something the engine does -- it's the classic
+        assistant's own answer, so this always delegates straight through."""
+        return self.fallback.open_answer(st, query)
+
     def ports(self) -> Ports:
         fb = self.fallback
         return Ports(extract_variables=fb.extract_variables, detect_risks=fb.detect_risks, retrieve=self.retrieve,
                      ocr=fb.ocr, judge=self.judge, load_chunks=self.load_chunks, build_guide=self.build_guide,
-                     help_step=self.help_step, thresholds=fb.thresholds)
+                     help_step=self.help_step, open_answer=self.open_answer, thresholds=fb.thresholds)
 
 
 def with_engine(fallback: Ports, engine, client_id: str) -> Ports:

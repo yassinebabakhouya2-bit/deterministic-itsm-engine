@@ -17,7 +17,8 @@ class Phase(str, Enum):
     LOCATE = "LOCATE"        # finding the exact fiche
     GUIDING = "GUIDING"      # walking through the steps
     SOLVED = "SOLVED"        # user confirmed the resolution (only terminal phase)
-    STUCK = "STUCK"          # no fiche left: waiting for a new description (not terminal)
+    OPEN = "OPEN"            # no fiche matches: free-form diagnostic answer instead (not terminal)
+    STUCK = "STUCK"          # the free-form fallback itself failed: waiting for a new description (not terminal)
 
 
 TERMINAL = (Phase.SOLVED,)
@@ -82,6 +83,18 @@ class Choice(Strict):
     score: float
 
 
+class OpenTurn(Strict):
+    """One exchange of the free-form fallback (orchestration/answer.py's diagnostic_query_core_keyless,
+    the classic assistant's own engine), kept so the next turn's prompt carries this conversation's
+    history -- same shape app/app.py already builds from its own conversation table, trimmed to what
+    _build_diagnostic_state_block actually reads."""
+    query: str = Field("", max_length=1000)
+    answer: str = Field("", max_length=1500)
+    primary_title: Optional[str] = None
+    error_codes: list[str] = []
+    screen_reading: Optional[str] = Field(None, max_length=500)
+
+
 class GuideState(Strict):
     session_id: str
     ticket_id: Optional[str] = None
@@ -101,6 +114,7 @@ class GuideState(Strict):
     guide: Optional[Guide] = None
     current_step: int = Field(0, ge=0)        # == len(steps) means "all done, verify"
     step_attempts: int = Field(0, ge=0)
+    open_turns: list[OpenTurn] = Field([], max_length=8)
     seen_event_ids: list[str] = []
 
 
