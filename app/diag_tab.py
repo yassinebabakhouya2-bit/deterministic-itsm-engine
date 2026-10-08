@@ -282,7 +282,7 @@ table{width:100%;border-collapse:collapse}td{padding:8px 4px;border-bottom:1px s
 a.l{color:var(--acc);text-decoration:none}
 </style></head><body>
 <header><h1>KnowledgeEngine v9</h1>
-<a class="cur" href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a>
+<a class="cur" href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a>{% if labels_nav %}<a href="/labels">Labellisation</a>{% endif %}
 <a href="/classic" class="mut" style="font-weight:400">Assistant classique</a>
 <span class="mut" style="margin-left:auto">{{ display_name }}</span></header>
 <main>

@@ -50,7 +50,7 @@ from .graph import KB_NUMBER_RE, KBGraph, build_graph
 from .interpret import Interpretation
 from .search import SEARCHABLE_STATUSES, tokenize
 
-FUNNEL_VERSION = 1
+FUNNEL_VERSION = 2  # 2: min_show (a calibrated floor under which a fiche is offered, not shown)
 MAX_TEXT_CHARS = 20_000
 
 # Filter levels, most informative first; (name, entity prefixes). "answered" holds the entities the
@@ -107,6 +107,9 @@ class FunnelConfig:
     min_text_strong: float = 0.10  # kept by a cited fiche number, an error/event code or an update
     min_text_no_entity: float = 0.40  # no known entity: the text searches the whole map
     gap: float = 0.12  # lead of the first fiche over the second needed to show it
+    min_show: float = 0.0  # calibrated on labeled tickets (scoreboard): under it a fiche is offered in a
+                           # choice instead of shown alone; 0 = off. Never applies to a fiche the ticket
+                           # designates itself (cited number, the technician's own answer).
     max_choices: int = 3  # fiches offered at most in a choice question
     max_options: int = 5  # values offered at most in an entity question
     top_k: int = 5  # ranked candidates returned with every decision
@@ -279,6 +282,7 @@ class Finding:
     options: list[dict] = field(default_factory=list)
     trace: list[dict] = field(default_factory=list)
     version: int = FUNNEL_VERSION
+    designated: bool = False  # shown because the ticket named it (cited number, technician's answer)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -335,6 +339,17 @@ def _choice(kbmap: KBMap, fiche_ids: list[str], reason: str, score: float | None
         question = f"Laquelle de ces fiches correspond au problème : {_join(titles)} ?"
     return Finding("question", reason, score=score, asks="fiche", question=question,
                    options=[{"fiche_id": f, "label": kbmap.label(f)} for f in fiche_ids])
+
+
+def _show(kbmap: KBMap, fiche_id: str, reason: str, score: float, designated: bool, ranked: list[str],
+          config: FunnelConfig, trace: list[dict]) -> Finding:
+    """THE fiche -- unless the calibrated floor (``min_show``) says a score this low is not enough to
+    show it alone: it is then offered first in a choice. A designated fiche is always shown."""
+    if not designated and config.min_show > 0 and score < config.min_show:
+        choices = [fiche_id] + [f for f in ranked if f != fiche_id][: config.max_choices - 1]
+        return _finish(_choice(kbmap, choices, f"{reason}_below_min_show", score), ranked, config, trace)
+    return _finish(Finding("fiche", reason, fiche_id=fiche_id, score=score, designated=designated),
+                   ranked, config, trace)
 
 
 def _finish(finding: Finding, ranked: list[str], config: FunnelConfig, trace: list[dict]) -> Finding:
@@ -406,11 +421,13 @@ def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelCon
         mode = "entities"
         kept = {name for name, _, _ in active}
         strong = bool(kept & STRONG_LEVELS)
-        threshold = 0.0 if kept & DESIGNATING_LEVELS else config.min_text_strong if strong else config.min_text
+        designated = bool(kept & DESIGNATING_LEVELS)
+        threshold = 0.0 if designated else config.min_text_strong if strong else config.min_text
         candidates = sorted(pool)
     else:
         mode = "text_only"
         strong = False
+        designated = False
         threshold = config.min_text_no_entity
         candidates = list(kbmap.ranked)
 
@@ -453,7 +470,7 @@ def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelCon
         lead = second is None or round(best - second, 6) >= config.gap
         if lead and (strong or named(top)):
             reason = f"{mode}_single" if second is None else f"{mode}_clear_lead"
-            return _finish(Finding("fiche", reason, fiche_id=top, score=best), ranked, config, trace)
+            return _show(kbmap, top, reason, best, designated, ranked, config, trace)
         if lead:
             # nothing as specific as an error code, and the ticket does not repeat the fiche's
             # title: the fiche is proposed with the next ones, never shown as THE fiche
@@ -463,8 +480,8 @@ def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelCon
         # close by text, but the ticket names the title of only one of them: that one
         titled = [f for f in close if named(f)]
         if len(titled) == 1:
-            return _finish(Finding("fiche", f"{mode}_close_title_match", fiche_id=titled[0], score=scores[titled[0]]),
-                           ranked, config, trace)
+            return _show(kbmap, titled[0], f"{mode}_close_title_match", scores[titled[0]], designated, ranked,
+                         config, trace)
         # an entity question only when the ticket's own entities brought these fiches together
         found = _discriminator(kbmap, close, exclude, config) if mode == "entities" else None
         if found:

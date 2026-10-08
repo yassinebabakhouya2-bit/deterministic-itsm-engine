@@ -3,7 +3,9 @@
 The map is the one a kecore run froze under kecore-<client>/runs/<run_id>/:
 fiches.decomposed.jsonl (verified steps and entities), profile.json (the client's dictionary) and
 graph.json (relations between fiches; rebuilt by the same code for a run made before slice 3).
-latest.json names the run used when the request names none. The decision is kefind.funnel, code
+latest.json names the run used when the request names none; funnel-config.json, when present, holds
+the client's calibrated funnel settings (written by POST /api/kecore/funnel-config/apply from a
+scoreboard run, never by hand). The decision is kefind.funnel, code
 only; the steps returned are the fiche's own text, verified at decomposition. With "interpret"
 (the default), the model first turns the ticket into search terms in the words of the fiches,
 English and French (kefind.interpret, checked by code): they rank, they never filter or decide.
@@ -26,8 +28,10 @@ from kefind.interpret import interpret
 
 MAX_TEXT_CHARS = 20_000
 MAX_ANSWERS = 10
-_ANSWER_RE = re.compile(r"^[a-z]{2,8}:\S.{0,199}$", re.DOTALL)
+_ANSWER_RE = re.compile(r"[a-z]{2,8}:\S.{0,199}", re.DOTALL)  # always fullmatch
 _RUN_ID_RE = re.compile(r"^[0-9A-Za-z-]{1,64}$")
+RUN_ID_RE = _RUN_ID_RE
+FUNNEL_CONFIG = "funnel-config.json"
 
 
 def validate_find_request(body, allowed_clients) -> dict:
@@ -44,10 +48,10 @@ def validate_find_request(body, allowed_clients) -> dict:
         raise ValueError(f"text: {MAX_TEXT_CHARS} characters at most")
     answers = body.get("answers", [])
     if (not isinstance(answers, list) or len(answers) > MAX_ANSWERS
-            or not all(isinstance(a, str) and _ANSWER_RE.match(a) for a in answers)):
+            or not all(isinstance(a, str) and _ANSWER_RE.fullmatch(a) for a in answers)):
         raise ValueError(f'answers: a list of at most {MAX_ANSWERS} entities such as "app:teams"')
     run_id = body.get("run_id")
-    if run_id is not None and (not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id)):
+    if run_id is not None and (not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id)):
         raise ValueError("invalid run id")
     interpret_ticket = body.get("interpret", True)
     if not isinstance(interpret_ticket, bool):
@@ -75,6 +79,14 @@ def load_map(storage: pipeline.Storage, client: str, run_id: str) -> KBMap:
     return KBMap(client, fiches, dictionary, graph=graph, run_id=run_id)
 
 
+def funnel_config(storage: pipeline.Storage, client: str) -> FunnelConfig:
+    """The client's calibrated settings (kecore-<client>/funnel-config.json), else the defaults."""
+    data = storage.read(pipeline.kecore_container(client), FUNNEL_CONFIG)
+    if data is None:
+        return FunnelConfig()
+    return FunnelConfig.from_dict(json.loads(data.decode("utf-8")).get("funnel") or {})
+
+
 def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm=None) -> dict:
     """The answer to a find request. ``llm`` interprets the ticket when the request asks for it."""
     interpretation = None
@@ -90,4 +102,4 @@ def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm
     }
 
 
-__all__ = ["validate_find_request", "latest_run", "load_map", "respond"]
+__all__ = ["validate_find_request", "latest_run", "load_map", "funnel_config", "respond", "FUNNEL_CONFIG", "RUN_ID_RE"]

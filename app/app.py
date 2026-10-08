@@ -221,6 +221,17 @@ app.register_blueprint(create_diagnostic_blueprint(_table_service, {
     "fetch_document_chunks": _fetch_document_chunks,
 }))
 
+# V10 slice 4: labeling tab -- a technician labels the real (scrubbed) tickets with the fiche they
+# needed; the scoreboard of fn-kecore measures the engine on those labels. See app/labels.py.
+from labels import azure_tables, create_labels_blueprint, labels_access_for_request  # noqa: E402
+
+app.register_blueprint(create_labels_blueprint(azure_tables(_table_service), {
+    "allowed_clients": lambda: _resolve_allowed_clients_for_request(),
+    "user_id": lambda: _resolve_user_id_for_request(),
+    "display_name": lambda: _resolve_display_name_for_request() or "Utilisateur",
+    "label_access": lambda: labels_access_for_request(),
+}))
+
 HISTORY_MAX = 30  # conversations listed in the sidebar
 
 EXAMPLE_QUESTIONS = [

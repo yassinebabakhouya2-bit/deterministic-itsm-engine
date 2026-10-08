@@ -59,7 +59,10 @@ class FunnelEngine:
         usage = Usage(search_calls=1)
         if interpretation is not None:
             usage.input_tokens, usage.output_tokens = interpretation.usage.input_tokens, interpretation.usage.output_tokens
-        return Decision(finding.kind, fiches=finding.fiches, score=finding.score, question=finding.question,
+        # a designated fiche has no score for the scoreboard: no calibrated floor ever hides it
+        # (kefind.funnel._show), so the threshold sweep must not count on hiding it either
+        score = None if finding.designated else finding.score
+        return Decision(finding.kind, fiches=finding.fiches, score=score, question=finding.question,
                         titles={f: kbmap.label(f) for f in finding.fiches}, usage=usage, trace=finding.trace)
 
     def candidates(self, ticket, k: int) -> list[tuple[str, str]]:

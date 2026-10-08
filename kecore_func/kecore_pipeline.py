@@ -143,7 +143,10 @@ def _jsonl(items) -> bytes:
 
 
 def read_jsonl(data: bytes) -> list[dict]:
-    return [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+    # split on "\n" only: str.splitlines() also splits on U+2028 / U+2029 / U+0085, which
+    # json.dumps(..., ensure_ascii=False) writes raw inside strings (a pasted ticket or a Word
+    # fiche can hold one), and one such character would break every read of the file
+    return [json.loads(line) for line in data.decode("utf-8").split("\n") if line.strip()]
 
 
 def _json(data) -> bytes:

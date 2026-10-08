@@ -107,7 +107,7 @@ Two choices made with the decision:
 | 1 | Bicep: Function App, `kecore-<client>` / `tickets-<client>` containers, RBAC (`infra/modules/kecore.bicep`) | ✅ Deployed 2026-10-06 — runbook §15 |
 | 2 | kecore on Azure + parity test on the 242 real fiches (`kecore_func/`) | ✅ Deployed 2026-10-06; parity PASS on Azure: 242 fiches, 163 / 22 / 57, 2228 / 2228, mean agreement 0.919, 0 model calls — runbook §16 |
 | 3 | Finding the fiche from entities and the graph: client dictionary on the ticket, a graph between fiches, text only breaking ties | ✅ Deployed 2026-10-07; confirmed on real client-s data (242 fiches) — runbook §17.7 |
-| 4 | Tickets (ServiceNow poll on the PDI, export upload for client-s), labeling tab, scoreboard on Azure | 🟡 In progress 2026-10-08 — real export scrubbed into Table Storage and run blank (unlabeled) through `kefind`, tallied; labeling tab and scoreboard wait on the client having labeled tickets — runbook §18 |
+| 4 | Tickets (ServiceNow poll on the PDI, export upload for client-s), labeling tab, scoreboard on Azure | 🟡 Built 2026-10-08, to deploy — export scrubbed into Table Storage (every column cleaned, runbook §18.5), blank run keeping each finding, labeling tab `/labels`, scoreboard runs on Azure with a floor chosen on half the labels and confirmed on the other (runbook §18.6). Waits on labels for its first number. The ServiceNow intake is deferred until a client's KB lives in ServiceNow (client-s is EasyVista, export only) |
 | 5 | kefind in the live Diagnostic + pilier 2 loop + dictionary review tab | 🟢 Planned |
 | 6 | Bridge to the ITSM action engine + work-note write-back | 🟢 Planned |
 | 7 | Remove the local-writing CLIs and `clients-local/kecore` (after upload) | 🟢 Planned |

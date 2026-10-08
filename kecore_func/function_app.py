@@ -1,4 +1,5 @@
-"""fn-kecore — the V10 KB decomposition (slice 2) and the fiche finder (slice 3), run in Azure.
+"""fn-kecore — the V10 KB decomposition (slice 2), the fiche finder (slice 3) and real tickets
+with their scoreboard (slice 4), run in Azure.
 
 POST /api/kecore/runs  (function key)  {"client": "client-s", "source_prefix": "Kbs/",
                                          "mode": "replay" | "record", "batch_size": 10,
@@ -13,22 +14,37 @@ for blob storage and for Azure OpenAI alike. A client not listed in KECORE_CLIEN
 POST /api/kecore/find  (function key)  {"client": "client-s", "text": "<ticket>",
                                          "answers": ["app:teams"], "run_id": null, "interpret": true}
   -> the decision (fiche / question / abstain), its trace, and the fiche's verified steps.
-     The decision is code (kefind_service.py, kefind.funnel). With "interpret" (default), one
-     model call first turns the ticket into search terms (kefind.interpret), recorded under the
-     hash of the request in kecore-<client>/find-cache/: the same ticket gets the same terms.
-     The KB map of a run is read once and kept in memory (4 maps at most).
+     The decision is code (kefind_service.py, kefind.funnel), with the client's calibrated
+     settings (kecore-<client>/funnel-config.json) when there are some. With "interpret"
+     (default), one model call first turns the ticket into search terms (kefind.interpret),
+     recorded under the hash of the request in kecore-<client>/find-cache/: the same ticket gets
+     the same terms. The KB map of a run is read once and kept in memory (4 maps at most).
 
 POST /api/kecore/tickets/scrub  (function key)  {"client": "client-s"}
   -> scrubs every raw export under tickets-<client>/raw/*.csv (kecore.tickets.scrub: personal
-     columns dropped, e-mail/phone masked in free text), writes one Table row per ticket, and
-     deletes the raw export. No label, no judgment.
+     columns dropped, every other column cleaned), writes one Table row per ticket, and deletes
+     the raw export. No label, no judgment.
+
+POST /api/kecore/tickets/rescrub  (function key)  {"client": "client-s"}
+  -> the current cleaning re-applied in place to the rows already stored (the raw export is gone).
 
 POST /api/kecore/tickets/runs  (function key)  {"client": "client-s", "run_id": null,
                                                  "interpret": true, "limit": 200}
-  -> one Durable run of every scrubbed ticket through kefind's funnel, unlabeled: tallies what
-     the funnel actually does (fiche shown / question asked / abstain, and why) -- a first signal
-     before any ticket is hand-labeled. No correctness judgment: that needs labels (scoreboard,
-     later). Same batching shape as /kecore/runs.
+  -> one Durable run of every scrubbed ticket through kefind's funnel, unlabeled: refreshes the
+     catalog of fiches the labeling tab offers, keeps each ticket's finding on its row, and
+     tallies what the funnel does (fiche shown / question asked / abstain, and why).
+
+POST /api/kecore/scoreboard/runs  (function key)  {"client": "client-s", "run_id": null,
+                                                     "interpret": true, "max_wrong": 0.05}
+  -> one Durable run of every LABELED ticket through the funnel, measured by the scoreboard
+     package (exact fiche @1, wrong fiche shown, recall@5, 95% intervals) with the floor
+     (min_show) chosen on half the labels and confirmed on the other half.
+GET  /api/kecore/scoreboard/latest?client=client-s  (function key)
+  -> the last scoreboard run: summary and Markdown report.
+POST /api/kecore/funnel-config/apply  (function key)  {"client": "client-s", "scoreboard_id": "<id>"}
+                                                       or {"client": "client-s", "reset": true}
+  -> writes the client's funnel-config.json from a CONFIRMED recommendation (refused otherwise),
+     the previous file kept under funnel-config.history/. The only way a threshold reaches /find.
 """
 
 from __future__ import annotations
@@ -36,6 +52,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import time
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
@@ -45,6 +62,7 @@ import azure.functions as func
 
 import kecore_pipeline as pipeline
 import kefind_service as finder
+import scoreboard_service as sb_svc
 import tickets_service as tickets_svc
 from kecore.llm import AzureOpenAIChat, RecordingLLM
 
@@ -62,16 +80,17 @@ def storage():
     return _storage
 
 
-_table = None
+_tables: dict = {}
 
 
-def table():
-    global _table
-    if _table is None:
-        from kecore_table import TableStorage
+def table(name: str | None = None):
+    """One of the engine's tables (kecore_table: tickets, kefindfiches, ticketlabels, kecorescores)."""
+    from kecore_table import TICKETS, TableStorage
 
-        _table = TableStorage()
-    return _table
+    name = name or os.environ.get("KECORE_TICKETS_TABLE", TICKETS)
+    if name not in _tables:
+        _tables[name] = TableStorage(table=name)
+    return _tables[name]
 
 
 def allowed_clients() -> list[str]:
@@ -103,14 +122,28 @@ def _error(status: int, message: str) -> func.HttpResponse:
     return func.HttpResponse(json.dumps({"error": message}), status_code=status, mimetype="application/json")
 
 
+def _json(data, status: int = 200) -> func.HttpResponse:
+    return func.HttpResponse(json.dumps(data, ensure_ascii=False), status_code=status, mimetype="application/json")
+
+
+def _body(req: func.HttpRequest):
+    try:
+        return req.get_json()
+    except ValueError:
+        return None
+
+
+def _new_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+
+
 @app.route(route="kecore/runs", methods=["POST"])
 @app.durable_client_input(client_name="client")
 async def kecore_start(req: func.HttpRequest, client) -> func.HttpResponse:
-    try:
-        body = req.get_json()
-    except ValueError:
+    body = _body(req)
+    if body is None:
         return _error(400, "a JSON body is expected")
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+    run_id = _new_id()
     try:
         payload = pipeline.validate_request(body, allowed_clients(), run_id)
     except ValueError as exc:
@@ -177,11 +210,24 @@ def _kb_map(client: str, run_id: str):
     return finder.load_map(storage(), client, run_id)
 
 
+_CONFIG_TTL_S = 60
+_configs: dict[str, tuple[float, object]] = {}
+
+
+def _funnel_config(client: str):
+    """The client's calibrated settings, re-read at most once a minute (an applied floor reaches
+    every instance within that minute)."""
+    cached = _configs.get(client)
+    if cached is None or time.monotonic() - cached[0] > _CONFIG_TTL_S:
+        cached = (time.monotonic(), finder.funnel_config(storage(), client))
+        _configs[client] = cached
+    return cached[1]
+
+
 @app.route(route="kecore/find", methods=["POST"])
 def kecore_find(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        body = req.get_json()
-    except ValueError:
+    body = _body(req)
+    if body is None:
         return _error(400, "a JSON body is expected")
     try:
         payload = finder.validate_find_request(body, allowed_clients())
@@ -196,30 +242,41 @@ def kecore_find(req: func.HttpRequest) -> func.HttpResponse:
         return _error(404, "no KB map for this run (unknown or unfinished run)")
     # the ticket text is neither logged nor stored; only the model's search terms are recorded
     llm = find_llm(payload["client"]) if payload["interpret"] else None
-    return func.HttpResponse(json.dumps(finder.respond(kb_map, payload, llm=llm), ensure_ascii=False),
-                             mimetype="application/json")
+    return _json(finder.respond(kb_map, payload, config=_funnel_config(payload["client"]), llm=llm))
+
+
+# --------------------------------------------------------------------------- slice 4: tickets
 
 
 @app.route(route="kecore/tickets/scrub", methods=["POST"])
 def kecore_tickets_scrub(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        body = req.get_json()
-    except ValueError:
+    body = _body(req)
+    if body is None:
         return _error(400, "a JSON body is expected")
     try:
         payload = tickets_svc.validate_tickets_request(body, allowed_clients())
     except ValueError as exc:
         return _error(400, str(exc))
-    report = tickets_svc.scrub(storage(), table(), payload["client"])
-    return func.HttpResponse(json.dumps(report, ensure_ascii=False), mimetype="application/json")
+    return _json(tickets_svc.scrub(storage(), table(), payload["client"]))
+
+
+@app.route(route="kecore/tickets/rescrub", methods=["POST"])
+def kecore_tickets_rescrub(req: func.HttpRequest) -> func.HttpResponse:
+    body = _body(req)
+    if body is None:
+        return _error(400, "a JSON body is expected")
+    try:
+        payload = tickets_svc.validate_tickets_request(body, allowed_clients())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    return _json(tickets_svc.rescrub(table(), payload["client"]))
 
 
 @app.route(route="kecore/tickets/runs", methods=["POST"])
 @app.durable_client_input(client_name="client")
 async def kecore_tickets_start(req: func.HttpRequest, client) -> func.HttpResponse:
-    try:
-        body = req.get_json()
-    except ValueError:
+    body = _body(req)
+    if body is None:
         return _error(400, "a JSON body is expected")
     try:
         payload = tickets_svc.validate_run_request(body, allowed_clients())
@@ -235,11 +292,13 @@ def tickets_run(context: df.DurableOrchestrationContext):
     count = yield context.call_activity("tickets_count", payload)
     if not count:
         return {"client": payload["client"], "tickets": 0, "error": "no scrubbed tickets for this client yet"}
+    catalogued = yield context.call_activity("tickets_catalog", payload)
+    payload = {**payload, "run_id": catalogued["run_id"]}  # every batch reads the same map
     ranges = pipeline.batches(count, tickets_svc.RUN_BATCH_SIZE)
     parts = yield context.task_all(
         [context.call_activity("tickets_run_batch", {**payload, "start": start, "end": end}) for start, end in ranges]
     )
-    return tickets_svc.merge_runs(payload["client"], parts)
+    return {**tickets_svc.merge_runs(payload["client"], parts), "catalog": catalogued}
 
 
 @app.activity_trigger(input_name="payload")
@@ -248,8 +307,100 @@ def tickets_count(payload: dict) -> int:
 
 
 @app.activity_trigger(input_name="payload")
+def tickets_catalog(payload: dict) -> dict:
+    from kecore_table import FICHES
+
+    return tickets_svc.catalog(storage(), table(FICHES), payload)
+
+
+@app.activity_trigger(input_name="payload")
 def tickets_run_batch(payload: dict) -> dict:
-    # the ticket text is neither logged nor stored; only the model's search terms are recorded,
-    # in the same per-client cache kecore/find already uses (find-cache/)
+    # the ticket text is neither logged nor stored elsewhere; only the model's search terms are
+    # recorded, in the same per-client cache kecore/find already uses (find-cache/)
     llm = find_llm(payload["client"]) if payload["interpret"] else None
     return tickets_svc.run_batch(storage(), table(), payload, payload["start"], payload["end"], llm=llm)
+
+
+# --------------------------------------------------------------------------- slice 4: scoreboard
+
+
+@app.route(route="kecore/scoreboard/runs", methods=["POST"])
+@app.durable_client_input(client_name="client")
+async def kecore_scoreboard_start(req: func.HttpRequest, client) -> func.HttpResponse:
+    body = _body(req)
+    if body is None:
+        return _error(400, "a JSON body is expected")
+    try:
+        payload = sb_svc.validate_scoreboard_request(body, allowed_clients(), _new_id())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    instance_id = await client.start_new("scoreboard_run", client_input=payload)
+    return client.create_check_status_response(req, instance_id)
+
+
+@app.orchestration_trigger(context_name="context")
+def scoreboard_run(context: df.DurableOrchestrationContext):
+    payload = context.get_input()
+    prepared = yield context.call_activity("scoreboard_prepare", payload)
+    if not prepared["count"]:
+        return {"client": payload["client"], "sb_id": payload["sb_id"], "error": "no labeled ticket yet",
+                "prepared": prepared}
+    payload = {**payload, "kb_run_id": prepared["kb_run_id"]}
+    ranges = pipeline.batches(prepared["count"], sb_svc.BATCH_SIZE)
+    parts = yield context.task_all(
+        [context.call_activity("scoreboard_batch", {**payload, "start": start, "end": end}) for start, end in ranges]
+    )
+    summary = yield context.call_activity("scoreboard_report",
+                                          {**payload, "ranges": ranges, "prepared": prepared, "batches": parts})
+    return summary
+
+
+@app.activity_trigger(input_name="payload")
+def scoreboard_prepare(payload: dict) -> dict:
+    from kecore_table import LABELS
+
+    return sb_svc.prepare(storage(), table(), table(LABELS), payload)
+
+
+@app.activity_trigger(input_name="payload")
+def scoreboard_batch(payload: dict) -> dict:
+    llm = find_llm(payload["client"]) if payload["interpret"] else None
+    return sb_svc.batch(storage(), payload, payload["start"], payload["end"], llm=llm)
+
+
+@app.activity_trigger(input_name="payload")
+def scoreboard_report(payload: dict) -> dict:
+    from kecore_table import SCORES
+
+    return sb_svc.report(storage(), table(SCORES), payload, payload["ranges"], payload["prepared"],
+                         payload.get("batches"))
+
+
+@app.route(route="kecore/scoreboard/latest", methods=["GET"])
+def kecore_scoreboard_latest(req: func.HttpRequest) -> func.HttpResponse:
+    client = req.params.get("client")
+    if client not in set(allowed_clients()):
+        return _error(400, "unknown client")
+    latest = sb_svc.latest(storage(), client)
+    if latest is None:
+        return _error(404, "no scoreboard run for this client yet: POST /api/kecore/scoreboard/runs")
+    return _json(latest)
+
+
+@app.route(route="kecore/funnel-config/apply", methods=["POST"])
+def kecore_funnel_config_apply(req: func.HttpRequest) -> func.HttpResponse:
+    body = _body(req)
+    if body is None:
+        return _error(400, "a JSON body is expected")
+    try:
+        payload = sb_svc.validate_apply_request(body, allowed_clients())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    try:
+        result = sb_svc.apply(storage(), payload)
+    except FileNotFoundError as exc:
+        return _error(404, str(exc))
+    except ValueError as exc:  # no recommendation, or not confirmed on half B: refused, nothing written
+        return _error(409, str(exc))
+    _configs.pop(payload["client"], None)  # this instance at once; the others within a minute
+    return _json(result)

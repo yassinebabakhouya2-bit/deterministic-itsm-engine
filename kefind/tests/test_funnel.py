@@ -271,5 +271,46 @@ class ContractTest(unittest.TestCase):
         self.assertIn("interpret", [step["step"] for step in decision.trace])
 
 
+
+def cited_map() -> KBMap:
+    return KBMap("clienta", filler() + [make("KB0052 - Compte verrouillé", "Déverrouillez le compte dans la console."),
+                                        make("KB0053 - Autre", "Autre sujet sans rapport.")])
+
+
+class MinShowTest(unittest.TestCase):
+    """The calibrated floor (slice 4): under it a fiche is offered, not shown; a designated fiche is always shown."""
+
+    TICKET = "Outlook reste bloqué au démarrage, erreur 0x80070005."
+
+    def test_off_by_default(self):
+        self.assertEqual(FunnelConfig().min_show, 0.0)
+        self.assertEqual(FunnelConfig.from_dict({"min_show": "0.3"}).min_show, 0.3)
+
+    def test_a_fiche_under_the_floor_is_offered_first_in_a_choice(self):
+        shown = find(example_map(), self.TICKET)
+        self.assertEqual((shown.kind, shown.fiche_id, shown.designated), ("fiche", "KB0030001", False))
+        offered = find(example_map(), self.TICKET, config=FunnelConfig(min_show=shown.score + 0.01))
+        self.assertEqual((offered.kind, offered.asks), ("question", "fiche"))
+        self.assertTrue(offered.reason.endswith("_below_min_show"), offered.reason)
+        self.assertEqual(offered.options[0]["fiche_id"], "KB0030001")
+        self.assertEqual(offered.fiches[0], "KB0030001")
+
+    def test_a_fiche_at_the_floor_is_still_shown(self):
+        shown = find(example_map(), self.TICKET)
+        again = find(example_map(), self.TICKET, config=FunnelConfig(min_show=shown.score))
+        self.assertEqual((again.kind, again.fiche_id), ("fiche", "KB0030001"))
+
+    def test_a_fiche_the_ticket_designates_is_shown_whatever_the_floor(self):
+        finding = find(cited_map(), "L'utilisateur a suivi la KB 52 sans succès", config=FunnelConfig(min_show=0.99))
+        self.assertEqual((finding.kind, finding.fiche_id, finding.designated), ("fiche", "KB0052 - Compte verrouillé", True))
+
+    def test_the_scoreboard_sees_no_score_on_a_designated_fiche(self):
+        engine = FunnelEngine({"clienta": cited_map()})
+        decision = engine.decide(Ticket("T-10", "clienta", "L'utilisateur a suivi la KB 52 sans succès"))
+        self.assertEqual((decision.kind, decision.score), ("fiche", None))
+        scored = FunnelEngine({"clienta": example_map()}).decide(Ticket("T-1", "clienta", self.TICKET))
+        self.assertIsNotNone(scored.score)
+
+
 if __name__ == "__main__":
     unittest.main()

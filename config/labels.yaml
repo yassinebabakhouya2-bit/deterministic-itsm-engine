@@ -1,0 +1,21 @@
+# =====================================================================
+# Labeling tab (V10 slice 4, app/labels.py): a technician says which fiche each real
+# (scrubbed) ticket should have reached. Those labels are the ground truth of the
+# scoreboard (fn-kecore, POST /api/kecore/scoreboard/runs) -- nothing else.
+# =====================================================================
+
+# Access (deny-by-default, claims only -- same model as config/itsm.yaml):
+# the signed-in user must come from this tenant AND hold this Entra group, AND be allowed
+# to see the client (app/auth.py, engine.<client>.yaml). Without an "access" block here the
+# ITSM agents of config/itsm.yaml are the labelers (decision 2026-10-08: the same trusted
+# technicians; a dedicated group can replace it later by adding the block below).
+# access:
+#   entraTenantId: "<tenant id>"
+#   entraGroup: "<group object id>"
+
+# Tables of the storage account shared with fn-kecore (kecore_func/kecore_table.py).
+tables:
+  tickets: tickets          # scrubbed tickets + the engine's last finding (kefind_*), written by fn-kecore
+  fiches: kefindfiches      # the fiches a labeler may pick, written by fn-kecore's ticket runs
+  labels: ticketlabels      # the labels, written HERE only
+  scores: kecorescores      # one row per scoreboard run, written by fn-kecore

@@ -2217,3 +2217,132 @@ instead of the hardcoded `AzureError`. `kecore/tests/test_llm.py::TransportRetry
 paths (retried-then-succeeds, retried-then-degrades-to-LLMError). No behavior change for a
 request that never times out. Full suite: 95 (kecore) + 94 (kefind) + 23 (kecore_func) = 212
 passing.
+
+### 18.5 Bug: only the ticket text was scrubbed, not the rest of the row (2026-10-08)
+
+**Symptom.** Found while building the labeling tab (§18.6), before any human saw the data: the
+stored row of a scrubbed ticket kept `Résolution`, `Cause réelle`, `Sujet complet`, `Référence
+externe`... exactly as exported, e-mail addresses and phone numbers included. The 896 e-mails and
+186 phones reported by the first `/tickets/scrub` were masked in Titre / Sujet / Description only.
+
+**Root cause.** `kecore.tickets.scrub` passed only `TEXT_COLUMNS` (the three columns kefind reads)
+through the `Scrubber`; every other kept column was copied as is. The module docstring said the
+resolution was scrubbed too, and the test meant to check it
+(`test_resolution_text_is_kept_scrubbed_not_dropped`) only checked that the column was kept. Two
+cleanings of the local pipeline of 2026-10-01 were also missing: cutting the e-mail signature and
+masking @mentions.
+
+**Fix.** Every kept column except the structured ones (dates, priority, status, SLA, reference
+numbers) is cleaned (signature, greeting name, forwarded headers, e-mail, phone, mentions, person
+names, 30,000-character cut); the rules as they stand after two review passes are in 18.8 and in
+the docstring of `kecore/tickets.py`. `POST /api/kecore/tickets/rescrub` re-applies it in place to the rows already stored: the
+raw export is deleted after scrubbing, so in place is the only way. 13 new tests in
+`kecore/tests/test_tickets.py`, one in `kecore_func/tests`. Known limit, unchanged: a first name
+alone in running text, without a marker around it, is not detected.
+
+### 18.6 Labeling tab, scoreboard on Azure, calibrated floor (2026-10-08)
+
+Yassine: "tout le reste de la solution, décide toi-même". Decisions taken, each reversible:
+
+- **Labels live apart** (`ticketlabels`, written only by the Web App): human work is never
+  overwritten by a re-scrub or a new run. Every table write MERGEs (`kecore_table.TableStorage`),
+  so a re-scrub also keeps the engine's findings on a ticket's row.
+- **Labelers = the ITSM agents** (`KE-v9-itsm-agents`, from `config/itsm.yaml`); a dedicated group
+  can be set in `config/labels.yaml`. The user must also be allowed to see the client (`app/auth.py`).
+- **Against a biased ground truth**: the engine's proposal is shown, never pre-checked; the next
+  ticket is drawn from the engine outcome (fiche / question / abstain) whose labels are fewest; "Je
+  ne sais pas" skips without inventing a label. A label also accepts what the KB graph maps the
+  labeled fiche to (its canonical twin, the fiche replacing it).
+- **Calibrated floor** (`FunnelConfig.min_show`, kefind funnel v2): under it a fiche is offered
+  first in a choice instead of shown alone; a fiche the ticket designates itself (cited number,
+  the technician's own answer) is always shown. Chosen by `scoreboard.metrics.calibrate` on half the
+  labels (split by a hash of the ticket id, stable), confirmed on the other half, and applied only
+  by an explicit `POST /api/kecore/funnel-config/apply`, refused (409) when not confirmed. Never
+  automatic. Default ceiling: 5% wrong fiches shown, judged on the top of the 95% interval.
+- **How many labels**: a first score as soon as there are a few dozen (wide margins). To prove a
+  ceiling with zero wrong fiche: 5% needs 73 tickets per half (146 labeled), 10% needs 35 per half
+  (70). With some wrong fiches, more.
+- **`apply` refuses** a floor that was not confirmed on half B, measured on another KB map than
+  `latest.json`, measured without the model's interpretation (which `/find` uses), measured while the
+  model failed transiently (throttling, server, network), or chosen for a ceiling looser than 10%.
+- **A ticket that fails in a run is counted, never fatal** (`errors`, reason `error:<type>`).
+
+New: routes `tickets/rescrub`, `scoreboard/runs`, `scoreboard/latest`, `funnel-config/apply`
+(`kecore_func/README.md`); `tickets/runs` now refreshes the catalog (`kefindfiches`) and keeps each
+finding on its row (`kefind_*`); `/find` reads `kecore-<client>/funnel-config.json` (cached 60 s);
+the `scoreboard` package is deployed with the Function; Web App tab `/labels` (`app/labels.py`,
+`config/labels.yaml`), linked from the Assistant and ITSM headers for labelers. Tests: kecore 108,
+kefind 99, kecore_func 60, scoreboard 71, app 40 after the review fixes of 18.8 (kecore 123) — 393
+passing. No infrastructure change: both
+identities already hold Storage Table Data Contributor on the account.
+
+### 18.7 Deploy and use (lot 1)
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+.\scripts\deploy-kecore-function.ps1
+.\deploy-webapp.ps1
+
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+
+# 0. read-only check: did a copy of the raw export reach the KB container (and its index)? (18.8)
+az storage blob list --account-name stknowledgeengine3v9 --container-name kb-client-s --auth-mode login --query "[?ends_with(name, '.csv')].name" -o tsv
+
+# 1. privacy fix on the 370 rows already stored (18.5, 18.8)
+Invoke-RestMethod -Method Post -Uri "$base/kecore/tickets/rescrub?code=$key" -ContentType "application/json" -Body '{"client":"client-s"}'
+
+# 2. blank run: catalog + each ticket's finding kept on its row (feeds the labeling tab)
+$run = Invoke-RestMethod -Method Post -Uri "$base/kecore/tickets/runs?code=$key" -ContentType "application/json" -Body '{"client":"client-s","limit":500}'
+do { Start-Sleep -Seconds 30; $s = Invoke-RestMethod -Uri $run.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending','Running')
+$s.output | ConvertTo-Json -Depth 5
+```
+
+Then label at `https://app-knowledgeengine3-v9.azurewebsites.net/labels`. Score whenever wanted:
+
+```powershell
+$sb = Invoke-RestMethod -Method Post -Uri "$base/kecore/scoreboard/runs?code=$key" -ContentType "application/json" -Body '{"client":"client-s"}'
+do { Start-Sleep -Seconds 20; $s = Invoke-RestMethod -Uri $sb.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending','Running')
+$s.output | ConvertTo-Json -Depth 5
+(Invoke-RestMethod -Uri "$base/kecore/scoreboard/latest?client=client-s&code=$key").report_md
+# only when the output says "confirmed": true
+Invoke-RestMethod -Method Post -Uri "$base/kecore/funnel-config/apply?code=$key" -ContentType "application/json" -Body ('{"client":"client-s","scoreboard_id":"' + $s.output.sb_id + '"}')
+```
+
+Rollback of a floor: `-Body '{"client":"client-s","reset":true}'` (the previous file stays in
+`kecore-client-s/funnel-config.history/`).
+
+### 18.8 Two independent reviews of the slice 4 code (2026-10-08)
+
+Before anything was deployed, a separate agent that had not seen the code written reviewed it
+twice, running it on concrete inputs. Every finding below is fixed and has a test
+(`kecore/tests/test_tickets.py` ReviewCasesTest / SecondReviewTest, `kecore_func/tests`,
+`tests/test_labels_app.py`).
+
+| Finding (symptom) | Root cause | Fix |
+| --- | --- | --- |
+| "Cordialement, Jean Dupont" kept whole; "Cdt" signatures kept | the formula had to be alone on its line; "cdt" unknown | a formula ending its line, alone or followed by up to 3 capitalised words (the signer); abbreviations only at the start of a line |
+| first fix over-cut: "Le CDT du chantier…" → "Le", "je vous remercie cordialement de votre aide : …" cut | formula matched anywhere | same tail rule: nothing but punctuation and a name may follow the formula on its line |
+| "Bonjour Outlook plante au démarrage" → "Bonjour [nom] au démarrage" | the inline `(?i)` also made the name's capital-letter class case-insensitive | case-sensitive name, `(?i:…)` scoped to the greeting word and title; the name must end the greeting (`,` `!` `.` `:` or end of line); "Bonjour M. Dupont,", "Bonjour Jean et Paul," handled |
+| "De : Jean Dupont <…>" kept the name | forwarded headers not handled | header lines (De, From, À, To, Cc, De la part de…; "A :" only with an address) → `[masqué]` |
+| "01.10.2026 18:16" → "[phone]:16" | phone pattern accepted a date | ticket-only phone pattern: same formats as `kecore.text.PHONE_RE`, never starting on a dd.mm.yyyy / dd-mm-yyyy / dd mm yyyy date. A first fix (one consistent separator) missed "0661-234567": replaced. `kecore.text.PHONE_RE` is untouched on purpose: the KB decomposition uses it and its LLM record is keyed on exact text |
+| "[email]", "[phone]", "[nom]" searched as the words email / phone / nom (in 55 / 34 / 21 of the 175 ranked client-s fiches) | placeholders left in the text kefind reads | `ticket_text` and `Ticket.text` remove them |
+| a header "Bénéficiaire " (trailing space) or a renamed person column stored in clear | blocklist of exact header names | allowlist (`KEPT_COLUMNS`), headers compared trimmed and case-folded; unknown columns dropped and reported (`unknown_columns`) |
+| names from the person columns not masked in the text | — | at scrub time: first-name/surname pairs in any case; a single name only written as one ("Dupont", never "DUPONT", which could be a word of an upper-case title: "ECRAN BLANC" with a beneficiary "Blanc" stays); a single upper-case value ("ADMINISTRATEUR") is an account |
+| one U+2028 in a labeled ticket broke every scoreboard batch | `read_jsonl` used `splitlines()` | split on "\n" only |
+| a 130k-character field failed the whole scrub; `[\w.+-]+@` took seconds on long runs | csv module field limit; unbounded e-mail local part | field limit raised, value cut to 30,000 characters before cleaning, ticket-only e-mail pattern with a bounded local part |
+| `apply` accepted a floor measured on another map, without interpretation, with model failures, or for a 45% ceiling | only `confirmed` was checked | all refused (18.6); only transient model failures block (a content filter refusal repeats at the desk too: measured as it really goes, reported) |
+| two labelers could overwrite each other | one shared order, unconditional write | an order per labeler; a first label is an insert, a correction an If-Match update of the row read; refused with "changed" otherwise |
+| `/t/I1%0A` reached Azure and gave a 500; free text in `?msg=` shown on the page | `re.match` with `$`; message passed as text | `fullmatch` for every id from a request; messages are codes |
+
+**Known limits, kept:** a first name alone in running text, an upper-case surname alone, a
+lower-case surname after a lower-case mention ("@jean dupont"). The 370 rows stored on 2026-10-07
+cannot get the person-column name masking (those columns were never stored): only a fresh export
+through `/tickets/scrub` gives it. The raw export deleted from `tickets-client-s/raw/` stays
+recoverable for 7 days (blob soft delete of the account), then is purged.
+
+**Check (read-only, 18.7 step 0):** the daily ingestion copies every file of the client's SharePoint
+site into `kb-client-s` and the text indexer indexes `.csv`; neither propagates a deletion. If the
+raw export sat in SharePoint through one ingestion run, a copy may still be in `kb-client-s` and in
+`idx-client-s`. If the check lists a file, remove the blob and its chunks from the index before
+anything else.
