@@ -452,7 +452,7 @@ PAGE = """<!doctype html>
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.55 system-ui,sans-serif}
 header{display:flex;align-items:center;gap:18px;padding:14px 24px;border-bottom:1px solid var(--line)}
 header h1{font-size:1.05rem;margin:0}header a{color:var(--txt);text-decoration:none;font-weight:600;font-size:.88rem}
-header a.cur{border-bottom:2px solid var(--acc)}main{max-width:820px;margin:24px auto;padding:0 16px}
+header a.cur{border-bottom:2px solid var(--acc)}main{max-width:1100px;margin:24px auto;padding:0 16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:14px}
 textarea{width:100%;min-height:80px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--txt);font:inherit}
 select,input[type=file]{font:inherit;color:var(--txt)}
@@ -469,6 +469,7 @@ ol.st{list-style:none;padding:0;margin:12px 0 0}ol.st li{display:flex;gap:10px;p
 ol.st li .n{flex:none;width:24px;height:24px;border-radius:50%;background:var(--line);display:flex;align-items:center;justify-content:center;font-size:.78rem;font-weight:700}
 ol.st li.done{color:var(--mut)}ol.st li.done .n{background:var(--ok);color:#fff}
 ol.st li.cur{background:rgba(217,98,43,.10);font-weight:600}ol.st li.cur .n{background:var(--acc);color:#fff}
+.layout{display:grid;grid-template-columns:340px 1fr;gap:18px;align-items:start}.layout aside{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto}.layout aside .card{margin-bottom:0}@media (max-width:880px){.layout{display:block}.layout aside{position:static;max-height:none;margin-bottom:14px}}
 .step h2{font-size:1.15rem;margin:2px 0 8px}.step .ins{font-size:1.02rem;white-space:pre-wrap}
 .msg{border-left:3px solid var(--line);padding:6px 12px;margin:8px 0}.msg.u{border-color:var(--acc)}.msg.h{border-color:var(--ok);background:rgba(47,125,79,.06)}
 .pick{display:block;width:100%;text-align:left;margin-top:10px;padding:12px 14px}
@@ -515,7 +516,10 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 
 {% if g %}
 {% set n = g.steps|length %}{% set cur = s.current_step %}
-<div class="card">
+{% endif %}
+<div class="{{ 'layout' if g else '' }}">
+{% if g %}
+<aside><div class="card">
 <div class="mut">📄 Fiche {{ 'la plus proche' if g.approximate else 'identifiée' }}{% if g.parent_id.startswith('kefind:') %} par le moteur déterministe{% elif g.origin == 'fallback' %} · résumé automatique{% endif %}</div>
 <h2 style="margin:4px 0 6px;font-size:1.2rem">{{ g.title }}</h2>
 {% if g.summary %}<div>{{ g.summary }}</div>{% endif %}
@@ -526,7 +530,8 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <ol class="st">{% for st in g.steps %}<li class="{{ 'done' if loop.index0 < cur else ('cur' if loop.index0 == cur else '') }}">
 <span class="n">{{ '✓' if loop.index0 < cur else loop.index }}</span><span>{{ st.title }}</span></li>{% endfor %}</ol>
 {% if g.source_url %}<div class="mut" style="margin-top:8px">Source : <a class="l" href="{{ g.source_url }}" rel="noopener noreferrer">ouvrir la fiche</a></div>{% endif %}
-</div>
+</div></aside>
+<div>
 {% endif %}
 
 {% for m in s.messages %}
@@ -592,5 +597,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 {% endif %}{% if k.label %}<span class="mut">{{ 'Note' if k.kind == 'work_note' else 'Transfert' }} : {{ k.label }}</span>{% endif %}{% endfor %}</div>
 </form></div>
 {% endif %}
+{% if g %}</div>{% endif %}
+</div>
 {% endif %}
 </main></body></html>"""
