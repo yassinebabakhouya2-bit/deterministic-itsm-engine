@@ -11,6 +11,22 @@ except ImportError:  # optional dependency
     docx = None
 
 
+def _add_hyperlink(paragraph, text, url):
+    """Minimal recipe for a real ``w:hyperlink`` run: python-docx has no high-level helper."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+    from docx.opc.constants import RELATIONSHIP_TYPE
+
+    r_id = paragraph.part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+    run = OxmlElement("w:r")
+    run.append(OxmlElement("w:rPr"))
+    run.text = text
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+
 class FolderTest(TempDirTestCase):
     def test_demo_kb(self):
         fiches, warnings = load_folder(DEMO_KB, "clienta")
@@ -82,6 +98,42 @@ class DocxTest(TempDirTestCase):
         fiches, warnings = load_folder(folder, "c")
         self.assertEqual(warnings, [])
         self.assertEqual(fiches[0].text, "## Résolution\n- Fermez Outlook.\n- Relancez Outlook.")
+
+    def test_word_hyperlink_keeps_its_url(self):
+        document = docx.Document()
+        p = document.add_paragraph("Ouvrez ")
+        _add_hyperlink(p, "le fichier SFITFR Teams SDA Inventory Exploitation", "https://sharepoint.example.com/x")
+        folder = self.path("kb")
+        folder.mkdir()
+        document.save(folder / "KB0010041 - Teams.docx")
+        fiches, warnings = load_folder(folder, "c")
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            fiches[0].text,
+            "Ouvrez le fichier SFITFR Teams SDA Inventory Exploitation (https://sharepoint.example.com/x)",
+        )
+
+    def test_word_hyperlink_in_a_table_cell_keeps_its_url(self):
+        document = docx.Document()
+        table = document.add_table(rows=1, cols=1)
+        _add_hyperlink(table.rows[0].cells[0].paragraphs[0], "Portail", "https://sharepoint.example.com/portail")
+        folder = self.path("kb")
+        folder.mkdir()
+        document.save(folder / "KB0010042 - Portail.docx")
+        fiches, warnings = load_folder(folder, "c")
+        self.assertEqual(warnings, [])
+        self.assertIn("Portail (https://sharepoint.example.com/portail)", fiches[0].text)
+
+    def test_hyperlink_url_already_visible_is_not_duplicated(self):
+        document = docx.Document()
+        p = document.add_paragraph()
+        _add_hyperlink(p, "https://sharepoint.example.com/x", "https://sharepoint.example.com/x")
+        folder = self.path("kb")
+        folder.mkdir()
+        document.save(folder / "KB0010043 - Lien.docx")
+        fiches, warnings = load_folder(folder, "c")
+        self.assertEqual(warnings, [])
+        self.assertEqual(fiches[0].text, "https://sharepoint.example.com/x")
 
 
 if __name__ == "__main__":

@@ -50,6 +50,28 @@ class Fiche:
         return data
 
 
+def _paragraph_text(paragraph) -> str:
+    """A paragraph's text, with any hyperlink's target URL appended after its visible
+    text -- python-docx's own ``paragraph.text`` keeps a hyperlink's visible words but
+    drops where it points, so a fiche step naming a file by a clickable link would
+    otherwise lose that link entirely (the step keeps the file's name, never its URL)."""
+    text = paragraph.text.strip()
+    if not text:
+        return text
+    try:
+        links = paragraph.hyperlinks
+    except Exception:
+        links = []
+    seen: set[str] = set()
+    extras: list[str] = []
+    for link in links:
+        url = (link.address or "").strip()
+        if url and url not in text and url not in seen:
+            seen.add(url)
+            extras.append(url)
+    return text + " (" + ", ".join(extras) + ")" if extras else text
+
+
 def _read_docx(data: bytes) -> str:
     try:
         import docx
@@ -58,7 +80,7 @@ def _read_docx(data: bytes) -> str:
     document = docx.Document(io.BytesIO(data))
     lines: list[str] = []
     for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
+        text = _paragraph_text(paragraph)
         if not text:
             lines.append("")
             continue
@@ -73,7 +95,11 @@ def _read_docx(data: bytes) -> str:
             lines.append(text)
     for table in document.tables:
         for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            cells = []
+            for cell in row.cells:
+                cell_text = " ".join(_paragraph_text(p) for p in cell.paragraphs if _paragraph_text(p)).strip()
+                if cell_text:
+                    cells.append(cell_text)
             if cells:
                 lines.append(" | ".join(dict.fromkeys(cells)))
     return "\n".join(lines)
