@@ -128,12 +128,18 @@ def make_llm(payload: dict) -> RecordingLLM:
     return RecordingLLM(inner, mode=payload["mode"], store=pipeline.StorageRecordStore(storage(), payload["client"]))
 
 
+# JSON answers are ASCII (non-ASCII characters escaped) and declare their charset: the Python worker
+# sends a bare "application/json", which Windows PowerShell 5.1 decodes as ISO-8859-1 -- a fiche id
+# with an en dash came back as mojibake and the next call with it answered 404 (runbook 19.8).
+JSON_MIMETYPE = "application/json; charset=utf-8"
+
+
 def _error(status: int, message: str) -> func.HttpResponse:
-    return func.HttpResponse(json.dumps({"error": message}), status_code=status, mimetype="application/json")
+    return func.HttpResponse(json.dumps({"error": message}), status_code=status, mimetype=JSON_MIMETYPE)
 
 
 def _json(data, status: int = 200) -> func.HttpResponse:
-    return func.HttpResponse(json.dumps(data, ensure_ascii=False), status_code=status, mimetype="application/json")
+    return func.HttpResponse(json.dumps(data), status_code=status, mimetype=JSON_MIMETYPE)
 
 
 def _body(req: func.HttpRequest):

@@ -12,6 +12,11 @@ are the fiche's own sentences, verified at decomposition:
   model overrides the question;
 - the engine abstains, has no map for the client, or cannot be reached -> the search index takes
   over, exactly as before (``fallback`` ports): no question goes unanswered because of the engine;
+- the engine's interpretation failed (a model error) and no entity of the ticket backed its decision
+  (a ``text_only`` reason) -> the search index too: a French question and English fiches share no
+  word, so the fiches closest by the question's own words are noise ("mot de passe expiré" gave
+  "How to share mobile phone connection" without the interpretation, the SSPR password reset fiche
+  with it);
 - a fiche of the engine is guided with its verified steps, in order (25 at most), every step marked
   verbatim; help on a step comes from the same help port, with the fiche's full text as context.
 
@@ -110,6 +115,8 @@ class KefindPorts:
         kind, run_id = decision.get("kind"), (answer or {}).get("run_id")
         if kind not in ("fiche", "question") or not isinstance(run_id, str) or not _RUN_RE.fullmatch(run_id):
             return []
+        if (answer or {}).get("interpreted") is False and str(decision.get("reason") or "").startswith("text_only"):
+            return []  # interpretation failed, nothing but the question's own words: the search index answers
         labels = {c.get("fiche_id"): c.get("label") or c.get("fiche_id") for c in answer.get("candidates") or []}
         shown = decision.get("fiche_id") if kind == "fiche" else None
         branches = [[option["fiche_id"]] if option.get("fiche_id") else list(option.get("fiches") or [])

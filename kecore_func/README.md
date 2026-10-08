@@ -50,13 +50,18 @@ hash of the request, so the same ticket gets the same terms; `false` gives the c
 answer:
 
 ```
-{"client", "run_id",
+{"client", "run_id", "interpreted": true | false | null,
  "decision": {"kind": "fiche" | "question" | "abstain", "reason", "fiche_id", "fiches", "score",
               "question", "asks", "options", "trace"},
  "fiche": {"fiche_id", "label", "title", "status", "steps": [...], "prerequisites", "references",
            "duplicates"} | null,
  "candidates": [{"fiche_id", "label"}]}
 ```
+
+`interpreted`: null when the request did not ask for the interpretation, false when it asked and
+the model failed (the decision then rests on the ticket's own words: the Diagnostic does not use a
+`text_only` decision made that way). Every JSON answer is ASCII with `charset=utf-8` (Windows
+PowerShell 5.1 read a bare `application/json` as ISO-8859-1).
 
 The client's calibrated settings apply when `kecore-<client>/funnel-config.json` exists (written
 only by `POST /api/kecore/funnel-config/apply`, below): with a floor (`min_show`), a fiche scored

@@ -186,6 +186,38 @@ class Slice5RoutesTest(RoutesTest):
         self.assertEqual(self.review()["ready"], [])
         self.assertEqual(self.review()["watching"], 1)
 
+    def test_answers_are_ascii_json_declaring_utf8(self):
+        # Windows PowerShell 5.1 decodes a bare "application/json" as ISO-8859-1: a fiche id with an en dash
+        # came back as mojibake and the next call with it was a 404 (runbook 19.8)
+        response = self.fa._json({"fiche_id": "KB0163 – Débloquer une URL"})
+        self.assertEqual(response.mimetype, "application/json; charset=utf-8")
+        body = response.get_body().decode("ascii")  # every non-ASCII character escaped
+        self.assertEqual(json.loads(body)["fiche_id"], "KB0163 – Débloquer une URL")
+        self.assertEqual(self.fa._error(404, "fiche « x » inconnue").mimetype, "application/json; charset=utf-8")
+
+    def test_find_says_whether_the_ticket_was_interpreted(self):
+        from types import SimpleNamespace
+
+        from kecore.llm import LLMError, LLMUsage
+
+        class Model:
+            def __init__(self, fail):
+                self.fail = fail
+
+            def complete_json(self, system, user, schema, name):
+                if self.fail:
+                    raise LLMError("timeout")
+                return SimpleNamespace(data={"terms": ["account locked"], "application": None}, usage=LLMUsage(),
+                                       model="m", cached=False)
+
+        ticket = {"client": "client-s", "text": "Mon compte est bloqué"}
+        outcomes = []
+        for fail in (False, True):
+            with unittest.mock.patch.object(self.fa, "find_llm", lambda client, fail=fail: Model(fail)):
+                outcomes.append(json.loads(self.fa.kecore_find(request("POST", "kecore/find", ticket)).get_body())["interpreted"])
+        not_asked = json.loads(self.fa.kecore_find(request("POST", "kecore/find", dict(ticket, interpret=False))).get_body())
+        self.assertEqual(outcomes + [not_asked["interpreted"]], [True, False, None])
+
     def test_a_bad_session_key_is_a_400(self):
         self.assertEqual(self.find(observe="Session-1").status_code, 400)
 

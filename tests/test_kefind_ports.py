@@ -23,10 +23,11 @@ FICHES = {
 
 
 class Engine:
-    def __init__(self, decision=None, down=False, no_map=False, run_id="r1"):
+    def __init__(self, decision=None, down=False, no_map=False, run_id="r1", interpreted=True):
         self.decision = decision
         self.down, self.no_map = down, no_map
         self.run_id = run_id
+        self.interpreted = interpreted
         self.calls = []
 
     def find(self, client, text, answers=(), interpret=True, observe=None):
@@ -35,7 +36,7 @@ class Engine:
             raise ConnectionError("engine down")
         if self.no_map:
             return None
-        return {"client": client, "run_id": self.run_id, "decision": self.decision,
+        return {"client": client, "run_id": self.run_id, "interpreted": self.interpreted, "decision": self.decision,
                 "candidates": [{"fiche_id": f, "label": FICHES[f]["label"]} for f in self.decision.get("fiches", [])]}
 
     def fiche(self, client, fiche_id, run_id=None):
@@ -106,6 +107,21 @@ def test_abstention_no_map_or_engine_down_fall_back_to_the_search_index():
                    Engine(down=True)):
         r = advance(new(), ev("problème", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
         assert r.state.guide.parent_id == "IDX-1", engine
+
+
+def test_a_text_only_decision_whose_interpretation_failed_falls_back_to_the_index():
+    shown = {"kind": "fiche", "reason": "text_only_close_title_match", "fiche_id": "KB0120", "fiches": ["KB0120"]}
+    noisy = {"kind": "question", "reason": "text_only_close_choice", "fiche_id": None, "asks": "fiche",
+             "options": [{"fiche_id": "KB0120"}, {"fiche_id": "KB0200"}], "fiches": ["KB0120", "KB0200"]}
+    for decision in (shown, noisy):
+        engine = Engine(decision, interpreted=False)
+        r = advance(new(), ev("mot de passe expiré", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
+        assert r.state.guide.parent_id == "IDX-1", decision["reason"]
+    # interpreted, not asked (an engine without the field), or backed by an entity: the engine's decision stands
+    for engine in (Engine(shown, interpreted=True), Engine(shown, interpreted=None),
+                   Engine(fiche_decision(), interpreted=False)):
+        r = advance(new(), ev("mot de passe expiré", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
+        assert r.state.guide.parent_id == "kefind:r1:KB0120", engine.decision["reason"]
 
 
 def test_a_rejected_engine_fiche_is_never_shown_again():

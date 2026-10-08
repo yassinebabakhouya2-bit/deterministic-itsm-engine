@@ -10,9 +10,10 @@
 //     secret's scope, not the vault's);
 //   - the Web App's setting KECORE_FUNCTION_KEY is a Key Vault reference, resolved by App Service
 //     with that identity. KECORE_FUNCTION_URL is the Function's API base.
-// The two settings are MERGED into the existing ones (list() of the current app settings): nothing
-// else is touched. If webapp.bicep (main.bicep) is deployed again later, deploy this module again
-// after it. After a rotation of the function key, deploy this module again too.
+// The two settings are MERGED into the existing ones (list() of the current app settings, written
+// back by appsettings-merge.bicep: a template cannot read and write the same app settings, ARM calls
+// it a circular dependency): nothing else is touched. If webapp.bicep (main.bicep) is deployed again
+// later, deploy this module again after it. After a rotation of the function key, deploy it again too.
 //
 // Deployable on its own:
 //   az deployment group create -g rg-knowledgeengine-v9 --name kecore-link \
@@ -68,13 +69,16 @@ resource webAppReadsKey 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource webAppSettings 'Microsoft.Web/sites/config@2023-12-01' = {
-  parent: webApp
-  name: 'appsettings'
-  properties: union(list('${webApp.id}/config/appsettings', '2023-12-01').properties, {
-    KECORE_FUNCTION_URL: 'https://${functionApp.properties.defaultHostName}/api'
-    KECORE_FUNCTION_KEY: '@Microsoft.KeyVault(SecretUri=${keySecret.properties.secretUri})'
-  })
+module webAppSettings 'appsettings-merge.bicep' = {
+  name: 'kecore-link-appsettings'
+  params: {
+    webAppName: webApp.name
+    currentAppSettings: list('${webApp.id}/config/appsettings', '2023-12-01').properties
+    appSettings: {
+      KECORE_FUNCTION_URL: 'https://${functionApp.properties.defaultHostName}/api'
+      KECORE_FUNCTION_KEY: '@Microsoft.KeyVault(SecretUri=${keySecret.properties.secretUri})'
+    }
+  }
   dependsOn: [
     webAppReadsKey
   ]

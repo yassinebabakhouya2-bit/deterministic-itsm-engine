@@ -2477,7 +2477,7 @@ parameters were checked by script and its `$filter` rendered for both modes.
 
 ### 19.6 Deploy (lots 2 and 3)
 
-After the commit (files listed explicitly, as always):
+After the commit (files listed explicitly, as always). First deployment on 2026-10-08: see 19.8.
 
 ```powershell
 cd C:\V9\knowledgeengine-rag-platform
@@ -2486,32 +2486,36 @@ cd C:\V9\knowledgeengine-rag-platform
 az deployment group create -g rg-knowledgeengine-v9 --name kecore-link --template-file infra/modules/kecore-link.bicep --query properties.provisioningState -o tsv
 az deployment group create -g rg-knowledgeengine-v9 --name diag-writeback --template-file itsm/writeback/main.bicep --parameters clientId=client-s dryRun=true --query properties.provisioningState -o tsv
 Start-Sleep -Seconds 120   # the role on the secret must propagate before App Service resolves the reference
-az webapp restart --name app-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9
-Start-Sleep -Seconds 60
 
-$app  = az webapp show --name app-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query id -o tsv
-"Key Vault reference: " + (az rest --method get --uri "https://management.azure.com$app/config/configreferences/appsettings/KECORE_FUNCTION_KEY?api-version=2022-03-01" --query properties.status -o tsv)
+$app = az webapp show --name app-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query id -o tsv
+foreach ($i in 1..4) {
+    az webapp restart --name app-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9
+    Start-Sleep -Seconds 60
+    $kv = az rest --method get --uri "https://management.azure.com$app/config/configreferences/appsettings/KECORE_FUNCTION_KEY?api-version=2022-03-01" --query properties.status -o tsv 2>$null
+    "Key Vault reference: $kv"
+    if ($kv -eq "Resolved") { break }
+}
 $key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
 $base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
-$q = @{ client = "client-s"; text = "Mon compte est bloqué, je n'arrive plus à me connecter à Windows"; interpret = $false } | ConvertTo-Json
-$a = Invoke-RestMethod -Method Post -Uri "$base/kecore/find?code=$key" -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($q))
-$id = if ($a.decision.fiche_id) { $a.decision.fiche_id } else { @($a.candidates | ForEach-Object { $_.fiche_id })[0] }
-"find: {0} ({1}) -> {2}" -f $a.decision.kind, $a.decision.reason, $id
-if ($id) {
-    $f = Invoke-RestMethod -Uri ("$base/kecore/fiche?client=client-s&fiche_id=" + [uri]::EscapeDataString($id) + "&code=$key")
-    "fiche {0}: {1} steps, run {2}" -f $f.fiche_id, @($f.steps).Count, $f.run_id
+foreach ($t in @("Mon compte est bloqué, je n'arrive plus à me connecter à Windows", "Teams affiche un écran blanc")) {
+    $q = @{ client = "client-s"; text = $t } | ConvertTo-Json
+    $a = Invoke-RestMethod -Method Post -Uri "$base/kecore/find?code=$key" -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($q))
+    $id = if ($a.decision.fiche_id) { $a.decision.fiche_id } else { @($a.candidates | ForEach-Object { $_.fiche_id })[0] }
+    "find: {0} ({1}), interpreted {2} -> {3}" -f $a.decision.kind, $a.decision.reason, $a.interpreted, $id
+    if ($id) {
+        $f = Invoke-RestMethod -Uri ("$base/kecore/fiche?client=client-s&fiche_id=" + [uri]::EscapeDataString($id) + "&code=$key")
+        "   fiche: {0} steps, run {1}" -f @($f.steps).Count, $f.run_id
+    }
 }
-$d = Invoke-RestMethod -Uri "$base/kecore/dictionary?client=client-s&code=$key"
-"dictionary: {0} entries, {1} to review, {2} watched, run {3}" -f @($d.dictionary).Count, @($d.ready).Count, $d.watching, $d.run_id
-az resource show -g rg-knowledgeengine-v9 -n logic-diag-writeback-client-s --resource-type Microsoft.Logic/workflows --query properties.state -o tsv
 ```
 
-Expected: `Succeeded` twice, `Key Vault reference: Resolved`, a find answer and the steps of its
-fiche (the fiche id is taken from the answer, never hard-coded: a client's ids are its own), the
-dictionary's entry count, `Enabled`. The host's function list printed by the deploy script may lag
-(16.5); the calls above are the proof. Then in `/diag`: the same question gives "Fiche identifiée
-par le moteur déterministe" (or its choice of fiches) and steps marked "Texte exact de la fiche".
-If the reference is not `Resolved`, restart the Web App once more (role propagation).
+Expected: `Succeeded` twice, `Key Vault reference: Resolved`, and for each question the fiche the
+engine decides (or offers first), interpreted `True`, with its steps. The question is sent as the
+Diagnostic sends it: interpreted (one model call, recorded under the request's hash). Without the
+interpretation a French question and English fiches share no word (19.8). The host's function list
+printed by the deploy script may lag (16.5); the calls above are the proof. Then in `/diag`: the
+first question gives "Fiche identifiée par le moteur déterministe" and steps marked "Texte exact de
+la fiche".
 
 ### 19.7 Test the write-back on the PDI (dry run, then live)
 
@@ -2521,3 +2525,19 @@ If the reference is not `Resolved`, restart the Web App once more (role propagat
 3. Go live: `az deployment group create -g rg-knowledgeengine-v9 --name diag-writeback --template-file
    itsm/writeback/main.bicep --parameters clientId=client-s dryRun=false`. Within 2 minutes the
    page says "écrit dans le ticket" and the work note is on the incident in the PDI.
+
+### 19.8 First deployment of lots 2 and 3 (2026-10-08)
+
+Commit `38826f6`. fn-kecore and the Web App deployed; `diag-writeback`: Succeeded, Logic App
+`logic-diag-writeback-client-s` Enabled (dry run).
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| `kecore-link`: `InvalidTemplate`, "Circular dependency detected on resource .../config/appsettings"; nothing created (validation failure) | a template may not read (`list()`) the app settings of the resource it writes; `bicep build` does not see it, ARM does | `infra/modules/appsettings-merge.bicep`: kecore-link reads the current settings and passes them to the module, which writes them back with the two new ones; the settings parameter is `@secure()` (it holds the Easy Auth secret: never in the deployment history) |
+| `Key Vault reference: ` empty (NotFound) | consequence of the line above | redeployed with the fix |
+| `/kecore/fiche` 404 for the id the previous call returned ("KB0163 – Unblock URL on PALO ALTO", printed with an "â") | the Python worker answers a bare `application/json`; Windows PowerShell 5.1 decodes it as ISO-8859-1, so the en dash came back as mojibake and was sent back as such | every JSON answer of fn-kecore is ASCII (non-ASCII characters escaped) and says `charset=utf-8`; the Web App was not affected (`requests` reads JSON as UTF-8) |
+| the check question gave a choice of unrelated fiches ("Unblock URL on PALO ALTO", shared mailbox creation...) | the check sent it with `"interpret": false`: a French question and English fiches share no word, and the closest fiches by "compte", "bloqué", "connecter" are noise. The Diagnostic always asks for the interpretation | the check now sends it as the Diagnostic does. Simulated locally on the 1 October map of the same 242 fiches, with terms of the kind the interpretation gives ("account locked", "password expired", "clear Teams cache"), the same questions find KB0120 LOCKED ACCOUNT, the SSPR password reset fiche and "How to clear the TEAMS cache"; the check above confirms it on Azure |
+| (risk seen in the same trace) the interpretation fails (7 of 370 tickets in the blank run, transient model errors): the engine's text-only decision then rests on the question's own words, noise for a French question | the engine had no way to tell the Diagnostic | `/kecore/find` answers `interpreted` (null: not asked; false: asked, failed); the Diagnostic does not use a `text_only` decision whose interpretation failed: the search index answers (`kefind_ports.py`). A decision backed by an entity of the ticket stands |
+| the deploy script listed 21 functions, 24 are deployed | the host's listing lags one deployment (16.5) | none needed: the route calls are the proof |
+
+Tests after the fixes: kecore 123, kefind 99, kecore_func 88, scoreboard 71, app 87.

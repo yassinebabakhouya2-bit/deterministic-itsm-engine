@@ -114,14 +114,20 @@ def fiche_payload(kbmap: KBMap, fiche_id: str) -> dict | None:
 
 
 def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm=None) -> dict:
-    """The answer to a find request. ``llm`` interprets the ticket when the request asks for it."""
+    """The answer to a find request. ``llm`` interprets the ticket when the request asks for it.
+    ``interpreted``: None when no interpretation was asked, else whether it gave terms to search with
+    (False: the model failed, the decision rests on the ticket's own words -- the Diagnostic does not
+    trust a text-only decision made that way, orchestration/guide/kefind_ports.py)."""
     interpretation = None
-    if payload.get("interpret", True) and llm is not None:
+    asked = bool(payload.get("interpret", True))
+    if asked and llm is not None:
         interpretation = interpret(llm, payload["text"], kbmap.dictionary)
     finding = find(kbmap, payload["text"], answers=payload["answers"], config=config, interpretation=interpretation)
+    interpreted = (interpretation is not None and interpretation.error is None) if asked else None
     return {
         "client": kbmap.client,
         "run_id": kbmap.run_id,
+        "interpreted": interpreted,
         "decision": finding.to_dict(),
         "fiche": fiche_view(kbmap, finding.fiche_id) if finding.fiche_id else None,
         "candidates": [{"fiche_id": f, "label": kbmap.label(f)} for f in finding.fiches],
