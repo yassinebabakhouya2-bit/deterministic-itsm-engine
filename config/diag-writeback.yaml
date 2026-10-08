@@ -1,0 +1,29 @@
+# =====================================================================
+# Diagnostic write-back (V10 slice 6): what the Diagnostic may write into a ServiceNow ticket.
+# The web app only records an ITSM agent's validated request (a row of the table below); the
+# Logic App of itsm/writeback/ writes it into the ticket with its own identity, dryRun first.
+# See orchestration/guide/writeback.py and docs/operations-runbook.md section 19.3.
+# =====================================================================
+
+# Table of the storage account read by the executor (itsm/writeback/main.bicep, parameter tableName).
+table: diagwriteback
+
+# The clients whose sessions may be written back. One executor serves one ServiceNow instance and
+# reads one client's rows (itsm/writeback/main.bicep, parameters clientId and snInstance): a client
+# is listed here only once its executor is deployed. Not listed = no write-back panel.
+clients:
+  - client-s
+
+# Fiches whose resolution is an action of the ITSM module's closed list: the button "Transférer au
+# module ITSM" assigns the ticket to the module's group (KE-Automation) with that action proposed;
+# the ITSM action engine then proposes it to an agent, who validates it in the Tickets ITSM tab.
+# A rule is a Python regex on the fiche's TITLE (first match wins), never on what the user typed;
+# a rule that does not compile is ignored. Allowed actions (closed list of the ITSM module):
+# password_reset, mfa_reset, group_add, license_assign, offboarding.
+handover:
+  - action: mfa_reset
+    label_pattern: "(?i)\\bmfa\\b|authenticator|double authentification|multi.?facteur|multi.?factor"
+  - action: password_reset
+    label_pattern: "(?i)(r[ée]initialis|oubli|expir|d[ée]bloqu|verrouill).{0,40}mot de passe|mot de passe.{0,40}(oubli|expir|r[ée]initialis|verrouill)|password reset"
+  - action: group_add
+    label_pattern: "(?i)ajout.{0,40}groupe|groupe.{0,40}(ajout|acc[eè]s)"

@@ -140,8 +140,12 @@ _DICTIONARY_TRIGGERS = (
     "application", "applicatif", "logiciel", "outil", "erp", "progiciel", "systeme", "système",
     "plateforme", "interface", "portail", "module", "solution", "service",
 )
+# The trigger word alone anchors a match. An optional article group used to precede it
+# ("l'", "le ", "de la "...): it changed no captured name, and repeated in front of the trigger it
+# backtracked exponentially on text such as "l'l'l'l'..." -- a denial of service once live questions
+# reach this regex (review 2026-10-08). Without it the scan is linear.
 _DICTIONARY_TRIGGER_RE = re.compile(
-    r"\b(?i:l['’]|le |la |les |l'|un |une |du |de la |notre |votre )*(?i:" + "|".join(_DICTIONARY_TRIGGERS) + r")\s+"
+    r"\b(?i:" + "|".join(_DICTIONARY_TRIGGERS) + r")\s+"
     # the captured name itself stays case-sensitive: only a capitalized word is a candidate product name.
     r"([A-Z][\w&-]{1,24}(?:\s+(?:[A-Z][\w&-]{1,24}|&|et|and))*)"
 )

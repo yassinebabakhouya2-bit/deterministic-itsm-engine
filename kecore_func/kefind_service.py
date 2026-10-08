@@ -29,6 +29,7 @@ from kefind.interpret import interpret
 MAX_TEXT_CHARS = 20_000
 MAX_ANSWERS = 10
 _ANSWER_RE = re.compile(r"[a-z]{2,8}:\S.{0,199}", re.DOTALL)  # always fullmatch
+_OBSERVE_RE = re.compile(r"[0-9a-f]{16,64}")  # always fullmatch: a hash of the asking session
 _RUN_ID_RE = re.compile(r"^[0-9A-Za-z-]{1,64}$")
 RUN_ID_RE = _RUN_ID_RE
 FUNNEL_CONFIG = "funnel-config.json"
@@ -56,7 +57,11 @@ def validate_find_request(body, allowed_clients) -> dict:
     interpret_ticket = body.get("interpret", True)
     if not isinstance(interpret_ticket, bool):
         raise ValueError("interpret must be true or false")
-    return {"client": client, "text": text, "answers": answers, "run_id": run_id, "interpret": interpret_ticket}
+    observe = body.get("observe")  # the dictionary's online loop counts a name once per distinct session
+    if observe is not None and (not isinstance(observe, str) or not _OBSERVE_RE.fullmatch(observe)):
+        raise ValueError("observe: a hash of the session, 16 to 64 lowercase hexadecimal characters")
+    return {"client": client, "text": text, "answers": answers, "run_id": run_id, "interpret": interpret_ticket,
+            "observe": observe}
 
 
 def latest_run(storage: pipeline.Storage, client: str) -> str | None:
@@ -87,6 +92,27 @@ def funnel_config(storage: pipeline.Storage, client: str) -> FunnelConfig:
     return FunnelConfig.from_dict(json.loads(data.decode("utf-8")).get("funnel") or {})
 
 
+def validate_fiche_request(params, allowed_clients) -> dict:
+    """GET /kecore/fiche: one fiche of a run's map, with its verified steps and its own text."""
+    client = params.get("client")
+    if not isinstance(client, str) or client not in set(allowed_clients):
+        raise ValueError("unknown client")
+    fiche_id = params.get("fiche_id")
+    if not isinstance(fiche_id, str) or not fiche_id.strip() or len(fiche_id) > 300:
+        raise ValueError("fiche_id is required")
+    run_id = params.get("run_id") or None
+    if run_id is not None and not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError("invalid run id")
+    return {"client": client, "fiche_id": fiche_id, "run_id": run_id}
+
+
+def fiche_payload(kbmap: KBMap, fiche_id: str) -> dict | None:
+    """The fiche view (verified steps, neighbours) plus the fiche's own text, for the guide's help."""
+    if fiche_id not in kbmap.fiches:
+        return None
+    return {**fiche_view(kbmap, fiche_id), "run_id": kbmap.run_id, "text": kbmap.fiches[fiche_id].text}
+
+
 def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm=None) -> dict:
     """The answer to a find request. ``llm`` interprets the ticket when the request asks for it."""
     interpretation = None
@@ -102,4 +128,5 @@ def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm
     }
 
 
-__all__ = ["validate_find_request", "latest_run", "load_map", "funnel_config", "respond", "FUNNEL_CONFIG", "RUN_ID_RE"]
+__all__ = ["validate_find_request", "validate_fiche_request", "latest_run", "load_map", "funnel_config", "respond",
+           "fiche_payload", "FUNNEL_CONFIG", "RUN_ID_RE"]

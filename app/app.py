@@ -208,6 +208,12 @@ app.register_blueprint(create_itsm_blueprint(_table_service, _credential))
 # Same client resolution as the assistant; state in the `diagsessions` table.
 from answer import _fetch_document_chunks, retrieve_hierarchy  # noqa: E402
 from diag_tab import create_diagnostic_blueprint  # noqa: E402
+import kecore_client  # noqa: E402
+
+# V10 slice 5: the deterministic engine (fn-kecore) finds the fiche before the search index when the
+# Web App is linked to it (KECORE_FUNCTION_URL + KECORE_FUNCTION_KEY, infra/modules/kecore-link.bicep);
+# without those settings _engine is None and the Diagnostic keeps the search index alone.
+_engine = kecore_client.from_env()
 
 app.register_blueprint(create_diagnostic_blueprint(_table_service, {
     "allowed_clients": lambda: _resolve_allowed_clients_for_request(),
@@ -219,6 +225,7 @@ app.register_blueprint(create_diagnostic_blueprint(_table_service, {
     "load_engine_config": load_engine_config,
     "retrieve_hierarchy": retrieve_hierarchy,
     "fetch_document_chunks": _fetch_document_chunks,
+    "engine": _engine,
 }))
 
 # V10 slice 4: labeling tab -- a technician labels the real (scrubbed) tickets with the fiche they
@@ -228,6 +235,16 @@ from labels import azure_tables, create_labels_blueprint, labels_access_for_requ
 app.register_blueprint(create_labels_blueprint(azure_tables(_table_service), {
     "allowed_clients": lambda: _resolve_allowed_clients_for_request(),
     "user_id": lambda: _resolve_user_id_for_request(),
+    "display_name": lambda: _resolve_display_name_for_request() or "Utilisateur",
+    "label_access": lambda: labels_access_for_request(),
+}))
+
+# V10 slice 5: review of the client's software dictionary learned by the engine (app/dictionary_tab.py),
+# same access as the labeling tab; decisions are recorded by fn-kecore and applied at its next run.
+from dictionary_tab import create_dictionary_blueprint  # noqa: E402
+
+app.register_blueprint(create_dictionary_blueprint(_engine, {
+    "allowed_clients": lambda: _resolve_allowed_clients_for_request(),
     "display_name": lambda: _resolve_display_name_for_request() or "Utilisateur",
     "label_access": lambda: labels_access_for_request(),
 }))

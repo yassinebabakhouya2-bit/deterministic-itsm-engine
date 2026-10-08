@@ -1,0 +1,485 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "storageAccountName": {
+      "type": "string"
+    },
+    "tableName": {
+      "type": "string"
+    },
+    "clientId": {
+      "type": "string"
+    },
+    "snInstance": {
+      "type": "string"
+    },
+    "snUser": {
+      "type": "string"
+    },
+    "keyVaultName": {
+      "type": "string"
+    },
+    "snSecretName": {
+      "type": "string"
+    },
+    "handoverGroup": {
+      "type": "string"
+    },
+    "dryRun": {
+      "type": "bool"
+    }
+  },
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Minute",
+        "interval": 2
+      },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "runs": 1
+        }
+      }
+    }
+  },
+  "actions": {
+    "Init_status": {
+      "type": "InitializeVariable",
+      "runAfter": {},
+      "inputs": {
+        "variables": [
+          {
+            "name": "rowStatus",
+            "type": "string",
+            "value": "error"
+          }
+        ]
+      }
+    },
+    "Get_rows": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '()')}",
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://storage.azure.com"
+        },
+        "queries": {
+          "$filter": "@{concat('PartitionKey eq ''', parameters('clientId'), ''' and status eq ''validated'' and ', if(parameters('dryRun'), 'executionStatus eq ''''', concat('(executionStatus eq '''' or (executionStatus eq ''dry_run'' and validatedAtUtc ge ''', formatDateTime(addDays(utcNow(), -2), 'yyyy-MM-ddTHH:mm:ssZ'), '''))')))}",
+          "$top": "50"
+        },
+        "headers": {
+          "x-ms-version": "2020-12-06",
+          "Accept": "application/json;odata=minimalmetadata"
+        }
+      },
+      "runAfter": {
+        "Init_status": [
+          "Succeeded"
+        ]
+      }
+    },
+    "If_any": {
+      "type": "If",
+      "runAfter": {
+        "Get_rows": [
+          "Succeeded"
+        ]
+      },
+      "expression": {
+        "and": [
+          {
+            "greater": [
+              "@length(coalesce(body('Get_rows')?['value'], json('[]')))",
+              0
+            ]
+          }
+        ]
+      },
+      "actions": {
+        "Get_sn_secret": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat('https://', parameters('keyVaultName'), '.vault.azure.net/secrets/', parameters('snSecretName'), '?api-version=7.4')}",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://vault.azure.net"
+            }
+          },
+          "runAfter": {},
+          "runtimeConfiguration": {
+            "secureData": {
+              "properties": [
+                "outputs"
+              ]
+            }
+          }
+        },
+        "For_each_row": {
+          "type": "Foreach",
+          "foreach": "@body('Get_rows')?['value']",
+          "runAfter": {
+            "Get_sn_secret": [
+              "Succeeded"
+            ]
+          },
+          "runtimeConfiguration": {
+            "concurrency": {
+              "repetitions": 1
+            }
+          },
+          "actions": {
+            "Reset_status": {
+              "type": "SetVariable",
+              "runAfter": {},
+              "inputs": {
+                "name": "rowStatus",
+                "value": "error"
+              }
+            },
+            "Claim_row": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '(PartitionKey=''', items('For_each_row')?['PartitionKey'], ''',RowKey=''', items('For_each_row')?['RowKey'], ''')')}",
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://storage.azure.com"
+                },
+                "headers": {
+                  "x-ms-version": "2020-12-06",
+                  "Accept": "application/json;odata=nometadata",
+                  "X-HTTP-Method": "MERGE",
+                  "Content-Type": "application/json",
+                  "If-Match": "@items('For_each_row')?['odata.etag']"
+                },
+                "body": {
+                  "executionStatus": "running",
+                  "executionStartedUtc": "@{utcNow()}"
+                }
+              },
+              "runAfter": {
+                "Reset_status": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Scope_servicenow": {
+              "type": "Scope",
+              "runAfter": {
+                "Claim_row": [
+                  "Succeeded"
+                ]
+              },
+              "actions": {
+                "Get_incident": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/incident')}",
+                    "authentication": {
+                      "type": "Basic",
+                      "username": "@parameters('snUser')",
+                      "password": "@body('Get_sn_secret')?['value']"
+                    },
+                    "queries": {
+                      "sysparm_query": "@{concat('number=', items('For_each_row')?['ticketNumber'])}",
+                      "sysparm_fields": "sys_id,number,active",
+                      "sysparm_limit": "1"
+                    },
+                    "headers": {
+                      "Content-Type": "application/json",
+                      "Accept": "application/json"
+                    }
+                  },
+                  "runAfter": {},
+                  "runtimeConfiguration": {
+                    "secureData": {
+                      "properties": [
+                        "inputs",
+                        "outputs"
+                      ]
+                    }
+                  }
+                },
+                "Compose_sys_id": {
+                  "type": "Compose",
+                  "runAfter": {
+                    "Get_incident": [
+                      "Succeeded"
+                    ]
+                  },
+                  "inputs": "@coalesce(first(body('Get_incident')?['result'])?['sys_id'], '')"
+                },
+                "Compose_active": {
+                  "type": "Compose",
+                  "runAfter": {
+                    "Compose_sys_id": [
+                      "Succeeded"
+                    ]
+                  },
+                  "inputs": "@string(coalesce(first(body('Get_incident')?['result'])?['active'], ''))"
+                },
+                "If_found_active_and_live": {
+                  "type": "If",
+                  "runAfter": {
+                    "Compose_active": [
+                      "Succeeded"
+                    ]
+                  },
+                  "expression": {
+                    "and": [
+                      {
+                        "not": {
+                          "equals": [
+                            "@outputs('Compose_sys_id')",
+                            ""
+                          ]
+                        }
+                      },
+                      {
+                        "equals": [
+                          "@outputs('Compose_active')",
+                          "true"
+                        ]
+                      },
+                      {
+                        "equals": [
+                          "@parameters('dryRun')",
+                          false
+                        ]
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "If_handover": {
+                      "type": "If",
+                      "runAfter": {},
+                      "expression": {
+                        "and": [
+                          {
+                            "equals": [
+                              "@items('For_each_row')?['kind']",
+                              "handover"
+                            ]
+                          }
+                        ]
+                      },
+                      "actions": {
+                        "Get_handover_group": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "GET",
+                            "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/sys_user_group')}",
+                            "authentication": {
+                              "type": "Basic",
+                              "username": "@parameters('snUser')",
+                              "password": "@body('Get_sn_secret')?['value']"
+                            },
+                            "queries": {
+                              "sysparm_query": "@{concat('name=', parameters('handoverGroup'))}",
+                              "sysparm_fields": "sys_id",
+                              "sysparm_limit": "1"
+                            },
+                            "headers": {
+                              "Content-Type": "application/json",
+                              "Accept": "application/json"
+                            }
+                          },
+                          "runAfter": {},
+                          "runtimeConfiguration": {
+                            "secureData": {
+                              "properties": [
+                                "inputs",
+                                "outputs"
+                              ]
+                            }
+                          }
+                        },
+                        "If_group_found": {
+                          "type": "If",
+                          "runAfter": {
+                            "Get_handover_group": [
+                              "Succeeded"
+                            ]
+                          },
+                          "expression": {
+                            "and": [
+                              {
+                                "greater": [
+                                  "@length(coalesce(body('Get_handover_group')?['result'], json('[]')))",
+                                  0
+                                ]
+                              }
+                            ]
+                          },
+                          "actions": {
+                            "Patch_handover": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "PATCH",
+                                "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/incident/', outputs('Compose_sys_id'))}",
+                                "authentication": {
+                                  "type": "Basic",
+                                  "username": "@parameters('snUser')",
+                                  "password": "@body('Get_sn_secret')?['value']"
+                                },
+                                "queries": {
+                                  "sysparm_fields": "sys_id"
+                                },
+                                "headers": {
+                                  "Content-Type": "application/json",
+                                  "Accept": "application/json"
+                                },
+                                "body": {
+                                  "work_notes": "@items('For_each_row')?['noteText']",
+                                  "assignment_group": "@first(body('Get_handover_group')?['result'])?['sys_id']"
+                                }
+                              },
+                              "runAfter": {},
+                              "runtimeConfiguration": {
+                                "secureData": {
+                                  "properties": [
+                                    "inputs",
+                                    "outputs"
+                                  ]
+                                }
+                              }
+                            },
+                            "Status_handover": {
+                              "type": "SetVariable",
+                              "runAfter": {
+                                "Patch_handover": [
+                                  "Succeeded",
+                                  "Failed"
+                                ]
+                              },
+                              "inputs": {
+                                "name": "rowStatus",
+                                "value": "@{if(equals(outputs('Patch_handover')?['statusCode'], 200), 'success', 'error')}"
+                              }
+                            }
+                          },
+                          "else": {
+                            "actions": {
+                              "Status_no_group": {
+                                "type": "SetVariable",
+                                "runAfter": {},
+                                "inputs": {
+                                  "name": "rowStatus",
+                                  "value": "error"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "else": {
+                        "actions": {
+                          "Patch_note": {
+                            "type": "Http",
+                            "inputs": {
+                              "method": "PATCH",
+                              "uri": "@{concat('https://', parameters('snInstance'), '.service-now.com/api/now/table/incident/', outputs('Compose_sys_id'))}",
+                              "authentication": {
+                                "type": "Basic",
+                                "username": "@parameters('snUser')",
+                                "password": "@body('Get_sn_secret')?['value']"
+                              },
+                              "queries": {
+                                "sysparm_fields": "sys_id"
+                              },
+                              "headers": {
+                                "Content-Type": "application/json",
+                                "Accept": "application/json"
+                              },
+                              "body": {
+                                "work_notes": "@items('For_each_row')?['noteText']"
+                              }
+                            },
+                            "runAfter": {},
+                            "runtimeConfiguration": {
+                              "secureData": {
+                                "properties": [
+                                  "inputs",
+                                  "outputs"
+                                ]
+                              }
+                            }
+                          },
+                          "Status_note": {
+                            "type": "SetVariable",
+                            "runAfter": {
+                              "Patch_note": [
+                                "Succeeded",
+                                "Failed"
+                              ]
+                            },
+                            "inputs": {
+                              "name": "rowStatus",
+                              "value": "@{if(equals(outputs('Patch_note')?['statusCode'], 200), 'success', 'error')}"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "else": {
+                    "actions": {
+                      "Status_not_written": {
+                        "type": "SetVariable",
+                        "runAfter": {},
+                        "inputs": {
+                          "name": "rowStatus",
+                          "value": "@{if(equals(outputs('Compose_sys_id'), ''), 'not_found', if(equals(outputs('Compose_active'), 'true'), 'dry_run', 'inactive'))}"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "Merge_result": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@{concat('https://', parameters('storageAccountName'), '.table.core.windows.net/', parameters('tableName'), '(PartitionKey=''', items('For_each_row')?['PartitionKey'], ''',RowKey=''', items('For_each_row')?['RowKey'], ''')')}",
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "https://storage.azure.com"
+                },
+                "headers": {
+                  "x-ms-version": "2020-12-06",
+                  "Accept": "application/json;odata=nometadata",
+                  "X-HTTP-Method": "MERGE",
+                  "Content-Type": "application/json"
+                },
+                "body": {
+                  "executionStatus": "@{variables('rowStatus')}",
+                  "executionDryRun": "@parameters('dryRun')",
+                  "executedAtUtc": "@{utcNow()}"
+                }
+              },
+              "runAfter": {
+                "Scope_servicenow": [
+                  "Succeeded",
+                  "Failed",
+                  "Skipped",
+                  "TimedOut"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "actions": {}
+      }
+    }
+  },
+  "outputs": {}
+}

@@ -55,16 +55,41 @@ class MemoryStorage:
 
 
 class MemoryTable:
-    """Same contract as kecore_table.TableStorage: writes MERGE, reads sorted by RowKey."""
+    """Same contract as kecore_table.TableStorage: writes MERGE, reads sorted by RowKey, ETags."""
 
     def __init__(self):
         self.rows: dict[tuple[str, str], dict] = {}
+        self.etags: dict[tuple[str, str], str] = {}
+        self._version = 0
+
+    def _touch(self, key):
+        self._version += 1
+        self.etags[key] = f"W/{self._version}"
 
     def upsert(self, entity):
         key = (entity["PartitionKey"], entity["RowKey"])
         self.rows[key] = {**self.rows.get(key, {}), **entity}
+        self._touch(key)
 
     merge = upsert
+
+    def read(self, client, row_key):
+        key = (client, row_key)
+        return (dict(self.rows[key]), self.etags[key]) if key in self.rows else (None, None)
+
+    def create(self, entity):
+        key = (entity["PartitionKey"], entity["RowKey"])
+        if key in self.rows:
+            return False
+        self.upsert(entity)
+        return True
+
+    def merge_if(self, entity, etag):
+        key = (entity["PartitionKey"], entity["RowKey"])
+        if key not in self.rows or self.etags.get(key) != etag:
+            return False
+        self.upsert(entity)
+        return True
 
     def get(self, client, row_key):
         row = self.rows.get((client, row_key))
@@ -81,6 +106,7 @@ class MemoryTable:
 
     def delete(self, client, row_key):
         self.rows.pop((client, row_key), None)
+        self.etags.pop((client, row_key), None)
 
 
 def fiche(fiche_id="KB0120", title="KB0120- LOCKED ACCOUNT", client="client-s", status="guided"):

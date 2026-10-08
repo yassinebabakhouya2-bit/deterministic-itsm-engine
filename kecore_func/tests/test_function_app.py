@@ -141,6 +141,72 @@ class RoutesTest(unittest.TestCase):
         self.assertEqual(bad.status_code, 400)
 
 
+class Slice5RoutesTest(RoutesTest):
+    """GET /kecore/fiche, the dictionary review and the online loop of /kecore/find (V10 slice 5)."""
+
+    def test_a_fiche_comes_with_its_verified_steps_and_its_text(self):
+        response = self.fa.kecore_fiche(request("GET", "kecore/fiche", params={"client": "client-s", "fiche_id": "KB0120"}))
+        self.assertEqual(response.status_code, 200)
+        view = json.loads(response.get_body())
+        self.assertEqual((view["fiche_id"], view["run_id"]), ("KB0120", "r1"))
+        self.assertTrue(view["steps"] and view["text"])
+        unknown = self.fa.kecore_fiche(request("GET", "kecore/fiche", params={"client": "client-s", "fiche_id": "NOPE"}))
+        self.assertEqual(unknown.status_code, 404)
+        bad = self.fa.kecore_fiche(request("GET", "kecore/fiche", params={"client": "other", "fiche_id": "KB0120"}))
+        self.assertEqual(bad.status_code, 400)
+
+    def find(self, observe=None):
+        ticket = {"client": "client-s", "text": "L'application Coupa ne démarre plus", "interpret": False}
+        if observe is not None:
+            ticket["observe"] = observe
+        return self.fa.kecore_find(request("POST", "kecore/find", ticket))
+
+    def review(self):
+        return json.loads(self.fa.kecore_dictionary(
+            request("GET", "kecore/dictionary", params={"client": "client-s"})).get_body())
+
+    def test_live_questions_of_distinct_sessions_feed_the_review_and_a_decision_is_recorded_once(self):
+        for session in ("a1", "a1", "a1", "b2", "c3"):
+            self.assertEqual(self.find(observe=session * 8).status_code, 200)
+        self.assertEqual([r["spelling"] for r in self.review()["ready"]], ["Coupa"])
+        decision = {"client": "client-s", "term": "coupa", "accept": True, "by": "Yassine"}
+        first = self.fa.kecore_dictionary_decision(request("POST", "kecore/dictionary/decision", decision))
+        self.assertEqual(first.status_code, 200)
+        again = self.fa.kecore_dictionary_decision(request("POST", "kecore/dictionary/decision", decision))
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual(self.review()["decisions"]["accepted"], [{"spelling": "Coupa", "canonical": None}])
+        unknown = dict(decision, term="sage")
+        self.assertEqual(self.fa.kecore_dictionary_decision(
+            request("POST", "kecore/dictionary/decision", unknown)).status_code, 404)
+
+    def test_one_session_asking_again_and_again_is_one_observation(self):
+        for _ in range(5):
+            self.find(observe="ab" * 16)
+        self.find()  # no session key: not observed at all
+        self.assertEqual(self.review()["ready"], [])
+        self.assertEqual(self.review()["watching"], 1)
+
+    def test_a_bad_session_key_is_a_400(self):
+        self.assertEqual(self.find(observe="Session-1").status_code, 400)
+
+    def test_a_broken_pending_table_never_fails_the_answer(self):
+        self.fa.table = lambda name=None: (_ for _ in ()).throw(RuntimeError("table down")) if name == "kefindpending" \
+            else self.tables.setdefault(name or "tickets", MemoryTable())
+        self.assertEqual(self.find(observe="ab" * 16).status_code, 200)
+
+    def test_the_next_run_reads_the_review_decisions(self):
+        for session in ("a1", "b2", "c3"):
+            self.find(observe=session * 8)
+        self.fa.kecore_dictionary_decision(request("POST", "kecore/dictionary/decision",
+                                                   {"client": "client-s", "term": "coupa", "accept": False}))
+        seen = {}
+        fake = lambda storage, payload, llm=None, decided=None: seen.update(decided=decided) or {}  # noqa: E731
+        with unittest.mock.patch.object(self.fa.pipeline, "profile", fake), \
+                unittest.mock.patch.object(self.fa, "make_llm", lambda payload: None):
+            self.fa.kecore_profile({"client": "client-s", "with_dictionary": True})
+        self.assertEqual(seen["decided"], {"rejected": ["Coupa"], "accepted": []})
+
+
 class OrchestratorsTest(unittest.TestCase):
     def setUp(self):
         self.fa = load_app()

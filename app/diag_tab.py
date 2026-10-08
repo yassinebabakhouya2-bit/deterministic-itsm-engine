@@ -6,11 +6,16 @@
 #   POST /diag/new                 start a session (text and/or screenshot)
 #   GET  /diag/s/<id>              fiche choice, step summary, current step, help
 #   POST /diag/s/<id>/reply        action (done/blocked/...), text and/or screenshot
+#   POST /diag/s/<id>/writeback    an ITSM agent validates the note for the session's ServiceNow ticket
 #   POST /api/servicenow/webhook   ServiceNow ticket event (HMAC signed, JSON in / JSON out)
 #   POST /diag/internal/sweep      no-op kept for compatibility (HMAC signed)
 #
 # The engine itself lives in orchestration/guide/ (pure FSM + ports). This
-# module only does access control, form handling and rendering.
+# module only does access control, form handling and rendering. When the Web App
+# is linked to the deterministic engine (deps["engine"], app/kecore_client.py),
+# fn-kecore finds the fiche first and its verified steps are shown word for word;
+# the search index answers when the engine abstains or cannot be reached
+# (orchestration/guide/kefind_ports.py).
 #
 # Security rules, enforced server-side:
 #   - user routes: the client must be in the caller's allowed clients (Easy Auth
@@ -22,30 +27,91 @@
 #     are the only routes excluded from Easy Auth (scripts/enable-diagnostic-webhook.ps1);
 #   - ticket text, OCR text and model output are untrusted: Flask autoescapes
 #     everything, nothing here is marked |safe;
-#   - screenshots stay in memory for the request (never stored).
+#   - screenshots stay in memory for the request (never stored);
+#   - write-back (V10 slice 6): this app never writes to ServiceNow and holds no
+#     ServiceNow credential. An ITSM agent who can see the session validates the
+#     note, built from the fiche and its steps only, never from what was typed
+#     (orchestration/guide/writeback.py); the validated request is a row of the
+#     diagwriteback table, executed by its own Logic App (itsm/writeback/, dryRun first);
+#   - messages between pages travel as codes, never as text taken from the URL.
 # =====================================================================
 import hashlib
 import hmac
 import html as _html
 import json
+import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
+import yaml
 from flask import Blueprint, abort, jsonify, redirect, render_template_string, request, url_for
 
 from guide.contracts import ACTION_RE
 from guide.fsm import Thresholds
+from guide.kefind_ports import with_engine
 from guide.ports import build_ports
 from guide.service import Conflict, GuideService, NotFound, SESSION_ID_RE, TableStore
 from guide.textutil import kb_text
+from guide.writeback import KINDS, TICKET_RE, handover_action, request_row, statuses, work_note
 
 TABLE = "diagsessions"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_MIMES = {"image/png", "image/jpeg", "image/webp"}
 STATE_LABELS = {"LOCATE": "Recherche de la fiche", "GUIDING": "Résolution guidée",
                 "SOLVED": "Résolu", "STUCK": "En attente d'une nouvelle description"}
+# Messages between pages travel as codes: a crafted link cannot make this site show its own text.
+MESSAGES = {
+    "empty": "Collez un texte ou joignez une capture.",
+    "start_failed": "Erreur technique au démarrage : réessayez dans un instant.",
+    "conflict": "Session modifiée en parallèle, réessayez.",
+    "ticket": "Numéro d'incident invalide : INC suivi de 7 à 10 chiffres.",
+    "wb_saved": "Demande validée : l'exécuteur ServiceNow la traite sous 2 minutes (état ci-dessous).",
+    "wb_exists": "Cette demande est déjà validée pour ce ticket (état ci-dessous).",
+    "wb_no_action": "Aucune action du module ITSM ne correspond à cette fiche : ajoutez la note de travail.",
+    "wb_invalid": "Rien à écrire : la session n'a pas de fiche, ou pas de numéro de ticket valide.",
+    "wb_unavailable": "La file d'écriture ne répond pas : réessayez dans un instant.",
+}
+RETRYABLE = ("error", "not_found", "inactive")  # a failed write may be validated again, a written one never
+STALE_RUNNING = timedelta(minutes=15)   # an executor run stopped mid-row: the row may be validated again
+log = logging.getLogger(__name__)
+
+
+def _load_writeback_config(path: Path) -> dict:
+    """config/diag-writeback.yaml; a handover rule whose pattern does not compile is dropped."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        cfg = {}
+    rules = []
+    for rule in cfg.get("handover") or []:
+        try:
+            re.compile(str(rule.get("label_pattern") or ""))
+        except (AttributeError, re.error):
+            continue
+        rules.append(rule)
+    return {"table": str(cfg.get("table") or "diagwriteback"), "handover": rules,
+            "clients": [str(c) for c in cfg.get("clients") or []]}
+
+
+def _retryable(row: dict, now: datetime) -> bool:
+    status = row.get("executionStatus") or ""
+    if status in RETRYABLE:
+        return True
+    if status == "running":
+        try:
+            started = datetime.strptime(str(row.get("executionStartedUtc") or "")[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return True
+        return now - started.replace(tzinfo=timezone.utc) > STALE_RUNNING
+    return False
+
+
+WRITEBACK_CONFIG = _load_writeback_config(Path(__file__).resolve().parent.parent / "config" / "diag-writeback.yaml")
 
 
 def _same_origin():
@@ -65,9 +131,51 @@ def verify_signature(secret: str, timestamp: str, body: bytes, signature: str, n
     return hmac.compare_digest(expected, (signature or "").removeprefix("sha256="))
 
 
-def create_diagnostic_blueprint(table_service, deps, store=None):
+class WritebackTable:
+    """The diagwriteback table: one row per (session, kind). A first request is an atomic insert;
+    a new validation after a failed write merges only into the row as it was read (If-Match)."""
+
+    def __init__(self, table_client):
+        self._client = table_client
+
+    def get(self, partition_key, row_key):
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            entity = self._client.get_entity(partition_key=partition_key, row_key=row_key)
+        except ResourceNotFoundError:
+            return None
+        return {**dict(entity), "_etag": entity.metadata.get("etag")}
+
+    def create(self, entity) -> bool:
+        """True when inserted, False when the row already exists."""
+        from azure.core.exceptions import ResourceExistsError
+
+        try:
+            self._client.create_entity(entity)
+        except ResourceExistsError:
+            return False
+        return True
+
+    def merge(self, entity, etag) -> bool:
+        """False when the row changed (or vanished) since it was read."""
+        from azure.core import MatchConditions
+        from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+        from azure.data.tables import UpdateMode
+
+        try:
+            self._client.update_entity(entity, mode=UpdateMode.MERGE, etag=etag,
+                                       match_condition=MatchConditions.IfNotModified)
+        except (ResourceModifiedError, ResourceNotFoundError):
+            return False
+        return True
+
+
+def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None):
     """deps: allowed_clients(), user_id(), display_name(), itsm_access(), search_token(),
-    aoai, load_engine_config, retrieve_hierarchy, fetch_document_chunks."""
+    aoai, load_engine_config, retrieve_hierarchy, fetch_document_chunks, and engine (optional:
+    app/kecore_client.EngineClient; None = the search index alone).
+    writeback: get/create/merge of the diagwriteback table (WritebackTable); None = from table_service."""
     bp = Blueprint("diag", __name__)
     bp.add_app_template_filter(kb_text, "kb_text")
     if store is None:
@@ -76,6 +184,8 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         except Exception:
             pass                                        # exists, or not authorized yet
         store = TableStore(table_service.get_table_client(TABLE))
+    if writeback is None and table_service is not None:
+        writeback = WritebackTable(table_service.get_table_client(WRITEBACK_CONFIG["table"]))
 
     def ports_factory(client_id, images):
         cfg = deps["load_engine_config"](client_id)
@@ -91,8 +201,9 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         def fetch_chunks(parent_id):
             return deps["fetch_document_chunks"]([parent_id], index, headers, client_id=client_id).get(parent_id, [])
 
-        return build_ports(aoai=deps["aoai"], model=gen["model"], seed=gen["seed"], search_docs=search_docs,
-                           fetch_chunks=fetch_chunks, images=images, thresholds=th)
+        index_ports = build_ports(aoai=deps["aoai"], model=gen["model"], seed=gen["seed"], search_docs=search_docs,
+                                  fetch_chunks=fetch_chunks, images=images, thresholds=th)
+        return with_engine(index_ports, deps.get("engine"), client_id)
 
     service = GuideService(store, ports_factory)
 
@@ -122,6 +233,51 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         if not _same_origin():
             abort(403)
 
+    def _ticket_of(view) -> str:
+        ticket = view.get("ticket_id") or ""
+        return ticket if TICKET_RE.fullmatch(ticket) else ""
+
+    def _writeback_on(client_id) -> bool:
+        """Write-back is on for the clients of config/diag-writeback.yaml only (one executor per instance)."""
+        return writeback is not None and client_id in WRITEBACK_CONFIG["clients"]
+
+    def _writeback_panel(view):
+        """What an ITSM agent may validate for the session's ticket; None when nothing can be written."""
+        guide = view.get("guide") or {}
+        if not _writeback_on(view["client_id"]) or not _ticket_of(view) or not guide.get("steps") \
+                or not deps["itsm_access"]():
+            return None
+        rows = {}
+        for kind in KINDS:
+            try:
+                row = writeback.get(view["client_id"], f"{view['session_id']}-{kind}")
+            except Exception:
+                row = None
+            if row:
+                rows[kind] = row
+        labels, now = statuses(list(rows.values())), datetime.now(timezone.utc)
+        return {"ticket": _ticket_of(view), "note": work_note(view, deps["display_name"](), now),
+                "action": handover_action(guide.get("title") or "", WRITEBACK_CONFIG["handover"]),
+                "kinds": [{"kind": kind, "label": labels.get(kind), "can": kind not in rows or _retryable(rows[kind], now)}
+                          for kind in KINDS]}
+
+    def _submit(row) -> str:
+        try:
+            if writeback.create(row):
+                return "wb_saved"
+            existing = writeback.get(row["PartitionKey"], row["RowKey"])
+        except Exception:
+            log.exception("diagwriteback unavailable")
+            return "wb_unavailable"
+        if not existing or not _retryable(existing, datetime.now(timezone.utc)):
+            return "wb_exists"
+        retry = {**row, "executionStatus": "", "executionStartedUtc": "", "executedAtUtc": ""}
+        try:
+            return "wb_saved" if writeback.merge(retry, existing.get("_etag")) else "wb_exists"
+        except Exception:
+            log.exception("diagwriteback unavailable")
+            return "wb_unavailable"
+
     # -------------------------------------------------------------- pages
     @bp.route("/diag")
     def home():
@@ -139,8 +295,8 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         except Exception:
             pass
         return render_template_string(PAGE, view="home", clients=clients, client_id=client_id, rows=rows,
-                                      states=STATE_LABELS, display_name=deps["display_name"](),
-                                      error=request.args.get("error"))
+                                      states=STATE_LABELS, display_name=deps["display_name"](), itsm=itsm,
+                                      error=MESSAGES.get(request.args.get("error", "")))
 
     @bp.route("/diag/new", methods=["POST"])
     def new():
@@ -149,14 +305,18 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         if client_id not in _clients():
             abort(403)
         text = (request.form.get("text") or "").strip()
+        ticket = (request.form.get("ticket") or "").strip().upper()
+        if ticket and not (deps["itsm_access"]() and TICKET_RE.fullmatch(ticket)):
+            return redirect(url_for("diag.home", client_id=client_id, error="ticket"))
         images = _images()
         if not text and not images:
-            return redirect(url_for("diag.home", client_id=client_id, error="Collez un texte ou joignez une capture."))
+            return redirect(url_for("diag.home", client_id=client_id, error="empty"))
         try:
             view = service.start(client_id=client_id, user_id=deps["user_id"]() or "unknown", origin="app",
-                                 text=text[:4000], images=images)
-        except Exception as exc:
-            return redirect(url_for("diag.home", client_id=client_id, error=f"Erreur : {type(exc).__name__}"))
+                                 text=text[:4000], images=images, ticket_id=ticket or None)
+        except Exception:
+            log.exception("diagnostic start failed")
+            return redirect(url_for("diag.home", client_id=client_id, error="start_failed"))
         return redirect(url_for("diag.session", client_id=client_id, session_id=view["session_id"]))
 
     @bp.route("/diag/s/<session_id>")
@@ -171,8 +331,9 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
         if not _can_see(view):
             abort(404)
         return render_template_string(PAGE, view="session", s=view, states=STATE_LABELS,
-                                      display_name=deps["display_name"](),
-                                      error=request.args.get("error"))
+                                      display_name=deps["display_name"](), wb=_writeback_panel(view),
+                                      error=MESSAGES.get(request.args.get("error", "")),
+                                      msg=MESSAGES.get(request.args.get("msg", "")))
 
     @bp.route("/diag/s/<session_id>/reply", methods=["POST"])
     def reply(session_id):
@@ -201,8 +362,38 @@ def create_diagnostic_blueprint(table_service, deps, store=None):
                 err = None
                 break
             except Conflict:
-                err = "Session modifiée en parallèle, réessayez."
+                err = "conflict"
         return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, error=err))
+
+    @bp.route("/diag/s/<session_id>/writeback", methods=["POST"])
+    def writeback_request(session_id):
+        _guard_post()
+        client_id = request.form.get("client_id", "")
+        if client_id not in _clients() or not SESSION_ID_RE.fullmatch(session_id):
+            abort(404)
+        if not _writeback_on(client_id) or not deps["itsm_access"]():
+            abort(403)
+        kind = request.form.get("kind", "")
+        if kind not in KINDS:
+            abort(400)
+        try:
+            view = service.get(client_id, session_id)
+        except NotFound:
+            abort(404)
+        if not _can_see(view):
+            abort(404)
+        now = datetime.now(timezone.utc)
+        action = None
+        if kind == "handover":
+            action = handover_action((view.get("guide") or {}).get("title") or "", WRITEBACK_CONFIG["handover"])
+            if not action:
+                return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg="wb_no_action"))
+        try:
+            row = request_row(view, kind, work_note(view, deps["display_name"](), now),
+                              deps["user_id"]() or "unknown", deps["display_name"](), now, action)
+        except ValueError:
+            return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg="wb_invalid"))
+        return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg=_submit(row)))
 
     # -------------------------------------------------- signed machine routes
     def _signed_body():
@@ -280,13 +471,18 @@ ol.st li.cur{background:rgba(217,98,43,.10);font-weight:600}ol.st li.cur .n{back
 .pick{display:block;width:100%;text-align:left;margin-top:10px;padding:12px 14px}
 table{width:100%;border-collapse:collapse}td{padding:8px 4px;border-bottom:1px solid var(--line)}
 a.l{color:var(--acc);text-decoration:none}
+.b-verb{background:#e3eefb;color:#1f4f8a}
+.info{background:#e3eefb;color:#1f3f6b;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:.9rem}
+.note{white-space:pre-wrap;font-size:.85rem;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px}
+input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--txt)}
 </style></head><body>
 <header><h1>KnowledgeEngine v9</h1>
-<a class="cur" href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a>{% if labels_nav %}<a href="/labels">Labellisation</a>{% endif %}
+<a class="cur" href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a>{% if labels_nav %}<a href="/labels">Labellisation</a><a href="/dictionary">Dictionnaire</a>{% endif %}
 <a href="/classic" class="mut" style="font-weight:400">Assistant classique</a>
 <span class="mut" style="margin-left:auto">{{ display_name }}</span></header>
 <main>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<div class="info">{{ msg }}</div>{% endif %}
 
 {% if view == "home" %}
 <div class="card"><b>Décrivez votre problème</b>
@@ -295,6 +491,8 @@ a.l{color:var(--acc);text-decoration:none}
 {% if clients|length > 1 %}<select name="client_id">{% for c in clients %}<option value="{{ c }}" {{ 'selected' if c==client_id }}>{{ c }}</option>{% endfor %}</select>
 {% else %}<input type="hidden" name="client_id" value="{{ client_id }}">{% endif %}
 <textarea name="text" style="min-height:110px" placeholder="Décrivez le problème, collez le message d'erreur…"></textarea>
+{% if itsm %}<div class="row"><input class="tk" name="ticket" maxlength="14" placeholder="N° de ticket (optionnel)">
+<span class="mut">INC… : la note de résolution pourra être ajoutée à l'incident, après votre validation.</span></div>{% endif %}
 <div class="row"><input type="file" name="screenshot" accept="image/png,image/jpeg,image/webp" multiple>
 <button type="submit">Trouver la solution</button></div></form></div>
 <div class="card"><b>Conversations récentes</b>
@@ -315,7 +513,7 @@ a.l{color:var(--acc);text-decoration:none}
 {% if g %}
 {% set n = g.steps|length %}{% set cur = s.current_step %}
 <div class="card">
-<div class="mut">📄 Fiche {{ 'la plus proche' if g.approximate else 'identifiée' }}{% if g.origin == 'fallback' %} · résumé automatique{% endif %}</div>
+<div class="mut">📄 Fiche {{ 'la plus proche' if g.approximate else 'identifiée' }}{% if g.parent_id.startswith('kefind:') %} par le moteur déterministe{% elif g.origin == 'fallback' %} · résumé automatique{% endif %}</div>
 <h2 style="margin:4px 0 6px;font-size:1.2rem">{{ g.title }}</h2>
 {% if g.summary %}<div>{{ g.summary }}</div>{% endif %}
 {% if g.approximate %}<div class="mut" style="margin-top:6px">Je n'ai pas pu confirmer que c'est exactement la bonne fiche : dites-le-moi si elle ne correspond pas.</div>{% endif %}
@@ -357,6 +555,7 @@ a.l{color:var(--acc);text-decoration:none}
 {% if cur < n %}{% set stp = g.steps[cur] %}
 <div class="card step" style="border-left:4px solid var(--acc)"><div class="mut">Étape {{ cur + 1 }} sur {{ n }}</div>
 <h2>{{ stp.title }}</h2><div class="ins">{{ stp.instruction }}</div>
+{% if stp.verbatim_from_kb %}<div style="margin-top:6px"><span class="badge b-verb">Texte exact de la fiche</span></div>{% endif %}
 <div class="row"><button class="ok" type="submit" name="action" value="done">✓ C'est fait</button>
 <button class="alt" type="submit" name="action" value="blocked">✗ Ça ne marche pas</button>
 <button class="alt" type="submit" name="action" value="explain">? Expliquer</button>
@@ -378,6 +577,16 @@ a.l{color:var(--acc);text-decoration:none}
 <div class="row"><input type="file" name="screenshot" accept="image/png,image/jpeg,image/webp" multiple>
 <button type="submit">Envoyer</button></div></div>
 </form>
+{% endif %}
+{% if wb %}
+<div class="card"><b>Ticket {{ wb.ticket }} : note de résolution</b>
+<div class="mut">Ajoutée au ticket en note de travail interne (jamais visible du demandeur) par l'exécuteur ServiceNow, après votre validation. Elle ne contient que la fiche et ses étapes, rien de ce qui a été tapé.</div>
+<details><summary class="mut" style="cursor:pointer;margin-top:8px">▸ voir la note</summary><div class="note">{{ wb.note }}</div></details>
+<form method="post" action="/diag/s/{{ s.session_id }}/writeback"><input type="hidden" name="client_id" value="{{ s.client_id }}">
+<div class="row">{% for k in wb.kinds %}{% if k.can and (k.kind == 'work_note' or wb.action) %}
+<button class="{{ 'ok' if k.kind == 'work_note' else 'alt' }}" type="submit" name="kind" value="{{ k.kind }}">{% if k.kind == 'work_note' %}{{ 'Valider à nouveau la note' if k.label else 'Valider : ajouter la note au ticket' }}{% else %}{{ 'Valider à nouveau le transfert' if k.label else 'Transférer au module ITSM' }} ({{ wb.action }}){% endif %}</button>
+{% endif %}{% if k.label %}<span class="mut">{{ 'Note' if k.kind == 'work_note' else 'Transfert' }} : {{ k.label }}</span>{% endif %}{% endfor %}</div>
+</form></div>
 {% endif %}
 {% endif %}
 </main></body></html>"""

@@ -205,17 +205,51 @@ def dictionary_rejected(storage: Storage, client: str) -> list[str]:
     return rejected
 
 
-def profile(storage: Storage, payload: dict, llm=None) -> dict:
+def dictionary_accepted(storage: Storage, client: str) -> list[dict]:
+    """The candidates a person accepted in the dictionary review (dictionary-decisions.json "accepted":
+    [{"spelling", "canonical"}]); they join the dictionary the run learns."""
+    data = storage.read(kecore_container(client), DICTIONARY_DECISIONS)
+    if data is None:
+        return []
+    decisions = json.loads(data.decode("utf-8-sig"))
+    accepted = decisions.get("accepted", []) if isinstance(decisions, dict) else []
+    return [a for a in accepted if isinstance(a, dict) and isinstance(a.get("spelling"), str) and a["spelling"].strip()]
+
+
+def merge_accepted(learned: Profile, accepted: list[dict], rejected: list[str]) -> int:
+    """Adds each accepted spelling to its entry (``canonical``) or to a new one; a rejection wins."""
+    refused = {r.lower() for r in rejected}
+    added = 0
+    for item in accepted:
+        spelling = " ".join(item["spelling"].split())
+        target = item.get("canonical") or re.sub(r"[^a-z0-9]+", "-", spelling.lower()).strip("-")
+        if not target or spelling.lower() in refused or target in refused:
+            continue
+        forms = learned.dictionary.setdefault(target, [])
+        if spelling not in forms:
+            forms.append(spelling)
+            added += 1
+    return added
+
+
+def profile(storage: Storage, payload: dict, llm=None, decided: dict | None = None) -> dict:
+    """``decided``: the decisions of the dictionary review tab (dictionary_service.decisions), on top
+    of the optional hand-written dictionary-decisions.json."""
     fiches = _load_fiches(storage, payload)
-    rejected = dictionary_rejected(storage, payload["client"]) if payload["with_dictionary"] else []
+    decided = decided or {}
+    rejected = (dictionary_rejected(storage, payload["client"]) + list(decided.get("rejected") or [])) \
+        if payload["with_dictionary"] else []
     learned = build_profile(payload["client"], fiches, llm=llm, with_dictionary=payload["with_dictionary"],
                             dictionary_rejected=rejected)
+    accepted = merge_accepted(learned, dictionary_accepted(storage, payload["client"]) + list(decided.get("accepted") or []),
+                              rejected) if payload["with_dictionary"] else 0
     storage.write(kecore_container(payload["client"]), layout(payload["run_id"])["profile"], _json(learned.to_dict()))
     return {
         "headings": len(learned.headings),
         "stable": learned.stable,
         "dictionary": len(learned.dictionary),
         "dictionary_rejected": len(learned.dictionary_rejected),
+        "dictionary_accepted": accepted,
         "llm": {**_llm_counts(llm), "heading_roles": learned.llm_usage, "dictionary": learned.dictionary_usage},
     }
 

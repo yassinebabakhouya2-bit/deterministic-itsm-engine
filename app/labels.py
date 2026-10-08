@@ -386,7 +386,7 @@ PAGE = """
 <body>
 <header>
   <h1>KnowledgeEngine — Labellisation</h1>
-  <nav><a href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a><a class="on" href="/labels">Labellisation</a></nav>
+  <nav><a href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a><a class="on" href="/labels">Labellisation</a><a href="/dictionary">Dictionnaire</a></nav>
   <span class="who">{{ display_name }}</span>
 </header>
 <main>

@@ -1,8 +1,8 @@
 # kecore_func: the V10 KB decomposition, fiche finder and scoreboard, run in Azure
 
 Function App `fn-kecore-<prefix>-v9` (infrastructure: `infra/modules/kecore.bicep`, slice 1).
-It runs `kecore` (slice 2), `kefind` (slice 3) and `scoreboard` (slice 4) unchanged; only where
-documents, tickets, labels, results and the LLM record live changes.
+It runs `kecore` (slice 2), `kefind` (slice 3, in the live Diagnostic from slice 5) and `scoreboard`
+(slice 4) unchanged; only where documents, tickets, labels, results and the LLM record live changes.
 
 ## Decompose a KB (slice 2)
 
@@ -36,7 +36,8 @@ summary (fiches, guided, citable, info_only, steps, steps_verified, mean_agreeme
 
 ```
 POST /api/kecore/find?code=<function key>
-{"client": "client-s", "text": "<ticket>", "answers": ["app:teams"], "run_id": null, "interpret": true}
+{"client": "client-s", "text": "<ticket>", "answers": ["app:teams"], "run_id": null, "interpret": true,
+ "observe": null}
 ```
 
 The decision is code: `kefind.funnel` on the KB map of a run (`fiches.decomposed.jsonl`,
@@ -93,10 +94,33 @@ POST /api/kecore/funnel-config/apply?code=<key>  {"client": "client-s", "scorebo
 - `funnel-config/apply`: refused (409) unless the run's floor was confirmed on both halves; the
   previous `funnel-config.json` is kept under `funnel-config.history/`.
 
+## The engine in the Diagnostic and the dictionary review (slice 5)
+
+```
+GET  /api/kecore/fiche?client=client-s&fiche_id=KB0120[&run_id=...]&code=<key>
+GET  /api/kecore/dictionary?client=client-s&code=<key>
+POST /api/kecore/dictionary/decision?code=<key>
+     {"client": "client-s", "term": "coupa", "accept": true, "canonical": null, "by": "<name>"}
+     {"client": "client-s", "entry": "<entry id>", "accept": false, "by": "<name>"}
+```
+
+- The Web App's Diagnostic calls `/find`, then `/fiche` for the fiche it guides with: its verified
+  steps, its neighbours and its own text, from the run that decided (`run_id`), so a session keeps
+  the same map after a new kecore run (`orchestration/guide/kefind_ports.py`). The Web App holds
+  the key through a Key Vault reference (`infra/modules/kecore-link.bicep`).
+- `/find` accepts `"observe": "<hash of the asking session>"` (16 to 64 hexadecimal characters):
+  the question's product-like names unknown to the dictionary (`l'application X`, 3 words and 40
+  characters at most) are counted once per distinct session in the table `kefindpending`; below 3
+  sessions only a hash of the name is stored, never the question. Observation never fails the answer.
+- `/dictionary`: the current entries, the names seen in at least 3 sessions (`ready`), how many are
+  still watched, the decisions. `/dictionary/decision` records one decision, once (404: unknown
+  or not ready yet; 409: already decided); the next `POST /api/kecore/runs` reads them with the
+  hand-written `dictionary-decisions.json` (`kecore_pipeline.profile`).
+
 Code: `function_app.py` (Durable and HTTP wiring only), `kecore_pipeline.py` (the steps, no
 Azure SDK, tested in memory), `kefind_service.py` (the find request, no Azure SDK, tested in
 memory), `tickets_service.py` and `scoreboard_service.py` (slice 4, no Azure SDK, tested in
-memory), `kecore_blob.py` (blob storage), `kecore_table.py` (table storage). Tests, from the repository root:
+memory), `dictionary_service.py` (slice 5, no Azure SDK, tested in memory), `kecore_blob.py` (blob storage), `kecore_table.py` (table storage). Tests, from the repository root:
 
 ```powershell
 python -m unittest discover -s kecore_func/tests
@@ -104,4 +128,5 @@ python -m unittest discover -s kecore_func/tests
 
 Deployment: `scripts/deploy-kecore-function.ps1` (ships `kecore_func`, `kecore`, `kefind` and
 `scoreboard`); procedure and parity check: runbook §16; the finder: runbook §17; tickets, labels
-and scoreboard: runbook §18.
+and scoreboard: runbook §18; the engine in the Diagnostic, the dictionary review and the
+write-back: runbook §19.

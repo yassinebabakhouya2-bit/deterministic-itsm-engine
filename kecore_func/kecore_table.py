@@ -6,16 +6,20 @@ One partition per client (``PartitionKey``) in every table:
   kefindfiches  the fiches a labeler may pick (one row per fiche of the KB map last used)
   ticketlabels  the human labels, written by the Web App's labeling tab, read here
   kecorescores  one row per scoreboard run (the headline numbers)
+  kefindpending the dictionary's candidate names seen in live questions (dictionary_service.py)
 
 Writes MERGE by default: a property this code does not write (a label, a finding) is never
-erased by a write that does not carry it.
+erased by a write that does not carry it. Where two writers may meet on one row (the dictionary's
+candidates and decisions), ``read`` / ``create`` / ``merge_if`` give optimistic concurrency: an
+atomic insert, then merges that only apply to the row as it was read (ETag, If-Match).
 """
 
 from __future__ import annotations
 
 import os
 
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import DefaultAzureCredential
 
@@ -23,6 +27,7 @@ TICKETS = "tickets"
 FICHES = "kefindfiches"
 LABELS = "ticketlabels"
 SCORES = "kecorescores"
+PENDING = "kefindpending"
 
 
 def _endpoint() -> str:
@@ -55,6 +60,31 @@ class TableStorage:
             return dict(self._client.get_entity(partition_key=client, row_key=row_key))
         except ResourceNotFoundError:
             return None
+
+    def read(self, client: str, row_key: str) -> tuple[dict | None, str | None]:
+        """The row and its ETag, or (None, None)."""
+        try:
+            entity = self._client.get_entity(partition_key=client, row_key=row_key)
+        except ResourceNotFoundError:
+            return None, None
+        return dict(entity), entity.metadata.get("etag")
+
+    def create(self, entity: dict) -> bool:
+        """Inserts the row; False when it already exists (another writer created it first)."""
+        try:
+            self._client.create_entity(entity)
+        except ResourceExistsError:
+            return False
+        return True
+
+    def merge_if(self, entity: dict, etag: str) -> bool:
+        """Merges into the row only as it was read (If-Match); False when it changed or vanished."""
+        try:
+            self._client.update_entity(entity, mode=UpdateMode.MERGE, etag=etag,
+                                       match_condition=MatchConditions.IfNotModified)
+        except (ResourceModifiedError, ResourceNotFoundError):
+            return False
+        return True
 
     def list(self, client: str, select: list[str] | None = None) -> list[dict]:
         rows = self._client.query_entities("PartitionKey eq @pk", parameters={"pk": client}, select=select)

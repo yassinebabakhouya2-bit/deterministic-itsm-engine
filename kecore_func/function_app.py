@@ -45,6 +45,15 @@ POST /api/kecore/funnel-config/apply  (function key)  {"client": "client-s", "sc
                                                        or {"client": "client-s", "reset": true}
   -> writes the client's funnel-config.json from a CONFIRMED recommendation (refused otherwise),
      the previous file kept under funnel-config.history/. The only way a threshold reaches /find.
+
+GET  /api/kecore/fiche?client=client-s&fiche_id=KB0120[&run_id=...]  (function key)
+  -> one fiche of the map: its verified steps, its neighbours and its own text (slice 5: the web
+     app's Diagnostic guides with these steps).
+GET  /api/kecore/dictionary?client=client-s  (function key)
+POST /api/kecore/dictionary/decision  (function key)  {"client", "term"|"entry", "accept", "canonical", "by"}
+  -> the client dictionary's review (slice 5, pilier 2): the current entries, the names live
+     questions brought (every /find observes its question: only the candidate name and its count
+     are kept), and a person's decisions, applied at the next kecore run.
 """
 
 from __future__ import annotations
@@ -60,6 +69,7 @@ from datetime import datetime, timezone
 import azure.durable_functions as df
 import azure.functions as func
 
+import dictionary_service as dictionary_svc
 import kecore_pipeline as pipeline
 import kefind_service as finder
 import scoreboard_service as sb_svc
@@ -177,7 +187,12 @@ def kecore_extract(payload: dict) -> dict:
 
 @app.activity_trigger(input_name="payload")
 def kecore_profile(payload: dict) -> dict:
-    return pipeline.profile(storage(), payload, llm=make_llm(payload))
+    from kecore_table import PENDING
+
+    # the decisions of the dictionary review tab join the run (an unreadable table fails the run:
+    # a rejected name must never come back silently)
+    decided = dictionary_svc.decisions(table(PENDING), payload["client"]) if payload.get("with_dictionary", True) else None
+    return pipeline.profile(storage(), payload, llm=make_llm(payload), decided=decided)
 
 
 @app.activity_trigger(input_name="payload")
@@ -242,7 +257,69 @@ def kecore_find(req: func.HttpRequest) -> func.HttpResponse:
         return _error(404, "no KB map for this run (unknown or unfinished run)")
     # the ticket text is neither logged nor stored; only the model's search terms are recorded
     llm = find_llm(payload["client"]) if payload["interpret"] else None
-    return _json(finder.respond(kb_map, payload, config=_funnel_config(payload["client"]), llm=llm))
+    answer = finder.respond(kb_map, payload, config=_funnel_config(payload["client"]), llm=llm)
+    if payload["observe"]:  # the dictionary's online loop (only names, never the text); never fails the answer
+        try:
+            from kecore_table import PENDING
+
+            dictionary_svc.observe(table(PENDING), payload["client"], payload["text"], kb_map.dictionary,
+                                   payload["observe"])
+        except Exception:
+            pass
+    return _json(answer)
+
+
+@app.route(route="kecore/fiche", methods=["GET"])
+def kecore_fiche(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        payload = finder.validate_fiche_request(dict(req.params), allowed_clients())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    run_id = payload["run_id"] or finder.latest_run(storage(), payload["client"])
+    if not run_id:
+        return _error(404, "no KB map for this client yet")
+    try:
+        kb_map = _kb_map(payload["client"], run_id)
+    except FileNotFoundError:
+        return _error(404, "no KB map for this run")
+    view = finder.fiche_payload(kb_map, payload["fiche_id"])
+    if view is None:
+        return _error(404, "unknown fiche")
+    return _json(view)
+
+
+@app.route(route="kecore/dictionary", methods=["GET"])
+def kecore_dictionary(req: func.HttpRequest) -> func.HttpResponse:
+    from kecore_table import PENDING
+
+    client = req.params.get("client")
+    if client not in set(allowed_clients()):
+        return _error(400, "unknown client")
+    run_id = finder.latest_run(storage(), client)
+    dictionary = _kb_map(client, run_id).dictionary if run_id else {}
+    try:
+        return _json(dictionary_svc.review(storage(), table(PENDING), client, dictionary, run_id))
+    except ValueError as exc:  # the hand-written dictionary-decisions.json is invalid
+        return _error(500, str(exc))
+
+
+@app.route(route="kecore/dictionary/decision", methods=["POST"])
+def kecore_dictionary_decision(req: func.HttpRequest) -> func.HttpResponse:
+    from kecore_table import PENDING
+
+    body = _body(req)
+    if body is None:
+        return _error(400, "a JSON body is expected")
+    try:
+        payload = dictionary_svc.validate_decision(body, allowed_clients())
+    except ValueError as exc:
+        return _error(400, str(exc))
+    try:
+        return _json(dictionary_svc.decide(table(PENDING), payload))
+    except FileNotFoundError as exc:  # never observed, or not seen in enough sessions yet
+        return _error(404, str(exc))
+    except ValueError as exc:  # already decided
+        return _error(409, str(exc))
 
 
 # --------------------------------------------------------------------------- slice 4: tickets

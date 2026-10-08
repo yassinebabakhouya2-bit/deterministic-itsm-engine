@@ -2346,3 +2346,178 @@ site into `kb-client-s` and the text indexer indexes `.csv`; neither propagates 
 raw export sat in SharePoint through one ingestion run, a copy may still be in `kb-client-s` and in
 `idx-client-s`. If the check lists a file, remove the blob and its chunks from the index before
 anything else.
+
+### 18.9 Lot 1 deployed and run on the real data (2026-10-08)
+
+Commit `1211d9a`; fn-kecore and the Web App deployed (18.7).
+
+- Step 0 (read-only check): no `.csv` in `kb-client-s`, so the raw export never reached the index.
+- `rescrub`: 370 rows, 67 changed (68 `[mention]`, 57 `[signature]`, 3 `[nom]`, 1 `[masqué]`).
+- Blank run on the KB map `20261007T204049Z-215423` (catalog: 242 fiches): 370 tickets, fiche shown
+  88, question 282, abstain 0, errors 0, interpretation failures 7 (transient, counted, not fatal).
+  Reasons: `text_only_close_choice` 207, `text_only_close_title_match` 75, `entities_close_choice` 52,
+  `entities_close_title_match` 13, `text_only_no_title_match` 10, `entities_close_entity` 8,
+  `entities_no_title_match` 5.
+- Observation, not acted on: the engine never abstained on 370 real tickets, and three answers in
+  four are a question, most from the text alone. Whether those questions offer the right fiche, or
+  should have been abstentions, is exactly what the labels measure (scoreboard). No threshold is
+  changed before that: it would be tuning blind.
+
+## 19. Slices 5 and 6: the engine in the live Diagnostic, the dictionary review, the write-back (2026-10-08)
+
+Lots 2 and 3 of the plan agreed with Yassine ("tout le reste de la solution, décide toi-même").
+Built and reviewed on 2026-10-08, deployed with 19.6.
+
+### 19.1 The engine finds the fiche in the Diagnostic (slice 5)
+
+`app/diag_tab.py` puts the engine in front of the search index (`orchestration/guide/kefind_ports.py`)
+when the Web App is linked to fn-kecore (`app/kecore_client.py`, settings `KECORE_FUNCTION_URL` and
+`KECORE_FUNCTION_KEY`):
+
+- the engine shows a fiche: the session is guided with the fiche's verified steps, word for word
+  (badge "Texte exact de la fiche"; the card says "Fiche identifiée par le moteur déterministe");
+- the engine asks: its fiches are the choices, one per branch of its question in turn, never "strong";
+- the engine abstains, has no map for the client, or cannot be reached: the search index answers,
+  exactly as before. Without the two settings the Diagnostic is unchanged.
+
+A candidate of the engine is `kefind:<run id>:<fiche id>`: the KB map that decided is pinned in the
+session, so a pick or a help request after a new kecore run still reads the same fiche.
+
+New routes of fn-kecore (`kecore_func/README.md`): `GET /kecore/fiche` (the fiche's steps and full
+text, for a given run); `/kecore/find` accepts `observe` (19.2).
+
+Link Web App → Function (`infra/modules/kecore-link.bicep`): the Function's default host key is
+copied into Key Vault (`kecore-function-key`); the Web App's identity gets Key Vault Secrets User on
+that secret only; the two settings are merged into the existing app settings, the key as a Key
+Vault reference. The key is never in code, a file or a plain setting.
+
+### 19.2 The dictionary's online loop and its review tab (slice 5, pilier 2)
+
+- A live question is observed only when `/kecore/find` gets an `observe` key: the Diagnostic sends a
+  hash of the session (sha256 of client and session id, 32 hex characters), never the id. A
+  candidate is a product-like name after a trigger word ("l'application X", "le logiciel Y"), 3
+  words and 40 characters at most (a longer run of capitalized words is a sentence, a signature or
+  people's names: dropped), unknown to the dictionary. It counts once per distinct session.
+- Personal data: the question is never stored. Below 3 distinct sessions a candidate is only a hash,
+  a count and hashes of sessions (table `kefindpending`); its spelling is stored at the threshold.
+- Review tab `/dictionary` (same access as `/labels`): accept as new software, accept as another
+  spelling of an entry, reject; reject an entry of the current dictionary.
+- Decisions are rows of `kefindpending`, set once with If-Match. The next kecore run reads them,
+  with the optional hand-written `kecore-<client>/dictionary-decisions.json` (17.4). Routes
+  `GET /kecore/dictionary`, `POST /kecore/dictionary/decision` (404: unknown or not ready yet; 409:
+  already decided).
+
+### 19.3 Write-back of a work note into the ServiceNow incident (slice 6)
+
+- An ITSM agent may give an incident number (INC followed by 7 to 10 digits) when starting a
+  diagnostic; sessions from the ServiceNow webhook carry theirs.
+- Session page, for ITSM agents and the clients of `config/diag-writeback.yaml`: panel
+  "Ticket INC… : note de résolution" with the note, "Valider : ajouter la note au ticket", and
+  "Transférer au module ITSM (<action>)" when the fiche's title matches a handover rule
+  (`password_reset`, `mfa_reset`, `group_add`).
+- The note (`orchestration/guide/writeback.py`): fiche title and reference, outcome, the fiche's
+  steps, "Validé par <agent> le …". A step the assistant reformulated (written by a model, which sees
+  the user's text) is replaced by a pointer to the fiche: no user text and no model wording reach
+  ServiceNow.
+- A validation is a row of `diagwriteback` (`status` validated, `executionStatus` empty). The Web App
+  never calls ServiceNow and holds no ServiceNow credential.
+- Executor `logic-diag-writeback-client-s` (`itsm/writeback/`, its own identity): every 2 minutes,
+  the rows of its client not executed yet (filtered in the query, 50 per run); claims a row with
+  If-Match; looks the incident up (an inactive incident is left alone); adds the note as an internal
+  work note, or also assigns the incident to KE-Automation for a handover (the group must exist);
+  writes `executionStatus` back: success, not_found, inactive, dry_run or error, shown on the page.
+- An agent may validate again after error, not_found or inactive, or when a row stayed "running" for
+  15 minutes; never after success or dry_run.
+- `dryRun=true` by default (the incident is looked up, nothing written). Deployed again with
+  `dryRun=false`, the dry_run rows validated in the last 2 days are written for real.
+- Identity: Storage Table Data Contributor on the `diagwriteback` table only (not the account:
+  `diagsessions` holds what users typed), Key Vault Secrets User on the ServiceNow password secret only.
+
+### 19.4 Decisions (each reversible)
+
+- The engine first, the search index as fallback: never a regression when the engine is down,
+  abstains or has no map.
+- The Web App calls fn-kecore with the Function's default host key, kept in Key Vault and read
+  through a Key Vault reference. Accepted for now: that key also opens the administration routes
+  (runs, scrub, apply). Planned hardening (lot 4): a function-level key on the four routes the
+  Web App calls (`find`, `fiche`, `dictionary`, `dictionary/decision`).
+- Write-back for incidents only: the executor reads and writes the incident table. Requested items
+  (RITM) stay with the ITSM module.
+- One executor per client and ServiceNow instance (`clientId` of the module, `clients` of
+  `config/diag-writeback.yaml`): a client is listed only once its executor is deployed.
+- Dictionary decisions are table rows, the hand-written file stays a second source.
+
+### 19.5 Independent review before deployment (2026-10-08)
+
+A separate agent that had not seen the code reviewed lots 2 and 3, running it on concrete inputs.
+Every finding is fixed and tested (`kecore_func/tests/test_dictionary_service.py`,
+`test_function_app.py` Slice5RoutesTest, `tests/test_kefind_ports.py`, `tests/test_writeback.py`,
+`tests/test_guide_app.py`).
+
+| Finding (symptom) | Root cause | Fix |
+| --- | --- | --- |
+| `"l'"*22+"x"` took 2.7 s in the dictionary scan, 61 characters about 12 minutes: any Diagnostic user could freeze fn-kecore | the optional article group before the trigger word, with `l'` matching two ways, backtracked exponentially | group removed (it changed no captured name: kecore tests unchanged), the scan is linear (20 KB of hostile text in about a millisecond); live text capped at 4,000 characters |
+| a whole capitalized run ("Mon Compte Pour Marie Curie Bureau B204 et Paul Martin") stored at its first sight | no length cap; spelling stored from the first observation | 3 words / 40 characters at most, longer runs dropped; hash only until 3 distinct sessions |
+| one session made a candidate "ready" by itself (every LOCATE event called `/find`) | no notion of session | `observe` key = hash of the session, the 8 latest kept per candidate; point reads instead of listing the partition |
+| a decision could be lost (decisions file read-modify-write, row marked before the file write) or undone by a concurrent observation | file as the store, unconditional writes | decisions are table rows set once with If-Match, read by the next run; an observation never writes the status |
+| the executor read every client's rows into one ServiceNow instance | no partition filter | `clientId` parameter, `clients` list in `config/diag-writeback.yaml` |
+| processed rows read again forever, first page only: past about 1,000 rows new validations would never run | status filtered after the query | filter in the query (`executionStatus eq ''`), 50 rows per run |
+| a RITM number accepted but never writable | the executor writes incidents only | incident numbers only |
+| going live would replay every dry-run row, closed incidents included | no age or state check | dry_run rows of the last 2 days only; an inactive incident ends `inactive`, nothing written |
+| a handover reported success when the group did not exist | a PATCH with an empty group still answers 200 | the group lookup must return a row, else `error` |
+| a pick or a help request after a new kecore run read another map's fiche | the run id was lost between requests | the run is pinned in the candidate id |
+| the engine's "which application?" question offered only the first application's fiches | options flattened in order, 3 shown | one fiche per branch in turn |
+| a step reformulated by the model (which sees the user's text) went into the note | every step copied | only the fiche's own steps; a reformulated one becomes a pointer to the fiche |
+| ServiceNow answers (the whole incident) in the run history; roles on the whole account and vault | defaults | `sysparm_fields`, secure inputs and outputs; roles on the table and on the secret |
+| an invalid decisions file answered 409 "already decided" | its ValueError was taken for a conflict | a decision no longer reads the file; the review answers 500 with the reason |
+
+Tests after the fixes: kecore 123, kefind 99, kecore_func 86, scoreboard 71, app 86 (465 passing).
+Both Bicep modules build without warning (bicep 0.48.1); the workflow's actions, references and
+parameters were checked by script and its `$filter` rendered for both modes.
+
+### 19.6 Deploy (lots 2 and 3)
+
+After the commit (files listed explicitly, as always):
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+.\scripts\deploy-kecore-function.ps1
+.\deploy-webapp.ps1
+az deployment group create -g rg-knowledgeengine-v9 --name kecore-link --template-file infra/modules/kecore-link.bicep --query properties.provisioningState -o tsv
+az deployment group create -g rg-knowledgeengine-v9 --name diag-writeback --template-file itsm/writeback/main.bicep --parameters clientId=client-s dryRun=true --query properties.provisioningState -o tsv
+Start-Sleep -Seconds 120   # the role on the secret must propagate before App Service resolves the reference
+az webapp restart --name app-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9
+Start-Sleep -Seconds 60
+
+$app  = az webapp show --name app-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query id -o tsv
+"Key Vault reference: " + (az rest --method get --uri "https://management.azure.com$app/config/configreferences/appsettings/KECORE_FUNCTION_KEY?api-version=2022-03-01" --query properties.status -o tsv)
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$q = @{ client = "client-s"; text = "Mon compte est bloqué, je n'arrive plus à me connecter à Windows"; interpret = $false } | ConvertTo-Json
+$a = Invoke-RestMethod -Method Post -Uri "$base/kecore/find?code=$key" -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($q))
+$id = if ($a.decision.fiche_id) { $a.decision.fiche_id } else { @($a.candidates | ForEach-Object { $_.fiche_id })[0] }
+"find: {0} ({1}) -> {2}" -f $a.decision.kind, $a.decision.reason, $id
+if ($id) {
+    $f = Invoke-RestMethod -Uri ("$base/kecore/fiche?client=client-s&fiche_id=" + [uri]::EscapeDataString($id) + "&code=$key")
+    "fiche {0}: {1} steps, run {2}" -f $f.fiche_id, @($f.steps).Count, $f.run_id
+}
+$d = Invoke-RestMethod -Uri "$base/kecore/dictionary?client=client-s&code=$key"
+"dictionary: {0} entries, {1} to review, {2} watched, run {3}" -f @($d.dictionary).Count, @($d.ready).Count, $d.watching, $d.run_id
+az resource show -g rg-knowledgeengine-v9 -n logic-diag-writeback-client-s --resource-type Microsoft.Logic/workflows --query properties.state -o tsv
+```
+
+Expected: `Succeeded` twice, `Key Vault reference: Resolved`, a find answer and the steps of its
+fiche (the fiche id is taken from the answer, never hard-coded: a client's ids are its own), the
+dictionary's entry count, `Enabled`. The host's function list printed by the deploy script may lag
+(16.5); the calls above are the proof. Then in `/diag`: the same question gives "Fiche identifiée
+par le moteur déterministe" (or its choice of fiches) and steps marked "Texte exact de la fiche".
+If the reference is not `Resolved`, restart the Web App once more (role propagation).
+
+### 19.7 Test the write-back on the PDI (dry run, then live)
+
+1. Wake the PDI `dev374242` (developer.servicenow.com) and note the number of an active incident.
+2. In `/diag`, start a diagnostic with that number, reach a fiche, then "Valider : ajouter la note au
+   ticket". Within 2 minutes the page says "simulé (aucune écriture)": the incident was found.
+3. Go live: `az deployment group create -g rg-knowledgeengine-v9 --name diag-writeback --template-file
+   itsm/writeback/main.bicep --parameters clientId=client-s dryRun=false`. Within 2 minutes the
+   page says "écrit dans le ticket" and the work note is on the incident in the PDI.

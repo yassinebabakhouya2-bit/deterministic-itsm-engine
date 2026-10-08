@@ -65,10 +65,10 @@ Every runtime component is an Azure managed service: Azure runs the servers, pat
 | **Azure AI Speech** | via Foundry | Batch transcription of support calls, with speaker separation. |
 | **Azure AI Video Indexer** | 1 account | Transcript, on-screen text and topics from tutorial videos. |
 | **Azure AI Search** | 1 service, 1 index per client | Hybrid search (BM25 + vectors + semantic reranker), indexers and skillsets that turn blobs into indexed chunks, synonym maps. |
-| **Azure Logic Apps** (Consumption) | ingestion, transcription, 3 ITSM workflows | Scheduled workflows with plain HTTP actions and managed identities: SharePoint → Blob, audio → Speech, ServiceNow poll / propose / execute. |
-| **Azure Functions** | 1 app | Enrichment skill called by the skillsets (entities, aliases, summaries). |
+| **Azure Logic Apps** (Consumption) | ingestion, transcription, 3 ITSM workflows, diagnostic write-back | Scheduled workflows with plain HTTP actions and managed identities: SharePoint → Blob, audio → Speech, ServiceNow poll / propose / execute, validated work notes → ServiceNow incident. |
+| **Azure Functions** | 2 apps | Enrichment skill called by the skillsets (entities, aliases, summaries); the deterministic engine `fn-kecore` (KB decomposition, fiche finder, tickets, scoreboard, dictionary review) on Durable Functions. |
 | **Azure App Service** | 1 plan (Linux) + 1 Web App | Hosts the diagnostic engine and the `/itsm` approval tab, behind Easy Auth. |
-| **Azure Storage** | 1 account | Blob: raw files per client container. Table: conversations, ITSM tickets, enrichment cache. |
+| **Azure Storage** | 1 account | Blob: raw files per client container, deterministic-engine runs. Table: conversations, ITSM tickets, enrichment cache, scrubbed real tickets, labels, scores, dictionary candidates, write-back requests. |
 | **Azure Key Vault** | 2 vaults | Integration secrets (SharePoint, Speech, ServiceNow) and one-time delivery of temporary passwords / Temporary Access Passes. |
 | **Microsoft Entra ID** | tenant, groups, app registrations | Sign-in, user → client resolution by tenant and group, managed identities, target of ITSM actions through Microsoft Graph. |
 | **Azure Monitor** | Log Analytics + Application Insights | Logs, performance and failures of the enrichment Function; smart-detection alerts. |
@@ -134,7 +134,7 @@ Onboarding a new client never touches the engine: a new `config/engine.<client>.
 | 8 | Video (Azure AI Video Indexer) | 🟡 Partial — service deployed, scheduled pipeline pending |
 | 9 | GraphRAG multimodal + iterative diagnostic (deterministic state machine, no escalation) | ✅ Closed — see `orchestration/guide/` |
 | 10 | **ITSM action engine** (ServiceNow + Entra ID, GPT-4o proposal + deterministic guardrails, human approval, execution, one-time secret delivery) | ✅ **Closed, validated live end to end** — replayable demo (`scripts/itsm/reset-demo.ps1`) |
-| V10 | Deterministic diagnostic track (`scoreboard`, `kecore`, `kefind`) — measurement harness, KB decomposition with self-consistency, dynamic per-client dictionary, entity + graph fiche finder | 🟡 In progress — moving to Azure-native (Bicep): slices 1–3 of 7 deployed (KB decomposition and the entity/graph fiche finder both run in Azure, confirmed on real data) — see [`docs/v10-deterministic-engine.md`](docs/v10-deterministic-engine.md) |
+| V10 | Deterministic diagnostic track (`scoreboard`, `kecore`, `kefind`) — measurement harness, KB decomposition with self-consistency, dynamic per-client dictionary, entity + graph fiche finder | 🟡 In progress — Azure-native (Bicep): slices 1–6 of 7 built and reviewed. Deployed: KB decomposition, the entity/graph fiche finder, real tickets scrubbed of personal data, labeling tab and scoreboard (slices 1–4, confirmed on real data). Slices 5–6: the engine in the live Diagnostic (verified steps word for word, search index as fallback), dictionary review, work note written into the ServiceNow incident after an agent's validation — see [`docs/v10-deterministic-engine.md`](docs/v10-deterministic-engine.md) |
 | — | Copilot Studio agent | 🟢 Planned |
 
 Convention: one jalon = one dedicated conversation, commit/push at every significant step, operations logged live in `docs/operations-runbook.md` (see `CLAUDE.md`).
