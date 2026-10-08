@@ -376,3 +376,35 @@ def test_a_row_stuck_running_may_be_validated_again_after_a_while():
     assert diag_bp._retryable({"executionStatus": "inactive"}, now)
     assert not diag_bp._retryable({"executionStatus": "dry_run"}, now)
     assert not diag_bp._retryable({"executionStatus": ""}, now + timedelta(days=9))
+def test_button_clicks_dont_pile_up_as_chat_only_typed_text_does():
+    app, _ = make_app()
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "reset mdp"}))
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "done"})
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "text": "ça ne marche pas vraiment"})
+    page = page_of(c, sid)
+    assert "C'est fait." not in page                    # the step list already marks it done
+    assert "ça ne marche pas vraiment" in page           # what was actually typed stays
+
+
+def test_a_reload_after_an_action_lands_back_on_the_current_step():
+    app, _ = make_app()
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "reset mdp"}))
+    r = post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "done"})
+    assert r.headers["Location"].endswith("#focus")
+    page = page_of(c, sid)
+    assert page.count('id="focus"') == 1                # exactly one anchor on the page
+
+
+def test_a_pending_write_back_says_the_executor_polls_every_two_minutes():
+    wb = FakeWriteback()
+    app, _ = make_app(itsm=True, writeback=wb)
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "reset mdp", "ticket": "INC0010023"}))
+    r = post(c, f"/diag/s/{sid}/writeback", {"client_id": "client-s", "kind": "work_note"})
+    assert r.headers["Location"].endswith("#writeback")
+    page = page_of(c, sid)
+    assert "toutes les 2 minutes" in page
+    wb.rows[("client-s", f"{sid}-work_note")]["executionStatus"] = "success"
+    assert "toutes les 2 minutes" not in page_of(c, sid)

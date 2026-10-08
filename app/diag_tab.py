@@ -256,7 +256,10 @@ def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None)
             if row:
                 rows[kind] = row
         labels, now = statuses(list(rows.values())), datetime.now(timezone.utc)
-        return {"ticket": _ticket_of(view), "note": work_note(view, deps["display_name"](), now),
+        # a row submitted but not yet picked up by the executor (polls every 2 minutes, runbook 19.3):
+        # the page says so, rather than leaving the person to wonder why nothing happened yet
+        pending = any(row.get("status") == "validated" and not row.get("executionStatus") for row in rows.values())
+        return {"ticket": _ticket_of(view), "note": work_note(view, deps["display_name"](), now), "pending": pending,
                 "action": handover_action(guide.get("title") or "", WRITEBACK_CONFIG["handover"]),
                 "kinds": [{"kind": kind, "label": labels.get(kind), "can": kind not in rows or _retryable(rows[kind], now)}
                           for kind in KINDS]}
@@ -353,7 +356,7 @@ def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None)
             abort(400)
         images = _images()
         if action is None and not text and not images:
-            return redirect(url_for("diag.session", client_id=client_id, session_id=session_id))
+            return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, _anchor="focus"))
         err = None
         for _ in range(2):                              # one retry on a concurrent writer
             try:
@@ -363,7 +366,7 @@ def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None)
                 break
             except Conflict:
                 err = "conflict"
-        return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, error=err))
+        return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, error=err, _anchor="focus"))
 
     @bp.route("/diag/s/<session_id>/writeback", methods=["POST"])
     def writeback_request(session_id):
@@ -387,13 +390,13 @@ def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None)
         if kind == "handover":
             action = handover_action((view.get("guide") or {}).get("title") or "", WRITEBACK_CONFIG["handover"])
             if not action:
-                return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg="wb_no_action"))
+                return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg="wb_no_action", _anchor="writeback"))
         try:
             row = request_row(view, kind, work_note(view, deps["display_name"](), now),
                               deps["user_id"]() or "unknown", deps["display_name"](), now, action)
         except ValueError:
-            return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg="wb_invalid"))
-        return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg=_submit(row)))
+            return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg="wb_invalid", _anchor="writeback"))
+        return redirect(url_for("diag.session", client_id=client_id, session_id=session_id, msg=_submit(row), _anchor="writeback"))
 
     # -------------------------------------------------- signed machine routes
     def _signed_body():
@@ -527,7 +530,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 {% endif %}
 
 {% for m in s.messages %}
-{% if m.role == 'user' %}<div class="msg u"><span class="mut">Vous{% if m.images %} · {{ m.images }} capture(s){% endif %}</span><br>{{ m.text }}</div>
+{% if m.role == 'user' and m.kind == 'text' %}<div class="msg u"><span class="mut">Vous{% if m.images %} · {{ m.images }} capture(s){% endif %}</span><br>{{ m.text }}</div>
 {% elif m.kind == 'help' %}<div class="msg h"><span class="mut">Aide · étape {{ m.step }}</span><br><div style="white-space:pre-wrap">{{ m.text }}</div></div>
 {% elif m.kind == 'notice' %}<div class="msg"><span class="mut">{{ m.text }}</span></div>
 {% elif m.kind == 'done' %}{% endif %}{% endfor %}
@@ -541,7 +544,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <input type="hidden" name="client_id" value="{{ s.client_id }}">
 
 {% if s.state == 'LOCATE' and s.choices %}
-<div class="card"><b>Quelle fiche correspond à votre problème ?</b>
+<div class="card" id="focus"><b>Quelle fiche correspond à votre problème ?</b>
 <div class="mut">Choisissez-en une : je vous montre aussitôt les étapes.</div>
 {% for c in s.choices %}<button class="alt pick" type="submit" name="action" value="pick:{{ loop.index }}">
 <b>{{ c.title }}</b><br><span class="mut">correspondance {{ 'forte' if c.score >= 2.5 else ('moyenne' if c.score >= 1.5 else 'faible') }}</span></button>
@@ -553,7 +556,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 
 {% if g and s.state == 'GUIDING' %}
 {% if cur < n %}{% set stp = g.steps[cur] %}
-<div class="card step" style="border-left:4px solid var(--acc)"><div class="mut">Étape {{ cur + 1 }} sur {{ n }}</div>
+<div class="card step" id="focus" style="border-left:4px solid var(--acc)"><div class="mut">Étape {{ cur + 1 }} sur {{ n }}</div>
 <h2>{{ stp.title }}</h2><div class="ins">{{ stp.instruction }}</div>
 {% if stp.verbatim_from_kb %}<div style="margin-top:6px"><span class="badge b-verb">Texte exact de la fiche</span></div>{% endif %}
 <div class="row"><button class="ok" type="submit" name="action" value="done">✓ C'est fait</button>
@@ -563,7 +566,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 {% if s.step_attempts >= 2 %}<div class="mut" style="margin-top:10px">Toujours bloqué ? <button class="lnk" type="submit" name="action" value="wrong_fiche">Essayer une autre fiche</button></div>{% endif %}
 </div>
 {% else %}
-<div class="card" style="border-left:4px solid var(--ok)"><b>Toutes les étapes sont faites. Le problème est-il résolu ?</b>
+<div class="card" id="focus" style="border-left:4px solid var(--ok)"><b>Toutes les étapes sont faites. Le problème est-il résolu ?</b>
 {% if g.verification %}<ul>{% for x in g.verification %}<li>{{ x }}</li>{% endfor %}</ul>{% endif %}
 <div class="row"><button class="ok" type="submit" name="action" value="solved_yes">✓ Oui, résolu</button>
 <button class="alt" type="submit" name="action" value="solved_no">✗ Non, toujours là</button>
@@ -572,15 +575,16 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <div class="row" style="margin-top:0"><button class="lnk" type="submit" name="action" value="wrong_fiche">Ce n'est pas la bonne fiche</button></div>
 {% endif %}
 
-<div class="card"><div class="mut">{% if g %}Une question ou un blocage sur cette étape ? Décrivez-le ou joignez une capture.{% elif s.state == 'STUCK' %}Décrivez le problème autrement ou joignez une capture.{% else %}Précisez le problème pour affiner la recherche (optionnel).{% endif %}</div>
+<div class="card"{% if not g and not s.choices %} id="focus"{% endif %}><div class="mut">{% if g %}Une question ou un blocage sur cette étape ? Décrivez-le ou joignez une capture.{% elif s.state == 'STUCK' %}Décrivez le problème autrement ou joignez une capture.{% else %}Précisez le problème pour affiner la recherche (optionnel).{% endif %}</div>
 <textarea name="text" placeholder="Votre message…"></textarea>
 <div class="row"><input type="file" name="screenshot" accept="image/png,image/jpeg,image/webp" multiple>
 <button type="submit">Envoyer</button></div></div>
 </form>
 {% endif %}
 {% if wb %}
-<div class="card"><b>Ticket {{ wb.ticket }} : note de résolution</b>
-<div class="mut">Ajoutée au ticket en note de travail interne (jamais visible du demandeur) par l'exécuteur ServiceNow, après votre validation. Elle ne contient que la fiche et ses étapes, rien de ce qui a été tapé.</div>
+<div class="card" id="writeback"><b>Ticket {{ wb.ticket }} : note de résolution</b>
+<div class="mut">Ajoutée au ticket en note de travail interne (jamais visible du demandeur) par l'exécuteur ServiceNow, après votre validation. Elle ne contient que la fiche et ses étapes, rien de ce qui a été tapé.
+{% if wb.pending %} L'exécuteur ServiceNow passe toutes les 2 minutes : rafraîchissez la page après ce délai pour voir le résultat.{% endif %}</div>
 <details><summary class="mut" style="cursor:pointer;margin-top:8px">▸ voir la note</summary><div class="note">{{ wb.note }}</div></details>
 <form method="post" action="/diag/s/{{ s.session_id }}/writeback"><input type="hidden" name="client_id" value="{{ s.client_id }}">
 <div class="row">{% for k in wb.kinds %}{% if k.can and (k.kind == 'work_note' or wb.action) %}

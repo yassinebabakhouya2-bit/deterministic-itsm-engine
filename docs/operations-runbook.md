@@ -2541,3 +2541,30 @@ Commit `38826f6`. fn-kecore and the Web App deployed; `diag-writeback`: Succeede
 | the deploy script listed 21 functions, 24 are deployed | the host's listing lags one deployment (16.5) | none needed: the route calls are the proof |
 
 Tests after the fixes: kecore 123, kefind 99, kecore_func 88, scoreboard 71, app 87.
+
+Second deployment (commit `471fbde`): `kecore-link` Succeeded, `Key Vault reference: Resolved` at the
+first check, the host lists its 24 functions. Asked as the Diagnostic asks (interpreted):
+
+- "Mon compte est bloqué, je n'arrive plus à me connecter à Windows": fiche shown, KB0120- LOCKED
+  ACCOUNT (`text_only_close_title_match`), 17 verified steps;
+- "Teams affiche un écran blanc": a question (`entities_close_choice`) between the Teams fiches, led
+  by "KB0250 - How to reconnect the Teams phone": the person picks. Whether "How to clear the TEAMS
+  cache" should lead is for the labels to say (no prompt or threshold tuned on one example).
+
+### 19.9 UX fixes after the first live write-back test (2026-10-08)
+
+Yassine ran KB0120 (17 steps) end to end and validated a work note on `INC0010005`.
+
+- The page said "validé, en attente de l'exécuteur" and nothing more: the executor polls every
+  2 minutes (19.3), so a wait is normal, but the page did not say so. Now, while a validated row has
+  no `executionStatus` yet, the panel adds "L'exécuteur ServiceNow passe toutes les 2 minutes :
+  rafraîchissez la page après ce délai pour voir le résultat."
+- Each "C'est fait." / "Ça ne marche pas." click was logged as a chat line ("Vous : C'est fait."):
+  on a 17-step fiche the person scrolled past 17 of them to reach the current step on every reload.
+  The step list already marks each one done with a check, so the button clicks are no longer shown
+  as chat; what the person actually types still is.
+- A POST back to the session page (`/reply`, `/writeback`) now redirects with a URL fragment
+  (`#focus` on the current step or choice card, `#writeback` on the write-back panel): the browser
+  lands there on load, no custom script needed, instead of the top of a session that has grown long.
+
+Tests: `tests/test_guide_app.py` (90 app tests total).
