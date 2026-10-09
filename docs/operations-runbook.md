@@ -3089,3 +3089,23 @@ du 2026-10-09, à consigner ici avec leur sortie) ; (2) ne déployer qu'après u
 `git log -1` qui montre le commit attendu ; (3) dans un bloc collé, arrêter au premier échec git :
 `git pull; if ($LASTEXITCODE) { throw "git pull a échoué" }` (idem après `merge` et `push`).
 Redéploiement Function + Web App à refaire depuis le bon commit.
+
+**Résolution (16:00-16:05 UTC).** Copie de `CLAUDE.md` local, `git revert --abort`, `git stash` de
+`CLAUDE.md`, `git pull --ff-only` (`f7e9651..366cb55`), `git merge --ff-only` de la branche
+(`366cb55..7798a72`), `git push`, `git stash pop` -- chaque commande suivie d'un arrêt si
+`$LASTEXITCODE` ; `main` = `7798a72`. Web App redéployée (16:02, `RuntimeSuccessful`), Function
+redéployée. **Second piège** : la liste « Functions served by the host » affichée par
+`deploy-kecore-function.ps1` ne contenait toujours pas `kecore_enrich` -- le script prend la première
+réponse de l'hôte 30 s après un déploiement qui répond 202 pendant la compilation distante : l'ancien
+hôte peut encore répondre. Vérifié quelques minutes plus tard :
+
+```powershell
+$sub  = az account show --query id -o tsv
+$site = "https://management.azure.com/subscriptions/$sub/resourceGroups/rg-knowledgeengine-v9/providers/Microsoft.Web/sites/fn-kecore-knowledgeengine3-v9"
+az rest --method post --url "$site/syncfunctiontriggers?api-version=2022-03-01" -o none
+az rest --method get --url "$site/hostruntime/admin/functions?api-version=2022-03-01" --query "[].name" -o tsv | Select-String enrich
+```
+
+-> `kecore_enrich`, `kecore_enrich_summary` : le code de `7798a72` est servi. Correction proposée du
+script (attendre que l'hôte serve toutes les fonctions déclarées dans `kecore_func/function_app.py`,
+échouer sinon) : en attente de validation.
