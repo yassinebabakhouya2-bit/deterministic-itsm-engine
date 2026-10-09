@@ -2865,3 +2865,11 @@ plus (gardé pour que les configs clients se chargent). Une session ancienne res
 choix peut toujours être choisie. **Limite connue** : l'ordre est celui du moteur ; sur cette question
 précise, la 1re est KB0217 « Transfert d'appels TEAMS » et la bonne fiche, KB0233, est 3e (classement,
 §19.11) : elle sera dans « Autres fiches proches », pas affichée d'emblée. Tests : 107.
+
+**Premier essai déployé (commit `3ba23b2`, 2026-10-09).** « comment attribuer la ligne teams » →
+KB0217 « Transfert d'appels TEAMS » affichée comme fiche la plus proche (11 étapes) ; autres fiches
+proches : KB0032 (cache Teams), KB0266 « LIBRE - A REUTILISER » (fiche vide de réemploi, indexée comme
+une vraie fiche), KB0233 « Associate a phone line » -- la bonne, 4e. L'écran fait ce qui était demandé ;
+la fiche ne l'est pas : le classement (§19.11) est le problème, pas l'affichage. Le résumé de la carte
+répète le titre (pour une fiche du moteur, `summary` = son libellé). Arrêt des changements de code à la
+demande de Yassine, le temps de faire le point (voir la suite de cette section).
