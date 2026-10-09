@@ -1,8 +1,9 @@
 """Guided resolution state machine: pure transitions, injected ports, no escalation.
 
-LOCATE  -> find the exact fiche (retrieval score + margin, cross-checked by an LLM
-           judge; otherwise the user picks among <= 3 fiches; after `max_rounds`
-           unanswered clarifications the best fiche is taken as "approximate").
+LOCATE  -> find the fiche (retrieval score + margin, cross-checked by an LLM judge);
+           when none is certain, the closest one is taken as "approximate" -- the
+           user is never asked to pick from a list first: the fiche is shown with
+           the next closest ones (<= 3) one click away.
 GUIDING -> the chosen fiche is shown first (title, summary, every step) and nothing
            runs until the user starts it (or says it is the wrong fiche); its steps
            are then walked one by one (done / blocked / explain / back); help comes
@@ -41,7 +42,7 @@ class Thresholds:
     exact_score: float = 2.0      # reranker score (0-4) under which a fiche is never "exact"
     margin_min: float = 0.5       # gap to the 2nd fiche needed to be exact without the judge
     judge_min_score: float = 1.0  # the judge may not pick a fiche scoring below this
-    max_rounds: int = 2           # clarification rounds before the best fiche is taken
+    max_rounds: int = 2           # unused since 2026-10-09 (no list to pick from); kept so client configs still load
 
 
 @dataclass
@@ -210,7 +211,8 @@ def _start_guiding(st: GuideState, cand: KbCandidate, p: Ports, out: List[dict],
     if g is None:
         st.rejected_parent_ids.append(cand.parent_id)
         return False
-    st.guide, st.selected_parent_id, st.choices = g, cand.parent_id, []
+    st.guide, st.selected_parent_id = g, cand.parent_id
+    st.choices = _choices([c for c in st.candidates if c.parent_id != cand.parent_id])   # the next closest
     st.phase, st.current_step, st.step_attempts, st.locate_rounds = Phase.GUIDING, 0, 0, 0
     st.steps_started = False                      # the fiche is shown; the user starts its steps
     out.append({"kind": "guide", "guide": g.model_dump()})
@@ -262,7 +264,7 @@ def _open_answer(st: GuideState, p: Ports, out: List[dict], evt: Event) -> None:
                 "next_check": res.get("next_check"), "closed": bool(res.get("closed"))})
 
 
-def _locate(st: GuideState, evt: Event, p: Ports, out: List[dict], force_choice: bool = False,
+def _locate(st: GuideState, evt: Event, p: Ports, out: List[dict], skip_judge: bool = False,
             picked: Optional[KbCandidate] = None) -> None:
     th = p.thresholds
     if picked is not None:
@@ -277,33 +279,22 @@ def _locate(st: GuideState, evt: Event, p: Ports, out: List[dict], force_choice:
         top = cands[0]
         strong = top.reranker_score >= th.exact_score and (len(cands) == 1 or margin(cands) >= th.margin_min)
         judged = None
-        if not force_choice and (len(cands) > 1 or not strong):
+        if not skip_judge and (len(cands) > 1 or not strong):
             try:
                 judged = p.judge(st, cands[:3])
             except Exception:
                 judged = None
         by_id = {c.parent_id: c for c in cands[:3]}
         exact = None
-        if not force_choice:
+        if not skip_judge:
             if strong and judged in (None, top.parent_id):
                 exact = top
             elif not strong and judged in by_id and by_id[judged].reranker_score >= th.judge_min_score:
                 exact = by_id[judged]
-        if exact is not None:
-            if _start_guiding(st, exact, p, out, forced=False, approximate=False):
-                return
-            continue                                   # model says "not applicable": next fiche
-        if not force_choice and st.locate_rounds >= th.max_rounds:
-            if _start_guiding(st, top, p, out, forced=False, approximate=True):
-                out.insert(0, {"kind": "notice", "level": "info",
-                               "text": "Je prends la fiche la plus proche. Dites-moi à l'étape suivante si ce n'est pas la bonne."})
-                return
-            continue
-        st.choices, st.phase = _choices(cands), Phase.LOCATE
-        st.locate_rounds += 1
-        out.append({"kind": "choose", "choices": [c.model_dump() for c in st.choices],
-                    "strong": strong, "round": st.locate_rounds})
-        return
+        # nothing certain: the closest fiche, marked approximate -- never a list to pick from first
+        if _start_guiding(st, exact or top, p, out, forced=False, approximate=exact is None):
+            return
+        # the model says "not applicable": next fiche
     _open_answer(st, p, out, evt)
 
 
@@ -315,7 +306,7 @@ def _next_fiche(st: GuideState, evt: Event, p: Ports, out: List[dict], text: str
     st.guide, st.selected_parent_id, st.current_step, st.step_attempts = None, None, 0, 0
     st.phase, st.locate_rounds = Phase.LOCATE, 0
     out.append({"kind": "notice", "level": "info", "text": text})
-    _locate(st, evt, p, out, force_choice=True)
+    _locate(st, evt, p, out, skip_judge=True)
 
 
 def _preview(st: GuideState, evt: Event, p: Ports, out: List[dict]) -> None:
@@ -324,10 +315,16 @@ def _preview(st: GuideState, evt: Event, p: Ports, out: List[dict]) -> None:
     as help on a step the user has not reached."""
     act = evt.action
     if act == "start":
-        st.steps_started = True
+        st.steps_started, st.choices = True, []
         _emit_step(st, out)
+    elif act and act.startswith("pick:"):          # one of the next closest fiches, shown in its place
+        i = int(act[5:]) - 1
+        if 0 <= i < len(st.choices):
+            picked = next((c for c in st.candidates if c.parent_id == st.choices[i].parent_id), None)
+            if picked is not None:
+                _start_guiding(st, picked, p, out, forced=True, approximate=False)
     elif act == "wrong_fiche":
-        _next_fiche(st, evt, p, out, "Compris, ce n'est pas la bonne fiche. Voici d'autres pistes.")
+        _next_fiche(st, evt, p, out, "Compris, ce n'est pas la bonne fiche. Voici la plus proche ensuite.")
     elif act is None:
         if not _ingest(st, evt, p) and not evt.attachments:
             return
@@ -353,7 +350,7 @@ def _guiding(st: GuideState, evt: Event, p: Ports, out: List[dict]) -> None:
     elif act == "solved_no":
         _next_fiche(st, evt, p, out, "D'accord, essayons une autre piste.")
     elif act == "wrong_fiche":
-        _next_fiche(st, evt, p, out, "Compris, ce n'est pas la bonne fiche. Voici d'autres pistes.")
+        _next_fiche(st, evt, p, out, "Compris, ce n'est pas la bonne fiche. Voici la plus proche ensuite.")
     elif act in ("blocked", "explain") or act is None:
         said = _ingest(st, evt, p)
         if act is None and not said and not evt.attachments:

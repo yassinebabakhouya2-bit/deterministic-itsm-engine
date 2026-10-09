@@ -94,14 +94,14 @@ def test_a_fiche_the_engine_shows_is_guided_with_its_verified_steps():
     assert ("fiche", "KB0120", "r1") in engine.calls
 
 
-def test_a_question_of_the_engine_becomes_a_choice_and_the_pick_is_guided():
+def test_a_question_of_the_engine_shows_its_first_fiche_and_the_other_is_guided_on_a_click():
     engine = Engine(question_decision())
     p = with_engine(fallback(), engine, "client-s")
     r1 = advance(new(), ev("problème de compte", kind="created"), p, T0)
-    assert r1.state.phase == Phase.LOCATE
-    assert [c.parent_id for c in r1.state.choices] == ["kefind:r1:KB0120", "kefind:r1:KB0200"]
+    assert r1.state.guide.parent_id == "kefind:r1:KB0120" and r1.state.guide.approximate
+    assert [c.parent_id for c in r1.state.choices] == ["kefind:r1:KB0200"]
     engine.run_id = "r2"  # a new kecore run between the question and the pick
-    r2 = advance(r1.state, ev(action="pick:2"), with_engine(fallback(), engine, "client-s"), T0)
+    r2 = advance(r1.state, ev(action="pick:1"), with_engine(fallback(), engine, "client-s"), T0)
     assert r2.state.guide.parent_id == "kefind:r1:KB0200" and ("fiche", "KB0200", "r1") in engine.calls
     st = advance(r2.state, ev(action="start"), with_engine(fallback(), engine, "client-s"), T0).state
     r3 = advance(st, ev(action="explain"), with_engine(fallback(), engine, "client-s"), T0)
@@ -135,8 +135,8 @@ def test_a_rejected_engine_fiche_is_never_shown_again():
     p = with_engine(fallback(), engine, "client-s")
     st = advance(new(), ev("Compte bloqué", kind="created"), p, T0).state
     r = advance(st, ev(action="wrong_fiche"), with_engine(fallback(), engine, "client-s"), T0)
-    assert r.state.phase == Phase.LOCATE and "kefind:r1:KB0120" in r.state.rejected_parent_ids
-    assert [c.parent_id for c in r.state.choices] == ["kefind:r1:KB0200"]
+    assert "kefind:r1:KB0120" in r.state.rejected_parent_ids
+    assert r.state.guide.parent_id == "kefind:r1:KB0200" and r.state.guide.approximate
     engine.run_id = "r2"  # rejected stays rejected whatever run proposes it again
     r2 = advance(r.state, ev("toujours bloqué"), with_engine(fallback(), engine, "client-s"), T0)
     assert all(split_parent(c.parent_id)[1] != "KB0120" for c in r2.state.candidates)
@@ -167,16 +167,16 @@ def test_when_every_semantic_fiche_is_rejected_the_index_is_not_asked():
     assert KefindPorts(engine, "client-s", fallback()).retrieve(st) == []
 
 
-def test_a_fiche_decided_by_words_during_an_embedding_outage_is_offered_not_shown():
+def test_a_fiche_decided_by_words_during_an_embedding_outage_is_only_the_closest_never_certain():
     engine = Engine(fiche_decision(), mode="degraded")
     r = advance(new(), ev("Compte bloqué", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
-    assert r.state.phase == Phase.LOCATE and r.state.guide is None
-    assert [c.parent_id for c in r.state.choices][0] == "kefind:r1:KB0120"
+    assert r.state.guide.parent_id == "kefind:r1:KB0120" and r.state.guide.approximate
+    assert not r.state.steps_started
     assert KefindPorts(engine, "client-s", fallback()).judge(r.state, r.state.candidates) is None
     # the same decision made by meaning is shown and guided at once
     shown = advance(new(), ev("Compte bloqué", kind="created"),
                     with_engine(fallback(), Engine(fiche_decision(), mode="semantic"), "client-s"), T0)
-    assert shown.state.phase == Phase.GUIDING and shown.state.guide.parent_id == "kefind:r1:KB0120"
+    assert shown.state.guide.parent_id == "kefind:r1:KB0120" and not shown.state.guide.approximate
 
 
 def test_help_on_an_engine_step_sees_the_whole_fiche():

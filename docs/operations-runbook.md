@@ -2852,3 +2852,16 @@ Vérifier : un nouveau diagnostic « Mon compte est bloqué, je n'arrive plus à
 affiche KB0120 LOCKED ACCOUNT avec ses étapes et le bouton « Démarrer les étapes », sans « Étape 1 sur
 … » ; après le clic, l'étape 1. `/classic` montre les anciennes conversations sans zone de saisie.
 Pas encore déployé à la date de cette entrée.
+
+**Plus de liste à choisir (2026-10-09, après le premier essai).** Retour après « comment attribuer une
+ligne teams » : l'écran « Quelle fiche correspond à votre problème ? » (KB0217, KB0032, KB0233) ne
+convient pas, il faut afficher la fiche pertinente et son détail. Désormais (`fsm._locate`) : quand
+aucune fiche n'est certaine (question du moteur, désaccord du juge, index sans fiche nette, panne des
+embeddings), la 1re fiche est affichée directement, marquée « la plus proche » (`approximate`), avec
+ses étapes en détail ; les 3 suivantes sont listées dessous en « Autres fiches proches » (un clic la
+remplace, sans la rejeter) ; « Ce n'est pas la bonne fiche » affiche la suivante au lieu d'une liste.
+Les étapes ne démarrent toujours qu'au clic « Démarrer les étapes ». `Thresholds.max_rounds` ne sert
+plus (gardé pour que les configs clients se chargent). Une session ancienne restée sur une liste de
+choix peut toujours être choisie. **Limite connue** : l'ordre est celui du moteur ; sur cette question
+précise, la 1re est KB0217 « Transfert d'appels TEAMS » et la bonne fiche, KB0233, est 3e (classement,
+§19.11) : elle sera dans « Autres fiches proches », pas affichée d'emblée. Tests : 107.

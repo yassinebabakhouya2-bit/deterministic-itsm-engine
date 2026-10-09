@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestration"))
 
-from guide.contracts import Event, GuideState, KbCandidate, Phase
+from guide.contracts import Choice, Event, GuideState, KbCandidate, Phase
 from guide.fsm import Ports, Thresholds, advance, check_guide, fallback_guide
 
 T0 = datetime(2026, 9, 30, tzinfo=timezone.utc)
@@ -74,12 +74,23 @@ def test_strong_match_shows_the_fiche_and_waits_for_the_user_to_start_its_steps(
     assert s.outbox == [{"kind": "step", "index": 0, "step": s.state.guide.steps[0].model_dump()}]
 
 
-def test_a_fiche_rejected_before_its_steps_start_proposes_the_others():
+def test_a_fiche_rejected_before_its_steps_start_shows_the_next_closest():
     p = ports([cand("A", 3.5), cand("B", 2.0), cand("C", 1.5)])
     st = advance(new(), ev("x", kind="created"), p, T0).state
+    assert [c.parent_id for c in st.choices] == ["B", "C"]          # the next closest, one click away
     r = advance(st, ev(action="wrong_fiche"), p, T0)
-    assert r.state.phase == Phase.LOCATE and r.state.guide is None and "A" in r.state.rejected_parent_ids
-    assert [c.parent_id for c in r.state.choices] == ["B", "C"]
+    assert r.state.guide.parent_id == "B" and r.state.guide.approximate and not r.state.steps_started
+    assert "A" in r.state.rejected_parent_ids and [c.parent_id for c in r.state.choices] == ["C"]
+
+
+def test_another_close_fiche_replaces_the_shown_one_without_rejecting_it():
+    p = ports([cand("A", 2.2), cand("B", 2.1), cand("C", 1.0)])
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    r = advance(st, ev(action="pick:2"), p, T0)
+    assert r.state.guide.parent_id == "C" and not r.state.guide.approximate and not r.state.steps_started
+    assert r.state.rejected_parent_ids == [] and [c.parent_id for c in r.state.choices] == ["A", "B"]
+    s = advance(r.state, ev(action="start"), p, T0)
+    assert s.state.steps_started and s.state.choices == []
 
 
 def test_a_description_before_the_start_searches_again_instead_of_helping_on_a_step():
@@ -102,13 +113,20 @@ def test_a_session_stored_before_the_preview_existed_keeps_walking_its_steps():
     assert advance(old, ev(action="done"), p, T0).state.current_step == 1
 
 
-def test_ambiguous_match_asks_to_choose_and_pick_starts_the_guide():
+def test_an_uncertain_match_shows_the_closest_fiche_never_a_list_to_pick_from():
     p = ports([cand("A", 2.2), cand("B", 2.1), cand("C", 1.0)])
-    r1 = advance(new(), ev("probleme", kind="created"), p, T0)
-    assert r1.state.phase == Phase.LOCATE and [c.parent_id for c in r1.state.choices] == ["A", "B", "C"]
-    r2 = advance(r1.state, ev(action="pick:2"), p, T0)
-    assert r2.state.phase == Phase.GUIDING and r2.state.guide.parent_id == "B"
-    assert r2.state.choices == []
+    r = advance(new(), ev("probleme", kind="created"), p, T0)
+    assert r.state.phase == Phase.GUIDING and r.state.guide.parent_id == "A" and r.state.guide.approximate
+    assert [m["kind"] for m in r.outbox] == ["guide"] and [c.parent_id for c in r.state.choices] == ["B", "C"]
+
+
+def test_a_choice_left_by_an_older_session_can_still_be_picked():
+    p = ports([cand("A", 2.2), cand("B", 2.1)])
+    st = new()
+    st.candidates = [cand("A", 2.2), cand("B", 2.1)]
+    st.choices = [Choice(parent_id="A", title="A", score=2.2), Choice(parent_id="B", title="B", score=2.1)]
+    r = advance(st, ev(action="pick:2"), p, T0)
+    assert r.state.guide.parent_id == "B" and not r.state.guide.approximate
 
 
 def test_judge_can_break_a_tie_but_not_override_a_strong_match():
@@ -116,16 +134,12 @@ def test_judge_can_break_a_tie_but_not_override_a_strong_match():
     assert advance(new(), ev("x", kind="created"), tie, T0).state.guide.parent_id == "B"
     strong = ports([cand("A", 3.5), cand("B", 1.0)], judge=lambda st, c: "B")
     r = advance(new(), ev("x", kind="created"), strong, T0)
-    assert r.state.phase == Phase.LOCATE                       # disagreement -> the user decides
+    assert r.state.guide.parent_id == "A" and r.state.guide.approximate   # disagreement -> not certain
 
 
-def test_unanswered_clarifications_end_with_best_fiche_marked_approximate():
-    p = ports([cand("A", 1.5), cand("B", 1.4)])
-    st = advance(new(), ev("a", kind="created"), p, T0).state
-    st = advance(st, ev("b"), p, T0).state
-    r = advance(st, ev("c"), p, T0)
-    assert r.state.phase == Phase.GUIDING and r.state.guide.approximate
-    assert r.outbox[0]["kind"] == "notice"
+def test_a_certain_match_is_not_marked_approximate():
+    r = advance(new(), ev("x", kind="created"), ports(), T0)
+    assert not r.state.guide.approximate
 
 
 def test_walkthrough_done_back_and_solved():
@@ -161,12 +175,12 @@ def test_explain_does_not_count_as_a_failed_attempt():
     assert r.state.step_attempts == 0 and r.outbox[0]["kind"] == "help"
 
 
-def test_wrong_fiche_proposes_others_and_never_the_rejected_one():
+def test_wrong_fiche_shows_the_next_one_and_never_the_rejected_one():
     p = ports([cand("A", 3.5), cand("B", 2.0), cand("C", 1.5)])
     st = started(p=p)
     r = advance(st, ev(action="wrong_fiche"), p, T0)
-    assert r.state.phase == Phase.LOCATE and "A" in r.state.rejected_parent_ids
-    assert [c.parent_id for c in r.state.choices] == ["B", "C"]
+    assert r.state.guide.parent_id == "B" and "A" in r.state.rejected_parent_ids
+    assert [c.parent_id for c in r.state.choices] == ["C"]
 
 
 def test_problem_persists_moves_to_next_fiche_and_falls_back_to_an_open_answer():
@@ -188,10 +202,10 @@ def test_model_refusal_skips_to_next_fiche_but_a_user_pick_is_never_refused():
     p = ports([cand("A", 3.5), cand("B", 3.0)], build=build)
     r = advance(new(), ev("x", kind="created"), p, T0)
     assert r.state.guide.parent_id == "B" and "A" in r.state.rejected_parent_ids
-    p2 = ports([cand("A", 2.2), cand("B", 2.1)], build=lambda st, c, ch: draft(applicable=False))
-    st = advance(new(), ev("x", kind="created"), p2, T0).state
+    p2 = ports([cand("A", 2.2), cand("B", 2.1), cand("C", 2.0)], build=lambda st, c, ch: draft(applicable=False))
+    st = advance(new(), ev("x", kind="created"), ports([cand("A", 2.2), cand("B", 2.1), cand("C", 2.0)]), T0).state
     r2 = advance(st, ev(action="pick:1"), p2, T0)
-    assert r2.state.phase == Phase.GUIDING and r2.state.guide.origin == "fallback"
+    assert r2.state.guide.parent_id == "B" and r2.state.guide.origin == "fallback"
 
 
 def test_unusable_draft_falls_back_to_the_fiche_own_numbered_lines():

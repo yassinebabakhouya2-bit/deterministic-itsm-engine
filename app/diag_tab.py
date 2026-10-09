@@ -581,8 +581,11 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <details style="margin-top:10px"><summary class="mut" style="cursor:pointer">▸ voir les {{ n }} étape{{ 's' if n > 1 }} en détail</summary>
 <ol style="margin:8px 0 0;padding-left:22px">{% for st in g.steps %}<li style="margin-bottom:6px"><b>{{ st.title }}</b><div style="white-space:pre-wrap">{{ st.instruction }}</div></li>{% endfor %}</ol></details>
 {% if g.source_url %}<div class="mut" style="margin-top:8px">Source : <a class="l" href="{{ g.source_url }}" rel="noopener noreferrer">ouvrir la fiche</a></div>{% endif %}
+{% if g.approximate %}<div class="mut" style="margin-top:8px">C'est la fiche la plus proche de votre description : vérifiez qu'elle correspond avant de démarrer.</div>{% endif %}
 <div class="row"><button class="ok" type="submit" name="action" value="start">▶ Démarrer les étapes</button>
-<button class="alt" type="submit" name="action" value="wrong_fiche">Ce n'est pas la bonne fiche</button></div></div>
+<button class="alt" type="submit" name="action" value="wrong_fiche">Ce n'est pas la bonne fiche</button></div>
+{% if s.choices %}<div class="mut" style="margin-top:12px">Autres fiches proches :{% for c in s.choices %}
+<button class="lnk" type="submit" name="action" value="pick:{{ loop.index }}">{{ c.title }}</button>{% endfor %}</div>{% endif %}</div>
 {% endif %}
 
 {% if g and s.state == 'GUIDING' and s.steps_started %}
