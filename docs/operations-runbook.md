@@ -3109,3 +3109,31 @@ az rest --method get --url "$site/hostruntime/admin/functions?api-version=2022-0
 -> `kecore_enrich`, `kecore_enrich_summary` : le code de `7798a72` est servi. Correction proposée du
 script (attendre que l'hôte serve toutes les fonctions déclarées dans `kecore_func/function_app.py`,
 échouer sinon) : en attente de validation.
+
+### 19.18 Revue pré-vol des commits déployés : défauts connus, pas encore corrigés (2026-10-09)
+
+Revue en lecture seule de `366cb55..6899d63` confrontée aux données réelles de client-s (quatre
+relecteurs, chaque constat soumis à un contradicteur chargé de le réfuter) : 20 constats, 14 confirmés
+(8 défauts distincts ci-dessous), 6 réfutés. **Rien n'est encore corrigé** ; cette liste dit ce qu'il
+faut savoir avant de se fier aux sorties de §19.14-19.16.
+
+| # | Gravité | Défaut | Effet sur le terrain |
+|---|---|---|---|
+| 1 | bloquant pour §19.15 | `config/reference-questions.yaml` cite `KB0233` / `KB0120` ; sur client-s l'identifiant d'une fiche est le nom du document (`KB\d{5,}` ne prend pas les numéros à 4 chiffres) : `KB0233 -  Associate a phone line`, `KB0120- LOCKED ACCOUNT` | l'import ignore les deux questions sans le dire |
+| 2 | majeur | les blocs §19.13-19.16 et les deux scripts de déploiement ne vérifient ni l'échec de `git`, ni un arbre sale ou en conflit, ni le commit déployé ; `deploy-kecore-function.ps1` accepte la liste de fonctions de l'ancien hôte | l'incident §19.17 peut se reproduire |
+| 3 | mineur, touche le run en cours | un délai de lecture ou une connexion coupée vers gpt-4o sort en `TimeoutError` / `RemoteDisconnected` (pas `LLMError`), n'est pas réessayé (`kecore/azure.py`) et n'est pas rattrapé par `make_enrichment` | un seul appel lent fait échouer tout le bloc `enrichment` du run (`enrichment.error`) ; les autres lots continuent d'écrire dans le dossier d'un run déjà publié |
+| 4 | mineur | le catalogue d'étiquetage (`kefindfiches`) n'est réécrit que par un run de tickets, pas par le run kecore | après la règle 3, `/labels` propose encore KB0266 et les autres fiches exclues ; l'import des questions valide contre ce catalogue périmé ; la phrase de §19.14 est fausse |
+| 5 | mineur | `exclusion-config.json` lu en UTF-8 strict (un BOM de PowerShell 5.1 fait échouer le run à `report`) ; un `force_include` qui ne correspond à aucune fiche (id recopié de `report.md`, où les espaces sont réduits, ou écrit en ASCII) n'est signalé nulle part | fiche exclue à tort qui reste exclue, ou run entier en échec |
+| 6 | mineur | le bloc d'inspection de §19.16 télécharge ~182 fichiers de contenu client dans la racine du dépôt (non ignorés par git) et les relit sans `-Encoding UTF8` | accents illisibles dans ce qu'on regarde ; données client à côté du code |
+| 7 | mineur | dans un bloc collé, un `POST` qui échoue laisse `$run` / `$sb` / `$s` d'un run précédent de la même session | les chiffres d'un ancien run affichés comme ceux du nouveau |
+| 8 | mineur | §19.15 lance le scoreboard avant le clic d'import ; sa sortie (`references`) ne montre ni les questions ni la fiche montrée | mesure à 0 question ; rien à lire sur le cas KB0233 |
+| 9 | mineur, préexistant | pendant un scoreboard, une panne d'embeddings fait décider une question par les mots sans que l'enregistrement le dise (`kefind/funnel_engine.py:_vector`) | un verdict de non-régression qui ne correspond pas à `/find`, sans marque |
+
+Réfutés (non-défauts sur les données réelles) : questions de référence dans les moitiés A/B du seuil
+(voulu, et aucun seuil n'est appliqué à une carte par le sens) ; verdicts sur le rejeu sans plancher
+(sans effet en mode sémantique) ; étiquette pointant une fiche exclue (aucune sur client-s) ; mots
+anglais « teams/office » pris pour des applications (non observé) ; liste de fonctions périmée (déjà
+traitée en §19.17) ; ordre du bloc §19.15 hors cas déjà connus.
+
+Le bloc donné à l'opérateur pour le run de la passe A (même jour) évite déjà #6 (dossier temporaire,
+`-Encoding UTF8`) et s'arrête si le run n'est pas `Completed`.
