@@ -30,6 +30,7 @@ import kecore_pipeline as pipeline
 import kefind_service as finder
 from kecore.tickets import scrub as scrub_tickets
 from kecore.tickets import scrub_entity, ticket_text
+from kefind import semantic as sem
 from kefind.funnel import FUNNEL_VERSION, FunnelConfig, find
 from kefind.interpret import interpret
 
@@ -155,9 +156,11 @@ def _finding_row(client: str, row_key: str, finding, run_id: str, interpreted: b
 
 
 def run_batch(storage: pipeline.Storage, table, payload: dict, start: int, end: int,
-              llm=None, config: FunnelConfig | None = None) -> dict:
+              llm=None, config: FunnelConfig | None = None, embedder=None) -> dict:
     """One slice [start, end) of the client's scrubbed tickets, tallied by what the funnel does; each
-    ticket's finding is merged into its row. One ticket that fails is counted, never fatal."""
+    ticket's finding is merged into its row. One ticket that fails is counted, never fatal. With a
+    semantic index and an ``embedder`` (recorded), each ticket is decided by meaning, exactly as
+    /kecore/find decides it; ``modes`` counts how each ticket was decided."""
     client = payload["client"]
     kbmap = _map_for(storage, payload)
     config = config or finder.funnel_config(storage, client)
@@ -167,14 +170,24 @@ def run_batch(storage: pipeline.Storage, table, payload: dict, start: int, end: 
     empty = 0
     errors = 0
     interpret_failures = 0
+    modes: Counter = Counter()
+    semantic = kbmap.semantic is not None and embedder is not None and getattr(embedder, "model_id", None) == kbmap.semantic.model
     for entity in entities:
         text = ticket_text(entity)
         if not text.strip():
             empty += 1
             continue
         try:
-            interpretation = interpret(llm, text, kbmap.dictionary) if payload.get("interpret", True) and llm else None
-            finding = find(kbmap, text, config=config, interpretation=interpretation)
+            vector = None
+            if semantic:
+                try:
+                    vector = embedder.embed([sem.query_text(text)])[0]
+                except Exception:  # decided by words for this ticket, and counted as degraded
+                    vector = None
+            modes["semantic" if vector is not None else "degraded" if kbmap.semantic is not None else "words"] += 1
+            asked = payload.get("interpret", True) and llm and vector is None
+            interpretation = interpret(llm, text, kbmap.dictionary) if asked else None
+            finding = find(kbmap, text, config=config, interpretation=interpretation, query_vector=vector)
             interpreted = interpretation is not None and interpretation.error is None
             if interpretation is not None and interpretation.error is not None:
                 interpret_failures += 1
@@ -187,12 +200,14 @@ def run_batch(storage: pipeline.Storage, table, payload: dict, start: int, end: 
         kinds[finding.kind] += 1
         reasons[finding.reason] += 1
     return {"run_id": kbmap.run_id, "tickets": len(entities), "empty": empty, "errors": errors,
-            "interpret_failures": interpret_failures, "kinds": dict(kinds), "reasons": dict(reasons)}
+            "interpret_failures": interpret_failures, "kinds": dict(kinds), "reasons": dict(reasons),
+            "modes": dict(modes)}
 
 
 def merge_runs(client: str, parts: list[dict]) -> dict:
     merged = {"client": client, "run_id": parts[0]["run_id"] if parts else None,
-              "tickets": 0, "empty": 0, "errors": 0, "interpret_failures": 0, "kinds": {}, "reasons": {}}
+              "tickets": 0, "empty": 0, "errors": 0, "interpret_failures": 0, "kinds": {}, "reasons": {},
+              "modes": {}}
     for part in parts:
         merged["tickets"] += part["tickets"]
         merged["empty"] += part["empty"]
@@ -202,6 +217,8 @@ def merge_runs(client: str, parts: list[dict]) -> dict:
             merged["kinds"][key] = merged["kinds"].get(key, 0) + count
         for key, count in part["reasons"].items():
             merged["reasons"][key] = merged["reasons"].get(key, 0) + count
+        for key, count in (part.get("modes") or {}).items():
+            merged["modes"][key] = merged["modes"].get(key, 0) + count
     return merged
 
 

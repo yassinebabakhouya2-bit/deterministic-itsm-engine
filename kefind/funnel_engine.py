@@ -13,6 +13,7 @@ from pathlib import Path
 from kecore.profile import Profile
 from scoreboard.engines import Decision, Usage
 
+from . import semantic as sem
 from .funnel import FunnelConfig, KBMap, find
 from .interpret import interpret
 from .io import load_decomposed_jsonl
@@ -25,10 +26,11 @@ class FunnelEngine:
 
     def __init__(self, maps: dict[str, KBMap] | None = None, fiches_path: str | None = None,
                  profile_path: str | None = None, config: FunnelConfig | None = None, name: str = "kefind-funnel",
-                 llm=None):
+                 llm=None, embedder=None):
         self.name = name
         self.config = config or FunnelConfig()
         self.llm = llm  # interprets each ticket (kefind.interpret); None: code only
+        self.embedder = embedder  # the semantic mode's question vectors (recorded); None: words only
         self._maps = dict(maps or {})
         self._fiches_path = fiches_path
         self._profile_path = profile_path
@@ -54,8 +56,10 @@ class FunnelEngine:
         kbmap = self._map_for(ticket.client)
         if kbmap is None:
             return Decision("abstain", error=f"no KB map for client {ticket.client!r}")
-        interpretation = interpret(self.llm, ticket.text, kbmap.dictionary) if self.llm is not None else None
-        finding = find(kbmap, ticket.text, config=self.config, interpretation=interpretation)
+        vector = self._vector(kbmap, ticket.text)
+        interpretation = (interpret(self.llm, ticket.text, kbmap.dictionary)
+                          if self.llm is not None and vector is None else None)
+        finding = find(kbmap, ticket.text, config=self.config, interpretation=interpretation, query_vector=vector)
         usage = Usage(search_calls=1)
         if interpretation is not None:
             usage.input_tokens, usage.output_tokens = interpretation.usage.input_tokens, interpretation.usage.output_tokens
@@ -69,8 +73,20 @@ class FunnelEngine:
         kbmap = self._map_for(ticket.client)
         if kbmap is None:
             return []
-        finding = find(kbmap, ticket.text, config=replace(self.config, top_k=k))
+        finding = find(kbmap, ticket.text, config=replace(self.config, top_k=k), query_vector=self._vector(kbmap, ticket.text))
         return [(f, kbmap.label(f)) for f in finding.fiches[:k]]
+
+    def _vector(self, kbmap: KBMap, text: str):
+        """The question's vector when the map has an index and the embedder is the index's model; None
+        otherwise or on failure (the finding then says it was decided by words: ``degraded``)."""
+        if kbmap.semantic is None or self.embedder is None:
+            return None
+        if getattr(self.embedder, "model_id", None) != kbmap.semantic.model:
+            return None
+        try:
+            return self.embedder.embed([sem.query_text(text)])[0]
+        except Exception:
+            return None
 
     @classmethod
     def from_config(cls, config: dict) -> "FunnelEngine":

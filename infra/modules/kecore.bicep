@@ -53,6 +53,9 @@ param kecoreDeployment string = 'gpt-4o'
 @description('Azure OpenAI API version used by kecore (same as the local runs it replaces)')
 param kecoreApiVersion string = '2024-10-21'
 
+@description('text-embedding-3-large deployment (foundry.bicep): the semantic index of each kecore run and the vector of each question (kefind.semantic). Vectors feed code; the model never picks a fiche.')
+param kecoreEmbeddingDeployment string = 'text-embedding-3-large'
+
 @description('Clients served by the V10 engine: one kecore-<client> and one tickets-<client> container each. The Function refuses any client not listed here (deny-by-default).')
 param clients array = [
   'clienta'
@@ -181,6 +184,10 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'KECORE_AOAI_API_VERSION'
           value: kecoreApiVersion
+        }
+        {
+          name: 'KECORE_AOAI_EMBEDDING_DEPLOYMENT'
+          value: kecoreEmbeddingDeployment
         }
         {
           name: 'KECORE_BLOB_ENDPOINT'

@@ -186,6 +186,37 @@ class TextTest(unittest.TestCase):
         finding = find(example_map(), "Le clavier du poste ne répond plus du tout depuis ce matin.")
         self.assertEqual(finding.kind, "abstain")
 
+    def test_the_french_negation_non_does_not_pull_in_an_unrelated_fiche(self):
+        """"non attribuée" should not drag in any fiche that happens to say "non" somewhere, the way
+        "pas" (already a stopword) does not; it is a function word, not a description of the problem."""
+        kbmap = KBMap("clienta", filler() + [
+            make("KB0233 - Associate a phone line", "Go to the admin center. Assign a phone line to the user.",
+                 entities=["app:teams"]),
+            make("KB0195 - Suspension procedures", "Verifiez si le compte reste non active apres la procedure.",
+                 entities=["app:teams"]),
+        ])
+        interpretation = Interpretation(terms=["ligne Teams non attribuée", "assign Teams line"])
+        finding = find(kbmap, "Comment attribuer une ligne Teams non attribuée ?", interpretation=interpretation)
+        offered = ([finding.fiche_id] if finding.fiche_id else
+                   [o.get("fiche_id") for o in finding.options if o.get("fiche_id")])
+        self.assertNotIn("KB0195 - Suspension procedures", offered)
+
+
+class IdentifierCaseTest(unittest.TestCase):
+    """The question's vector is case-folded: "kb893803" and "KB893803" share one vector, so they must
+    share one reading of the ticket's identifiers too."""
+
+    def test_an_identifier_reads_the_same_whatever_its_case(self):
+        from kefind.funnel import canonical_identifiers
+
+        self.assertEqual(canonical_identifiers("probleme kb893803 et inc0010005, erreur 0X80070005"),
+                         "probleme KB893803 et INC0010005, erreur 0x80070005")
+        self.assertEqual(canonical_identifiers("la taskbar et le kbd, request 12"), "la taskbar et le kbd, request 12")
+        entities = [next(s for s in find(example_map(), text).trace if s["step"] == "entities")["ticket"]
+                    for text in ("erreur 0X80070005 apres kb893803", "erreur 0x80070005 apres KB893803")]
+        self.assertEqual(entities[0], entities[1])
+        self.assertIn("err:0x80070005", entities[0])
+
 
 class InterpretationTest(unittest.TestCase):
     """The LLM's search terms bridge languages; they rank, they never filter."""

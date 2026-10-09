@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
@@ -30,6 +30,14 @@ class BlobStorage:
 
     def write(self, container: str, name: str, data: bytes) -> None:
         self._service.get_blob_client(container, name).upload_blob(data, overwrite=True)
+
+    def write_if_absent(self, container: str, name: str, data: bytes) -> bool:
+        """Writes only a blob that does not exist yet (If-None-Match: *); False when it did."""
+        try:
+            self._service.get_blob_client(container, name).upload_blob(data, overwrite=False)
+        except ResourceExistsError:
+            return False
+        return True
 
     def delete(self, container: str, name: str) -> None:
         try:

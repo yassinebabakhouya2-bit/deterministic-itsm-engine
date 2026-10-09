@@ -18,7 +18,13 @@ are the fiche's own sentences, verified at decomposition:
   "How to share mobile phone connection" without the interpretation, the SSPR password reset fiche
   with it);
 - a fiche of the engine is guided with its verified steps, in order (25 at most), every step marked
-  verbatim; help on a step comes from the same help port, with the fiche's full text as context.
+  verbatim; help on a step comes from the same help port, with the fiche's full text as context;
+- the engine decided by meaning (``mode: "semantic"``, a run with a calibrated semantic index) and
+  found nothing close, or every fiche it offered was rejected: that is the answer -- no search index
+  and no model judge pick a fiche instead (the free-form OPEN answer follows, labelled as such);
+- the engine decided by words because the embedding service was down (``mode: "degraded"``): its
+  fiche is offered, never shown as THE fiche -- the same question gets a semantic decision once the
+  service is back, so an outage never guides anyone on a fiche the person did not confirm.
 
 A candidate of the engine is ``kefind:<run id>:<fiche id>``: the KB map that made the decision is
 pinned in the session, so a pick or a help request later reads the same fiche even after a new
@@ -118,10 +124,11 @@ class KefindPorts:
         if (answer or {}).get("interpreted") is False and str(decision.get("reason") or "").startswith("text_only"):
             return []  # interpretation failed, nothing but the question's own words: the search index answers
         labels = {c.get("fiche_id"): c.get("label") or c.get("fiche_id") for c in answer.get("candidates") or []}
-        shown = decision.get("fiche_id") if kind == "fiche" else None
+        degraded = answer.get("mode") == "degraded"
+        shown = decision.get("fiche_id") if kind == "fiche" and not degraded else None
         branches = [[option["fiche_id"]] if option.get("fiche_id") else list(option.get("fiches") or [])
                     for option in decision.get("options") or []]
-        offered: List[str] = []
+        offered: List[str] = [decision["fiche_id"]] if kind == "fiche" and degraded and decision.get("fiche_id") else []
         for rank in range(max((len(b) for b in branches), default=0)):  # one fiche per branch in turn
             for branch in branches:
                 if rank < len(branch) and branch[rank] and branch[rank] not in offered:
@@ -142,13 +149,19 @@ class KefindPorts:
 
     # --------------------------------------------------------------- ports
     def retrieve(self, st: GuideState) -> List[KbCandidate]:
-        found = self.candidates(self._find(st), st)
-        return found or self.fallback.retrieve(st)
+        answer = self._find(st)
+        found = self.candidates(answer, st)
+        if found:
+            return found
+        if (answer or {}).get("mode") == "semantic":
+            return []  # decided by meaning on the run's calibrated index: nothing (left) close IS the answer
+        return self.fallback.retrieve(st)
 
     def judge(self, st: GuideState, cands: List[KbCandidate]) -> Optional[str]:
         if cands and all(is_kefind(c.parent_id) for c in cands):
-            decision = (self._find(st) or {}).get("decision") or {}
-            if decision.get("kind") == "fiche":
+            answer = self._find(st) or {}
+            decision = answer.get("decision") or {}
+            if decision.get("kind") == "fiche" and answer.get("mode") != "degraded":
                 for c in cands:
                     if fiche_id_of(c.parent_id) == decision.get("fiche_id"):
                         return c.parent_id

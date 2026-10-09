@@ -23,11 +23,12 @@ FICHES = {
 
 
 class Engine:
-    def __init__(self, decision=None, down=False, no_map=False, run_id="r1", interpreted=True):
+    def __init__(self, decision=None, down=False, no_map=False, run_id="r1", interpreted=True, mode=None):
         self.decision = decision
         self.down, self.no_map = down, no_map
         self.run_id = run_id
         self.interpreted = interpreted
+        self.mode = mode
         self.calls = []
 
     def find(self, client, text, answers=(), interpret=True, observe=None):
@@ -36,8 +37,11 @@ class Engine:
             raise ConnectionError("engine down")
         if self.no_map:
             return None
-        return {"client": client, "run_id": self.run_id, "interpreted": self.interpreted, "decision": self.decision,
-                "candidates": [{"fiche_id": f, "label": FICHES[f]["label"]} for f in self.decision.get("fiches", [])]}
+        answer = {"client": client, "run_id": self.run_id, "interpreted": self.interpreted, "decision": self.decision,
+                  "candidates": [{"fiche_id": f, "label": FICHES[f]["label"]} for f in self.decision.get("fiches", [])]}
+        if self.mode is not None:
+            answer["mode"] = self.mode
+        return answer
 
     def fiche(self, client, fiche_id, run_id=None):
         self.calls.append(("fiche", fiche_id, run_id))
@@ -144,6 +148,34 @@ def test_when_every_engine_fiche_is_rejected_the_index_is_asked():
     kp = KefindPorts(engine, "client-s", fallback())
     st.conversation_text = "Compte bloqué"
     assert [c.parent_id for c in kp.retrieve(st)] == ["IDX-1"]
+
+
+def test_a_semantic_abstention_is_the_answer_no_index_and_no_model_pick_a_fiche():
+    engine = Engine({"kind": "abstain", "reason": "semantic_nothing_close", "fiches": []}, interpreted=None,
+                    mode="semantic")
+    r = advance(new(), ev("la machine à café fuit", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
+    assert r.state.phase == Phase.OPEN and r.state.guide is None
+    assert all(c.parent_id != "IDX-1" for c in r.state.candidates)
+
+
+def test_when_every_semantic_fiche_is_rejected_the_index_is_not_asked():
+    engine = Engine(fiche_decision(), interpreted=None, mode="semantic")
+    st = new()
+    st.rejected_parent_ids = ["kefind:KB0120", "kefind:KB0200"]
+    st.conversation_text = "Compte bloqué"
+    assert KefindPorts(engine, "client-s", fallback()).retrieve(st) == []
+
+
+def test_a_fiche_decided_by_words_during_an_embedding_outage_is_offered_not_shown():
+    engine = Engine(fiche_decision(), mode="degraded")
+    r = advance(new(), ev("Compte bloqué", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
+    assert r.state.phase == Phase.LOCATE and r.state.guide is None
+    assert [c.parent_id for c in r.state.choices][0] == "kefind:r1:KB0120"
+    assert KefindPorts(engine, "client-s", fallback()).judge(r.state, r.state.candidates) is None
+    # the same decision made by meaning is shown and guided at once
+    shown = advance(new(), ev("Compte bloqué", kind="created"),
+                    with_engine(fallback(), Engine(fiche_decision(), mode="semantic"), "client-s"), T0)
+    assert shown.state.phase == Phase.GUIDING and shown.state.guide.parent_id == "kefind:r1:KB0120"
 
 
 def test_help_on_an_engine_step_sees_the_whole_fiche():

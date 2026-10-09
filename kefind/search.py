@@ -37,7 +37,7 @@ TOP_K = 20
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset(
     "le la les l un une des de du d et ou pour avec sans sur sous dans par au aux ce cette ces cet est "
-    "sont a ont ete etre que qui quoi comment pourquoi quand ou en se ne pas plus tres the a an of to in on for "
+    "sont a ont ete etre que qui quoi comment pourquoi quand ou en se ne pas non oui plus tres the a an of to in on for "
     "with and or is are".split()
 )
 

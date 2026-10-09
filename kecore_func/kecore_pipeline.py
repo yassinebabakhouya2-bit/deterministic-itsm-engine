@@ -7,7 +7,9 @@ separate, retryable Durable Functions activity and nothing lives on an operator'
   profile    fiches.jsonl                         -> runs/<run>/profile.json
   decompose  fiches.jsonl[start:end] + profile    -> runs/<run>/decomposed/<index>.json
   report     decomposed/*                         -> runs/<run>/{fiches.decomposed.jsonl, report.md,
-                                                     summary.json, graph.json} and latest.json
+                                                     summary.json, graph.json}
+  (semantic) the run's map                        -> runs/<run>/semantic/ (semantic_service.py)
+  publish    the run's summary                    -> latest.json, last: a published run never changes
 
 Every run keeps its own folder: the map of a client's KB is versioned, never overwritten. The map
 kefind finds fiches on (slice 3) is that folder: fiches.decomposed.jsonl (verified steps and
@@ -76,6 +78,7 @@ def layout(run_id: str) -> dict[str, str]:
         "report": base + "report.md",
         "summary": base + "summary.json",
         "graph": base + "graph.json",
+        "published": base + "published.json",
         "latest": LATEST,
     }
 
@@ -102,6 +105,9 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
     with_dictionary = body.get("with_dictionary", True)
     if not isinstance(with_dictionary, bool):
         raise ValueError("with_dictionary must be true or false")
+    semantic = body.get("semantic", True)
+    if not isinstance(semantic, bool):
+        raise ValueError("semantic must be true or false")
     if not _RUN_ID_RE.match(run_id):
         raise ValueError("invalid run id")
     return {
@@ -111,6 +117,7 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
         "batch_size": batch_size,
         "limit": limit,
         "with_dictionary": with_dictionary,
+        "semantic": semantic,
         "run_id": run_id,
     }
 
@@ -136,6 +143,18 @@ class StorageRecordStore:
 
     def write(self, relative: str, text: str) -> None:
         self.storage.write(self.container, self.prefix + relative, text.encode("utf-8"))
+
+    def write_if_absent(self, relative: str, text: str) -> bool:
+        """The first record of a key wins (two questions embedded at the same time get one vector).
+        A storage without a conditional write is read first: right for a single writer."""
+        name = self.prefix + relative
+        writer = getattr(self.storage, "write_if_absent", None)
+        if writer is not None:
+            return writer(self.container, name, text.encode("utf-8"))
+        if self.storage.read(self.container, name) is not None:
+            return False
+        self.storage.write(self.container, name, text.encode("utf-8"))
+        return True
 
 
 def _jsonl(items) -> bytes:
@@ -267,8 +286,8 @@ def decompose(storage: Storage, payload: dict, start: int, end: int, llm=None) -
 
 def report(storage: Storage, payload: dict, ranges: list[list[int]], profile_stats: dict, batch_stats: list[dict],
            warnings: list[str], model_id: str | None) -> dict:
-    """Gathers the run: the same report and summary as a local run, the graph between fiches
-    (kefind.graph, code only) and latest.json."""
+    """Gathers the run: the same report and summary as a local run and the graph between fiches
+    (kefind.graph, code only). latest.json is ``publish``'s, after the semantic folder."""
     container = kecore_container(payload["client"])
     paths = layout(payload["run_id"])
     decomposed = []
@@ -299,5 +318,16 @@ def report(storage: Storage, payload: dict, ranges: list[list[int]], profile_sta
     short["dictionary"] = profile_stats.get("dictionary")
     short["graph"] = graph.stats()
     short["run_id"] = payload["run_id"]
-    storage.write(container, paths["latest"], _json({"run_id": payload["run_id"], "summary": short}))
     return short
+
+
+def publish(storage: Storage, payload: dict, short: dict, semantic: dict | None = None) -> dict:
+    """latest.json names this run, last of all: the run's folder is complete and will never change.
+    ``semantic``: what the semantic build gave (or its error, or None when not asked). The run's own
+    published.json says it was published, after latest.json moves on to a newer run (the Function keeps
+    in memory only published runs: kecore_func.function_app._kb_map)."""
+    summary = {**short, "semantic": semantic}
+    container = kecore_container(payload["client"])
+    storage.write(container, layout(payload["run_id"])["published"], _json({"run_id": payload["run_id"]}))
+    storage.write(container, LATEST, _json({"run_id": payload["run_id"], "summary": summary}))
+    return summary

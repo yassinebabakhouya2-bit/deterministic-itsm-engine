@@ -22,6 +22,7 @@ import re
 import kecore_pipeline as pipeline
 from kecore.decompose import DecomposedFiche
 from kecore.profile import Profile
+from kefind import semantic as sem
 from kefind.funnel import FunnelConfig, KBMap, fiche_view, find
 from kefind.graph import KBGraph
 from kefind.interpret import interpret
@@ -69,8 +70,12 @@ def latest_run(storage: pipeline.Storage, client: str) -> str | None:
     return json.loads(data.decode("utf-8")).get("run_id") if data else None
 
 
-def load_map(storage: pipeline.Storage, client: str, run_id: str) -> KBMap:
-    """The KB map of one run. FileNotFoundError when the run has no decomposed fiches."""
+def load_map(storage: pipeline.Storage, client: str, run_id: str, with_semantic: bool = True) -> KBMap:
+    """The KB map of one run, with its semantic index when the run built one completely: index.json,
+    vectors.f32 AND calibration.json, checked against their sha256. An index without its calibration
+    (a build that stopped halfway), damaged, or made for another map is not used -- the map decides by
+    words and ``kbmap.semantic_error`` says why; it never makes /find fail. FileNotFoundError when the
+    run has no decomposed fiches."""
     container = pipeline.kecore_container(client)
     paths = pipeline.layout(run_id)
     data = storage.read(container, paths["decomposed"])
@@ -81,7 +86,34 @@ def load_map(storage: pipeline.Storage, client: str, run_id: str) -> KBMap:
     dictionary = Profile.from_dict(json.loads(profile.decode("utf-8"))).dictionary if profile else {}
     graph = storage.read(container, paths["graph"])
     graph = KBGraph.from_dict(json.loads(graph.decode("utf-8"))) if graph else None
-    return KBMap(client, fiches, dictionary, graph=graph, run_id=run_id)
+    index, error = None, None
+    if with_semantic:
+        base = f"runs/{run_id}/"
+        index_json = storage.read(container, base + sem.INDEX_BLOB)
+        if index_json is not None:
+            vectors = storage.read(container, base + sem.VECTORS_BLOB)
+            calibration = storage.read(container, base + sem.CALIBRATION_BLOB)
+            if vectors is None or calibration is None:
+                error = "the run's semantic index is incomplete (no " + (
+                    sem.VECTORS_BLOB if vectors is None else sem.CALIBRATION_BLOB) + "): decided by words"
+            else:
+                try:
+                    index = sem.SemanticIndex.from_blobs(index_json, vectors, calibration)
+                except (ValueError, KeyError, TypeError) as exc:
+                    error = f"the run's semantic index was refused ({str(exc)[:200]}): decided by words"
+    try:
+        kbmap = KBMap(client, fiches, dictionary, graph=graph, run_id=run_id, semantic=index)
+    except ValueError as exc:  # an index made for another map
+        kbmap = KBMap(client, fiches, dictionary, graph=graph, run_id=run_id)
+        error = f"the run's semantic index was refused ({str(exc)[:200]}): decided by words"
+    kbmap.semantic_error = error
+    return kbmap
+
+
+def with_index(kbmap: KBMap, index) -> KBMap:
+    """The same map with a semantic index (the calibration reads the index it is calibrating)."""
+    return KBMap(kbmap.client, list(kbmap.fiches.values()), kbmap.dictionary, graph=kbmap.graph, run_id=kbmap.run_id,
+                 semantic=index)
 
 
 def funnel_config(storage: pipeline.Storage, client: str) -> FunnelConfig:
@@ -113,26 +145,46 @@ def fiche_payload(kbmap: KBMap, fiche_id: str) -> dict | None:
     return {**fiche_view(kbmap, fiche_id), "run_id": kbmap.run_id, "text": kbmap.fiches[fiche_id].text}
 
 
-def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm=None) -> dict:
-    """The answer to a find request. ``llm`` interprets the ticket when the request asks for it.
-    ``interpreted``: None when no interpretation was asked, else whether it gave terms to search with
-    (False: the model failed, the decision rests on the ticket's own words -- the Diagnostic does not
-    trust a text-only decision made that way, orchestration/guide/kefind_ports.py)."""
+def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm=None, embedder=None) -> dict:
+    """The answer to a find request.
+
+    With a semantic index in the map, the question is embedded once (``embedder``: recorded, the same
+    text always gets the same vector) and decided by meaning; the model interprets nothing. Without
+    an index, or when the question gets no vector (no client, another model than the index's, the
+    service failed), the words decide as before and ``llm`` interprets the ticket when asked;
+    ``mode`` says which ("semantic", "words", or "degraded": an index was there but unusable for this
+    question, ``semantic_error`` says why). ``interpreted``: None when no interpretation was asked or
+    needed, else whether it gave terms (False: the model failed -- the Diagnostic does not trust a
+    text-only decision made that way, orchestration/guide/kefind_ports.py)."""
+    vector, semantic_error = None, getattr(kbmap, "semantic_error", None)
+    if kbmap.semantic is not None:
+        if embedder is None:
+            semantic_error = "no embedding client"
+        elif getattr(embedder, "model_id", None) != kbmap.semantic.model:
+            semantic_error = "the embedding model is not the index's"
+        else:
+            try:
+                vector = embedder.embed([sem.query_text(payload["text"])])[0]
+            except Exception as exc:  # the service is down: words decide, and the answer says so
+                semantic_error = f"embedding failed ({type(exc).__name__})"
     interpretation = None
-    asked = bool(payload.get("interpret", True))
+    asked = bool(payload.get("interpret", True)) and vector is None
     if asked and llm is not None:
         interpretation = interpret(llm, payload["text"], kbmap.dictionary)
-    finding = find(kbmap, payload["text"], answers=payload["answers"], config=config, interpretation=interpretation)
+    finding = find(kbmap, payload["text"], answers=payload["answers"], config=config, interpretation=interpretation,
+                   query_vector=vector)
     interpreted = (interpretation is not None and interpretation.error is None) if asked else None
+    mode = "semantic" if vector is not None else ("degraded" if kbmap.semantic is not None else "words")
     return {
         "client": kbmap.client,
         "run_id": kbmap.run_id,
+        "mode": mode,
+        "semantic_error": semantic_error,
         "interpreted": interpreted,
         "decision": finding.to_dict(),
         "fiche": fiche_view(kbmap, finding.fiche_id) if finding.fiche_id else None,
         "candidates": [{"fiche_id": f, "label": kbmap.label(f)} for f in finding.fiches],
     }
 
-
-__all__ = ["validate_find_request", "validate_fiche_request", "latest_run", "load_map", "funnel_config", "respond",
+__all__ = ["validate_find_request", "validate_fiche_request", "latest_run", "load_map", "with_index", "funnel_config", "respond",
            "fiche_payload", "FUNNEL_CONFIG", "RUN_ID_RE"]

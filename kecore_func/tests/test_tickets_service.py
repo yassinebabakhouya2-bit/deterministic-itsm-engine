@@ -319,7 +319,7 @@ class MergeRunsTest(unittest.TestCase):
     def test_no_parts_is_an_empty_merge(self):
         self.assertEqual(svc.merge_runs("client-s", []),
                          {"client": "client-s", "run_id": None, "tickets": 0, "empty": 0, "errors": 0,
-                          "interpret_failures": 0, "kinds": {}, "reasons": {}})
+                          "interpret_failures": 0, "kinds": {}, "reasons": {}, "modes": {}})
 
 
 class JsonlTest(unittest.TestCase):

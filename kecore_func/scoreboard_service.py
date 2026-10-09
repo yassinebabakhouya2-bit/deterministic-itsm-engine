@@ -172,13 +172,13 @@ class CountingLLM:
         return getattr(self.llm, name)
 
 
-def batch(storage: pipeline.Storage, payload: dict, start: int, end: int, llm=None) -> dict:
+def batch(storage: pipeline.Storage, payload: dict, start: int, end: int, llm=None, embedder=None) -> dict:
     """Tickets [start, end) of the frozen set through the funnel, floor off; records to results/."""
     client = payload["client"]
     kbmap = finder.load_map(storage, client, payload["kb_run_id"])
     config = replace(finder.funnel_config(storage, client), min_show=0.0)
     counting = CountingLLM(llm) if llm is not None else None
-    engine = FunnelEngine({client: kbmap}, config=config, name=ENGINE, llm=counting)
+    engine = FunnelEngine({client: kbmap}, config=config, name=ENGINE, llm=counting, embedder=embedder)
     records = run_engine(engine, _dataset(storage, payload)[start:end])
     data = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records).encode("utf-8")
     storage.write(pipeline.kecore_container(client), f"{layout(payload['sb_id'])['results_dir']}{start:05d}.jsonl", data)
@@ -389,6 +389,9 @@ def apply(storage: pipeline.Storage, payload: dict, now: str | None = None) -> d
         if not rec.get("confirmed"):
             raise ValueError(f"the floor was not confirmed on half B ({rec.get('reason')}): it is not applied")
         current_map = finder.latest_run(storage, client)
+        if current_map and storage.read(container, f"runs/{current_map}/semantic/calibration.json") is not None:
+            raise ValueError("the current map decides by meaning, with its own calibration (semantic/calibration.json); "
+                             "min_show only applies to the word path and cannot be set from a scoreboard of it")
         if summary.get("kb_run_id") != current_map:
             raise ValueError(f"the floor was measured on map {summary.get('kb_run_id')}, the current map is "
                              f"{current_map}: run the scoreboard again on the current map")

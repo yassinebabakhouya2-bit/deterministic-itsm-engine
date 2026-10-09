@@ -114,6 +114,38 @@ Two choices made with the decision:
 
 The classic assistant's own free-form RAG answer (`orchestration/answer.py::diagnostic_query_core_keyless`) is now also the Diagnostic's fallback when `kefind` and the search index find no fiche (`Phase.OPEN`, runbook §19.10) — `kefind` still decides every fiche; the fallback never does.
 
+## The semantic mode: fiches found by meaning, thresholds calibrated on the KB (2026-10-09)
+
+The funnel below ranks by words (BM25F). Measured offline on the 175 ranked fiches of client-s, with
+no ticket: given a fiche's own first description sentence, it ranked that fiche first 96% of the
+time but showed it only 38% of the time, and on the 370 real tickets 259 of its 282 questions were
+ties words cannot break ("ligne" in a French question, "line" in an English fiche). An independent
+review kept the skeleton (entities, graph, the code decides, verbatim steps, recorded model calls)
+and replaced two components: the relevance signal and the calibration source.
+
+- **Relevance by meaning, frozen per run.** Once per kecore run, offline, the model writes a card
+  per fiche (what it solves, in French and English, and ~10 questions people ask for it; checked by
+  code: no invented error code, fiche number, path, contact); every entry is embedded once
+  (text-embedding-3-large, 1024 dimensions, recorded) and frozen with its sha256
+  (`kefind/cards.py`, `kefind/semantic.py`). A question is embedded once (recorded: the same text
+  always gets the same vector); a fiche's score is its best cosine with the question, in pure
+  Python, fixed order. This replaces the `TfidfEmbeddingProvider` stand-in in the live path.
+- **Code decides.** `kefind.semantic.decide`: show if the score reaches `floor` and strictly leads by
+  `margin`, offer above `offer`, else abstain. Only strong entities still filter. In the Diagnostic,
+  an abstention by meaning is the answer: no search index or model judge picks a fiche instead; a
+  fiche decided by words during an embedding outage is offered, never shown.
+- **Calibration without tickets.** An independent generation writes exam questions per fiche, never
+  indexed; thresholds are chosen on half of them under a Wilson bound on wrong fiches shown and a
+  leave-one-out bound on fiches shown when the right one is absent, then measured on the other half
+  against targets fixed in advance (`kefind/calibrate.py`). Without a successful calibration no fiche
+  is ever shown alone, and thresholds the test half contradicts on safety (wrong fiche shown, or a
+  fiche shown when the right one is absent) are withheld: the engine then only offers.
+- **Guarantee.** Same normalized question + same run = byte-identical decision; a replay of the run
+  rebuilds the index and its calibration with zero model calls. Not guaranteed: 100% correctness on
+  real tickets, or the same answer for two different phrasings.
+
+Operations, artifacts and deployment: runbook §19.11.
+
 ## How the funnel finds a fiche (slice 3)
 
 `kefind.funnel.find` replaces the 5-step `kefind` pipeline above for the

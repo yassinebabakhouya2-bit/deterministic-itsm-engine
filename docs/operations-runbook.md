@@ -2602,3 +2602,151 @@ STUCK), `test_kefind_ports.py` (délégation systématique au fallback), `test_g
 bout avec `monkeypatch.setattr(guide.ports, "diagnostic_query_core_keyless", ...)`, puisque
 `diagnostic_query_core_keyless` appelle Azure Search directement et ne passe pas par le
 `FakeAoai` des autres tests du fichier).
+
+### 19.11 La décision par le sens : index sémantique figé, calibré sur la KB (2026-10-09)
+
+**Pourquoi.** Sur les 370 vrais tickets (19.8), le moteur posait une question 76 % du temps, et 259
+de ces 282 questions venaient d'égalités de score (`*_close_choice`) que le comptage de mots (BM25F)
+ne peut pas trancher : « ligne » (question en français) et « line » (fiche en anglais) sont deux mots
+sans rapport pour lui. Mesure hors-ligne sur les 175 fiches classées de client-s, sans ticket : avec
+la 1re phrase de description d'une fiche comme question, la bonne fiche sortait 1re dans 96 % des cas
+mais n'était montrée que dans 38 % (la règle « 2 mots du titre »), et 3 % des fiches montrées étaient
+fausses. Une revue indépendante a conclu : garder le squelette (entités, graphe, le code décide,
+étapes verbatim, enregistrement), remplacer le signal de pertinence et la source de calibration.
+
+**Ce qui change.** Un run kecore construit maintenant, entre `report` et la publication de
+`latest.json`, le dossier `kecore-<client>/runs/<run>/semantic/` (`kecore_func/semantic_service.py`) :
+
+| Étape | Ce qu'elle fait | Écrit |
+| --- | --- | --- |
+| `cards` | par fiche, un appel gpt-4o écrit ce qu'elle résout (FR + EN) et ~10 questions qu'on pose quand on en a besoin (6 FR, 4 EN) ; le code garde ce qui passe : 2 à 40 mots, ni e-mail ni téléphone, aucune entité technique, numéro de fiche, application ni système que la fiche ne nomme pas (`kefind/cards.py`) | `cards/<i>.json` |
+| `heldout` | par fiche, un appel indépendant (autre consigne, autre persona, température 0.9, seed fixe) écrit 4 messages d'un employé qui ne connaît pas la fiche, sans les mots du titre ; bruit déterministe (accents, lettres inversées) ; **jamais indexés** : c'est l'examen (`kefind/calibrate.py`) | `heldout/<i>.json` |
+| `index` | chaque entrée (nom de la fiche, ce qu'elle résout, ses questions) vectorisée une fois (text-embedding-3-large, 1024 dimensions) ; toute ligne écrite par le modèle (ce qu'elle résout, ses questions) plus proche du texte propre d'une autre fiche que du sien est retirée -- l'étalon est le nom de chaque fiche et son propre texte (description, étapes vérifiées), jamais le modèle : une carte fausse ne peut pas se valider elle-même (`kefind/semantic.py`) | `vectors.f32`, `built.json`, puis `index.json` |
+| `calibrate` | seuils `floor`, `margin`, `offer` choisis sur la moitié « calibration » de l'examen (fiches réparties par hash), mesurés sur l'autre moitié | `calibration.json` |
+| `publish` | `latest.json`, en dernier : un run publié ne change plus jamais | `latest.json` |
+
+Si une étape sémantique échoue, le run est quand même publié ; `latest.json` dit pourquoi
+(`summary.semantic.error`) et `/find` décide par les mots comme avant. Un index n'est jamais utilisé à
+moitié : `vectors.f32` est écrit avant `index.json`, et la carte ne charge un index que si son
+`calibration.json` existe et que les sha256 concordent ; sinon elle décide par les mots et la réponse dit
+pourquoi (`semantic_error`), sans jamais faire échouer `/find`. La Function ne garde en mémoire qu'un run
+publié (`latest.json` le nomme, ou son dossier a `published.json`) : un run encore en construction est
+relu à chaque appel, aucune instance ne fige une carte à moitié faite.
+
+**La décision** (`kefind.funnel._find_semantic`, `kefind.semantic.decide`) : la question est vectorisée
+une fois ; le score d'une fiche est la meilleure similarité cosinus entre la question et une de ses
+entrées (calcul en Python pur, float64, ordre fixe : aucune différence d'une machine à l'autre). Seules
+les entités fortes filtrent encore (réponse du technicien, numéro de fiche cité, code d'erreur ou
+d'événement, mise à jour) ; une application citée en passant ne filtre plus. Puis trois comparaisons :
+fiche montrée si son score atteint `floor` ET devance strictement la suivante d'au moins `margin` (une
+égalité exacte n'est jamais tranchée par le nom d'une fiche) ; sinon les fiches au-dessus de `offer` sont
+proposées (question) ; sinon abstention. Sans calibration réussie, ou seuils retenus par le verrou,
+`floor` vaut 1.01 : aucune fiche n'est montrée seule sur un score, même aidée par un code d'erreur --
+seule une fiche que le ticket nomme lui-même, seule candidate, l'est. Les règles « 2 mots du titre » ne
+s'appliquent plus en mode sémantique. Les sommes sont exactes (`math.fsum`) : même résultat sur toute
+machine et toute version de Python (le `sum` de Python a changé d'algorithme en 3.12). Les identifiants
+du ticket se lisent quelle que soit leur casse (`kb893803` = `KB893803`, `0X8007…` = `0x8007…`) : deux
+casses partagent un vecteur, elles partagent aussi la lecture des entités.
+
+**Calibration sans ticket.** Sur la moitié « calibration », le code essaie chaque couple (floor, margin) --
+marges strictement positives -- et garde celui qui montre le plus souvent la bonne fiche tant que (1) la
+mauvaise fiche montrée reste sous 3 % en haut de son intervalle de Wilson à 95 % (la moitié test tolère
+4,1 % : cette marge évite qu'un simple retour à la moyenne déclenche le verrou), et (2) quand la bonne
+fiche est retirée de l'index
+(la question n'a plus de bonne réponse), une fiche est montrée au plus 10 % du temps. `offer` garde 95 %
+des questions dont la fiche est parmi les 3 plus proches. Cibles fixées avant toute mesure, vérifiées sur
+l'autre moitié : mauvaise fiche montrée ≤ 2 % (borne haute ≤ 4,1 %), bonne fiche montrée ≥ 70 %,
+questions ≤ 25 %, bonne fiche parmi les proposées ≥ 95 %, fiche montrée sans bonne réponse ≤ 10 %.
+`calibration.json` → `acceptance.passed`. **Verrou de sécurité** : si la moitié test échoue un contrôle de
+sécurité (mauvaise fiche montrée, borne haute ; fiche montrée sans bonne réponse), les seuils choisis sont
+retenus (`withheld: true`, gardés sous `chosen`) : aucune fiche n'est montrée seule, le moteur ne fait que
+proposer. Une cible d'utilité ratée (bonne fiche montrée, part de questions) ne bloque rien : elle est
+rapportée (`test_effective` donne alors les mesures avec les seuils réellement utilisés). Sans aucune
+question d'examen (tous les appels au modèle ont échoué), l'index propose comme un index non calibré
+(`offer` 0,35) au lieu de s'abstenir sur tout. Les questions d'une même fiche ne sont pas indépendantes :
+les intervalles sont plus étroits que la réalité, à lire comme un minimum de prudence. Ces chiffres
+mesurent les questions écrites depuis la KB, pas
+de vrais tickets : les vrais tickets se mesurent avec le run de tickets (`modes`, `reasons`) et 30 tickets
+vérifiés à la main.
+
+**Ce qui est garanti, et ce qui ne l'est pas.** Même texte de question (après normalisation : casse,
+espaces, formes Unicode) + même run = même vecteur, mêmes scores, même décision, octet pour octet. Chaque
+réponse du modèle (cartes, examen) est enregistrée dans `llm-cache/`, chaque vecteur dans `embed-cache/`
+(construction) ou `find-cache/` (questions) ; le premier vecteur enregistré pour un texte gagne
+(`write_if_absent`). Un run rejoué en mode `replay` réécrit le dossier sémantique à l'identique sans un
+appel (testé). Les étapes montrées restent le texte exact de la fiche. Pas garanti : 100 % juste sur de
+vrais tickets ; la même fiche pour deux formulations différentes (elles ont deux vecteurs) ; une question
+jamais vue pendant une panne du service d'embeddings (décidée par les mots, réponse `mode: "degraded"`,
+rien n'est enregistré). Deux fiches au texte quasi identique sont déjà fusionnées par le graphe (11
+groupes sur client-s). Deux fiches au même nom mais au contenu différent (une version courte et une
+longue, une version française et une anglaise) donnent une question : c'est le bon comportement, la KB
+n'est jamais modifiée ; elles sont listées dans `built.json` (`same_label`) et comptées dans le résumé du
+run (`semantic.index.same_label_groups`) pour qu'une personne les voie.
+
+**Données.** Les cartes et l'examen sont dérivés des fiches et restent dans `kecore-<client>`. Pour une
+question, `find-cache/` garde son vecteur (pas son texte), sous l'empreinte de son texte ; e-mails et
+numéros de téléphone sont retirés avant vectorisation, pas les noms de personnes (aucun repérage fiable
+dans un texte libre). Un vecteur peut être partiellement inversé : le traiter comme la table des tickets.
+Il est gardé sans limite de durée -- c'est ce qui garantit la même décision pour la même question ; une
+règle de rétention échangerait ce déterminisme contre de la confidentialité, c'est un choix à faire
+explicitement.
+
+**Réponse de `/kecore/find`.** Nouveaux champs `mode` (`semantic`, `words`, `degraded`) et
+`semantic_error` ; `decision.reason` en `semantic_clear_lead`, `semantic_single`, `semantic_designated`,
+`semantic_close_choice`, `semantic_close_entity`, `semantic_below_floor`, `semantic_nothing_close` ;
+`decision.degraded`. La trace a une étape `semantic` : modèle, empreinte de l'index, seuils, et pour les
+5 premières fiches leur score, le type d'entrée qui a gagné et son texte (pour comprendre une décision).
+Dans le Diagnostic (`orchestration/guide/kefind_ports.py`), une fiche montrée est guidée et une question
+propose les fiches, comme avant. Deux changements : quand le moteur a décidé par le sens (`mode:
+"semantic"`) que rien n'est proche, ou que toutes ses fiches ont été refusées, c'est la réponse --
+l'index de recherche et son juge LLM ne choisissent plus une fiche à sa place (la réponse libre OPEN
+suit, présentée comme telle) ; et une fiche décidée par les mots pendant une panne des embeddings
+(`mode: "degraded"`) est proposée, jamais montrée d'office.
+
+**Infra.** Aucune nouvelle ressource : le déploiement `text-embedding-3-large` existe déjà (foundry.bicep),
+le rôle Cognitive Services OpenAI User de la Function couvre tout le compte. Nouveau réglage
+`KECORE_AOAI_EMBEDDING_DEPLOYMENT` (kecore.bicep). Coût d'un run complet : ~350 appels gpt-4o et
+~3 000 textes vectorisés (quelques centimes) ; un rejeu ne coûte rien.
+
+**Déployer, construire, vérifier** (bloc unique, après le commit) :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+az deployment group create --resource-group rg-knowledgeengine-v9 --name kecore-semantic --template-file infra/modules/kecore.bicep -o table
+.\scripts\deploy-kecore-function.ps1
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$body = @{ client = 'client-s'; source_prefix = 'Kbs/'; mode = 'record' } | ConvertTo-Json
+$run  = Invoke-RestMethod -Method Post -Uri "$base/kecore/runs?code=$key" -Body $body -ContentType 'application/json'
+do { Start-Sleep -Seconds 30; $s = Invoke-RestMethod $run.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending', 'Running')
+$s.output.semantic | ConvertTo-Json -Depth 6
+```
+
+Attendu : `semantic.index.sha256`, `semantic.calibration.feasible`, `withheld` (false) et
+`acceptance.passed`. Puis
+`POST /kecore/find` avec « comment attribuer une ligne teams » : `mode` = `semantic`.
+
+**Revue indépendante avant déploiement (2026-10-09).** Un agent qui n'avait pas vu le code l'a relu et
+exécuté sur des entrées concrètes. Tout est corrigé et testé.
+
+| Constat (symptôme) | Cause | Correction |
+| --- | --- | --- |
+| calibration échouée après l'index : `/find` en `mode: "semantic"` avec les seuils non calibrés ; index à moitié écrit : `/find` et `/fiche` en 500 | la carte chargeait tout ce qui était dans `semantic/` | vecteurs avant `index.json` ; index chargé seulement avec son `calibration.json` ; toute erreur → décision par les mots + `semantic_error` |
+| verrou contourné : seuils retenus ou non calibrés, mais un ticket avec un code d'erreur montrait une fiche à 0,35 | une entité forte abaissait le plancher au niveau `offer` | plancher > 1 : rien n'est montré sur un score ; seule une fiche nommée, seule candidate |
+| une marge 0 pouvait être choisie : égalité exacte tranchée par l'ordre alphabétique | marges à partir de 0, test `>=` | marges ≥ 0,005 et avance strictement positive |
+| aucun examen → abstention sur tout, toujours en `mode: "semantic"` | `offer` mis à 1,0 | `offer` d'un index non calibré (0,35) |
+| `kb893803` et `KB893803` : même vecteur, entités différentes | motifs kecore sensibles à la casse | identifiants du ticket lus sans casse (`canonical_identifiers`) |
+| un run nommé pendant sa construction restait en mémoire sans index | cache de toute carte demandée | seuls les runs publiés (`published.json`, `latest.json`) restent en mémoire |
+| une question citant une autre application passait (« … dans acrobat » pour une fiche Teams) | le contrôle ignorait applications et systèmes ; l'étalon incluait les lignes du modèle | applications/systèmes absents de la fiche refusés ; étalon = texte propre des fiches |
+| le choix des seuils poussait au bord des 4 % : la moitié test échouait souvent par retour à la moyenne | pas de marge entre choix et contrôle | choix sous 3 %, contrôle à 4,1 % ; corrélation des questions d'une fiche documentée |
+| décisions différentes possibles entre Python 3.11 et 3.12 | `sum` a changé d'algorithme en 3.12 | `math.fsum` |
+| deux exécutions d'un même lot (température 0,9) : le rejeu n'était plus identique | `RecordingLLM` : le dernier écrivain gagnait | le premier enregistrement gagne, l'autre appel le relit |
+| panne d'embeddings : fiche décidée par les mots montrée et guidée d'office | le Diagnostic ignorait `mode` | proposée, jamais montrée ; une abstention par le sens ne repasse plus par l'index et son juge LLM |
+| plancher `min_show` du scoreboard calculé sur des cosinus, appliqué aux scores BM25 | deux échelles mélangées | `funnel-config/apply` refuse quand la carte décide par le sens |
+
+Restent connus, sans effet sur la décision servie : si une activité `cards`/`heldout` échoue, ses
+voisines encore en cours peuvent écrire dans le dossier après la publication (les cartes ne sont pas
+lues à la décision) ; des fiches remplacées (aucune sur client-s) reçoivent des cartes mais sont écartées
+à la décision, ce qui rend la calibration un peu plus prudente.
+
+Tests : kecore 132, kefind 139, kecore_func 102, scoreboard 71, app 102 (546).

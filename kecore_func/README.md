@@ -122,6 +122,17 @@ POST /api/kecore/dictionary/decision?code=<key>
   or not ready yet; 409: already decided); the next `POST /api/kecore/runs` reads them with the
   hand-written `dictionary-decisions.json` (`kecore_pipeline.profile`).
 
+## The semantic index of a run (2026-10-09)
+
+`POST /api/kecore/runs` builds, after `report` and before `latest.json` (`publish`, last), the run's
+`semantic/` folder: `cards/` (how people ask for each fiche, written once by the model, checked by
+code), `heldout/` (exam questions, never indexed), `index.json` + `vectors.f32` (frozen, with their
+sha256) and `calibration.json` (thresholds chosen on the KB itself). `"semantic": false` skips it.
+Model answers are recorded in `llm-cache/`, vectors in `embed-cache/`: a `replay` run rebuilds the
+folder byte for byte with no call. `/find` then decides by meaning (`"mode": "semantic"`), the
+question's vector recorded in `find-cache/` (never its text); without a vector it decides by words
+and says so (`"mode": "degraded"`). Details: runbook §19.11, `semantic_service.py`.
+
 Code: `function_app.py` (Durable and HTTP wiring only), `kecore_pipeline.py` (the steps, no
 Azure SDK, tested in memory), `kefind_service.py` (the find request, no Azure SDK, tested in
 memory), `tickets_service.py` and `scoreboard_service.py` (slice 4, no Azure SDK, tested in

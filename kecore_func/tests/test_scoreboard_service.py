@@ -217,6 +217,11 @@ class ApplyTest(unittest.TestCase):
         self.refused(self.storage_with(rec, interpret=False))
         self.refused(self.storage_with(rec, interpret_failures=3))
 
+    def test_no_word_floor_is_applied_to_a_map_that_decides_by_meaning(self):
+        storage = self.storage_with({"min_show": 0.42, "confirmed": True, "max_wrong": 0.05})
+        storage.write("kecore-client-s", "runs/r1/semantic/calibration.json", b'{"index_sha256": "x"}')
+        self.refused(storage)
+
     def test_a_floor_for_a_loose_ceiling_is_refused(self):
         self.refused(self.storage_with({"min_show": 0.42, "confirmed": True, "max_wrong": 0.2}))
 

@@ -48,10 +48,17 @@ from kecore.text import clean_text
 
 from .graph import KB_NUMBER_RE, KBGraph, build_graph
 from .interpret import Interpretation
+from . import semantic as sem
 from .search import SEARCHABLE_STATUSES, tokenize
 
-FUNNEL_VERSION = 2  # 2: min_show (a calibrated floor under which a fiche is offered, not shown)
+FUNNEL_VERSION = 3  # 2: min_show (a calibrated floor under which a fiche is offered, not shown);
+                   # 3: the semantic mode (kefind.semantic) when the run has an index
 MAX_TEXT_CHARS = 20_000
+# Identifiers kecore reads in the KB's own case (KB893803, INC0010005, 0x80070005): a ticket typing them
+# in another case must give the same entities -- the question's vector is case-folded, so the two
+# spellings share one vector and must share one decision too.
+_ID_PREFIX_RE = re.compile(r"(?<![A-Za-z0-9])(kb|inc|ritm|req|chg|prb|sctask|task)(?=\d)", re.IGNORECASE)
+_HEX_PREFIX_RE = re.compile(r"(?<![\w-])0X(?=[0-9a-fA-F]{4,8}\b)")
 
 # Filter levels, most informative first; (name, entity prefixes). "answered" holds the entities the
 # technician chose in answer to a question (all must hold), "cited" the fiches whose number the
@@ -203,7 +210,7 @@ class KBMap:
     """The map of one client's KB, built from one kecore run: never mixed with another client."""
 
     def __init__(self, client: str, fiches: Sequence[DecomposedFiche], dictionary: dict[str, list[str]] | None = None,
-                 graph: KBGraph | None = None, run_id: str | None = None):
+                 graph: KBGraph | None = None, run_id: str | None = None, semantic: "sem.SemanticIndex | None" = None):
         by_id: dict[str, DecomposedFiche] = {}
         for fiche in fiches:
             if fiche.client != client:
@@ -246,6 +253,11 @@ class KBMap:
         # only they count in the text statistics: twins would make their own words look common.
         self.ranked = [i for i in self.searchable if self.graph.canonical(i) == i]
         self.text_index = _TextIndex([by_id[i] for i in self.ranked], self.titles)
+        # The run's semantic index (kefind.semantic), when the run built one: never another run's.
+        if semantic is not None and not semantic.fiche_ids <= set(self.ranked):
+            raise ValueError("this semantic index was built for another KB map: refusing it")
+        self.semantic = semantic
+        self.semantic_error: str | None = None  # why a run's index is not used (kecore_func.kefind_service)
 
     def entities_of(self, fiche_id: str) -> frozenset[str]:
         return self.fiche_entities.get(fiche_id, frozenset())
@@ -283,6 +295,7 @@ class Finding:
     trace: list[dict] = field(default_factory=list)
     version: int = FUNNEL_VERSION
     designated: bool = False  # shown because the ticket named it (cited number, technician's answer)
+    degraded: bool = False  # the run has a semantic index but this question got no vector: words only
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -364,9 +377,13 @@ def _finish(finding: Finding, ranked: list[str], config: FunnelConfig, trace: li
 
 
 def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelConfig | None = None,
-         interpretation: Interpretation | None = None) -> Finding:
+         interpretation: Interpretation | None = None, query_vector: Sequence[float] | None = None) -> Finding:
     """The decision for one ticket. ``answers``: entities the technician chose in answer to a question;
-    ``interpretation``: the ticket's search terms from ``kefind.interpret`` (text only, never a filter)."""
+    ``interpretation``: the ticket's search terms from ``kefind.interpret`` (text only, never a filter);
+    ``query_vector``: the question's embedding (``kefind.semantic.normalize_text`` of the ticket, recorded).
+    With a semantic index in the map and a vector, the decision is made by meaning
+    (``_find_semantic``); without a vector the words decide, as before, and the finding says it was
+    ``degraded``."""
     config = config or FunnelConfig()
     trace: list[dict] = []
     cleaned = clean_text(text or "")[:MAX_TEXT_CHARS]
@@ -379,6 +396,31 @@ def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelCon
         return _finish(Finding("abstain", "empty_map"), [], config, trace)
 
     # 1. entities of the ticket, read with the dictionary the fiches were read with
+    known, accepted, cited, step = _ticket_entities(kbmap, cleaned, answers)
+    trace.append(step)
+
+    degraded = False
+    if kbmap.semantic is not None:
+        if query_vector is not None:
+            return _find_semantic(kbmap, query_vector, known, accepted, cited, config, trace)
+        degraded = True
+        trace.append({"step": "semantic", "degraded": True,
+                      "why": "no vector for this question (the embedding service did not answer): words only"})
+    finding = _find_words(kbmap, cleaned, interpretation, known, accepted, cited, config, trace)
+    finding.degraded = degraded
+    return finding
+
+
+def canonical_identifiers(text: str) -> str:
+    """"kb893803" read as "KB893803", "inc0010005" as "INC0010005", "0X8007..." as "0x8007...": the
+    case kecore's patterns expect, so a ticket's case never changes which entities it has."""
+    return _HEX_PREFIX_RE.sub("0x", _ID_PREFIX_RE.sub(lambda m: m.group(1).upper(), text))
+
+
+def _ticket_entities(kbmap: KBMap, cleaned: str, answers: Sequence[str]) -> tuple[list[str], list[str], list[str], dict]:
+    """The ticket's known entities, the technician's accepted answers, the fiches it cites by number,
+    and the trace of it all. Identifiers are read whatever their case (``canonical_identifiers``)."""
+    cleaned = canonical_identifiers(cleaned)
     ticket = list(dict.fromkeys(e.canonical for e in extract_entities(cleaned, kbmap.dictionary or None)))
     known = [c for c in ticket if c in kbmap.entity_index]
     given = list(dict.fromkeys(a for a in answers if isinstance(a, str)))
@@ -386,13 +428,108 @@ def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelCon
     numbers = list(dict.fromkeys(int(m.group(1)) for m in KB_NUMBER_RE.finditer(cleaned)))
     resolved = {str(n): [f for f in kbmap.graph.resolve_number(n) if f in kbmap.searchable_set] for n in numbers}
     cited = list(dict.fromkeys(f for n in numbers for f in resolved[str(n)]))
-    trace.append({
+    step = {
         "step": "entities", "ticket": ticket, "known": known,
         "unknown_ignored": [c for c in ticket if c not in kbmap.entity_index],
         "answers": accepted, "answers_ignored": [a for a in given if a not in kbmap.entity_index],
         "fiche_numbers": resolved, "dictionary": len(kbmap.dictionary),
-    })
+    }
+    return known, accepted, cited, step
 
+
+def semantic_scored(kbmap: KBMap, text: str, query_vector: Sequence[float],
+                    answers: Sequence[str] = ()) -> tuple[list[tuple[float, str, int]], bool, bool]:
+    """The ranking ``_find_semantic`` decides on, without deciding: (scored, strong, designated).
+    kefind.calibrate replays it under many thresholds; the decision itself stays kefind.semantic.decide."""
+    cleaned = clean_text(text or "")[:MAX_TEXT_CHARS]
+    known, accepted, cited, _ = _ticket_entities(kbmap, cleaned, answers)
+    pool, strong, designated = _semantic_pool(kbmap, known, accepted, cited, [])
+    return kbmap.semantic.rank(query_vector, pool), strong, designated
+
+
+def _semantic_pool(kbmap: KBMap, known: list[str], accepted: list[str], cited: list[str],
+                   trace: list[dict]) -> tuple[list[str], bool, bool]:
+    """The fiches the meaning ranks. Only the strong levels filter here -- the technician's answers, a
+    cited fiche number, an error or event code, an update: an application or a technical detail named
+    in passing would exclude the right fiche whenever kecore missed it on that fiche, and the meaning
+    already weighs it. Nothing left after the strong levels: the whole map is ranked."""
+    levels: list[tuple[str, list[str], set[str]]] = []
+    for name, prefixes in FILTER_LEVELS:
+        if name not in STRONG_LEVELS:
+            continue
+        if name == "answered":
+            values = accepted
+            reached = set.intersection(*(set(kbmap.entity_index[v]) for v in values)) if values else set()
+        elif name == "cited":
+            values, reached = cited, set(cited)
+        else:
+            values = [c for c in known if c.split(":", 1)[0] in prefixes]
+            reached = set().union(*(kbmap.entity_index[v] for v in values)) if values else set()
+        if values:
+            levels.append((name, list(values), reached))
+    active = list(levels)
+    attempts = []
+    pool: set[str] = set()
+    while active:
+        pool = set.intersection(*(reached for _, _, reached in active))
+        attempts.append({"levels": [name for name, _, _ in active], "candidates": len(pool)})
+        if pool:
+            break
+        active.pop()
+    if levels:
+        trace.append({"step": "filter", "semantic": True, "levels": {name: values for name, values, _ in levels},
+                      "attempts": attempts, "kept": [name for name, _, _ in active]})
+    kept = {name for name, _, _ in active}
+    if active:
+        candidates, strong, designated = sorted(pool), bool(kept & STRONG_LEVELS), bool(kept & DESIGNATING_LEVELS)
+    else:
+        candidates, strong, designated = list(kbmap.ranked), False, False
+    pruned, changes = kbmap.graph.prune(candidates)
+    if changes:
+        trace.append({"step": "graph", "changes": changes})
+    return [f for f in pruned if f in kbmap.semantic.fiche_ids], strong, designated
+
+
+def _find_semantic(kbmap: KBMap, query_vector: Sequence[float], known: list[str], accepted: list[str],
+                   cited: list[str], config: FunnelConfig, trace: list[dict]) -> Finding:
+    """The decision by meaning: the question's vector against the run's frozen index, compared with the
+    run's calibrated thresholds (kefind.semantic.decide). Code only, no model; byte-identical for the
+    same vector."""
+    index = kbmap.semantic
+    pool, strong, designated = _semantic_pool(kbmap, known, accepted, cited, trace)
+    scored = index.rank(query_vector, pool)
+    thresholds = index.thresholds()
+    verdict = sem.decide(scored, thresholds, strong=strong, designated=designated)
+    ranked = [f for _, f, _ in scored]
+    trace.append({"step": "semantic", "model": index.model, "dimensions": index.dimensions,
+                  "index": index.sha256[:16], "thresholds": thresholds.to_dict(), "candidates": len(pool),
+                  "strong": strong, "designated": designated, "verdict": verdict,
+                  "top": [{"fiche_id": f, "score": s, "match": index.entries[i].kind,
+                           "text": index.entries[i].text[:160]} for s, f, i in scored[: config.top_k]]})
+    if not scored:
+        return _finish(Finding("abstain", "semantic_no_candidate"), ranked, config, trace)
+    first = scored[0][0]
+    if verdict == "show":
+        reason = ("semantic_designated" if designated else
+                  "semantic_single" if len(scored) == 1 else "semantic_clear_lead")
+        return _finish(Finding("fiche", reason, fiche_id=scored[0][1], score=first, designated=designated),
+                       ranked, config, trace)
+    if verdict == "offer":
+        offered = [f for s, f, _ in scored if s >= thresholds.offer]
+        close = [f for s, f, _ in scored if s >= thresholds.offer and round(first - s, sem.ROUND) < thresholds.margin]
+        found = _discriminator(kbmap, close, set(known) | set(accepted), config) if len(close) > 1 else None
+        if found:
+            return _finish(_entity_question(kbmap, found[0], found[1], "semantic_close_entity", first),
+                           ranked, config, trace)
+        reason = "semantic_close_choice" if first >= thresholds.floor else "semantic_below_floor"
+        return _finish(_choice(kbmap, offered[: config.max_choices], reason, first), ranked, config, trace)
+    return _finish(Finding("abstain", "semantic_nothing_close", score=first), ranked, config, trace)
+
+
+def _find_words(kbmap: KBMap, cleaned: str, interpretation: Interpretation | None, known: list[str],
+                accepted: list[str], cited: list[str], config: FunnelConfig, trace: list[dict]) -> Finding:
+    """The decision by words (BM25F over the entity-filtered fiches): the map without a semantic index,
+    or a question without a vector."""
     # 2. the entity filter, level by level; the least informative level kept is dropped first
     levels: list[tuple[str, list[str], set[str]]] = []
     for name, prefixes in FILTER_LEVELS:
@@ -473,8 +610,10 @@ def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelCon
             return _show(kbmap, top, reason, best, designated, ranked, config, trace)
         if lead:
             # nothing as specific as an error code, and the ticket does not repeat the fiche's
-            # title: the fiche is proposed with the next ones, never shown as THE fiche
-            return _finish(_choice(kbmap, ranked[: config.max_choices], f"{mode}_no_title_match", best),
+            # title: the fiche is proposed with the next ones, never shown as THE fiche -- but never
+            # with a fiche that matched not a single search term, which would be noise, not a choice
+            plausible = [f for f in ranked if scores[f] > 0][: config.max_choices] or ranked[:1]
+            return _finish(_choice(kbmap, plausible, f"{mode}_no_title_match", best),
                            ranked, config, trace)
         close = [f for f in ranked if round(best - scores[f], 6) < config.gap]
         # close by text, but the ticket names the title of only one of them: that one

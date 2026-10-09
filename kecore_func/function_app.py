@@ -7,18 +7,22 @@ POST /api/kecore/runs  (function key)  {"client": "client-s", "source_prefix": "
   -> starts one Durable Functions run and answers with its status URLs.
 
 The run: extract -> profile -> decompose (batches in parallel, at most 4 at a time, see
-host.json) -> report. Each step is an activity that reads from and writes to blob storage
-(kecore_pipeline.py); kecore itself is unchanged. Identity: the Function's managed identity,
-for blob storage and for Azure OpenAI alike. A client not listed in KECORE_CLIENTS is refused.
+host.json) -> report -> the semantic index ("semantic": true, the default: cards, exam, index,
+calibration -- semantic_service.py) -> publish (latest.json, last). Each step is an activity that
+reads from and writes to blob storage (kecore_pipeline.py); kecore itself is unchanged. Identity:
+the Function's managed identity, for blob storage and for Azure OpenAI alike. A client not listed
+in KECORE_CLIENTS is refused.
 
 POST /api/kecore/find  (function key)  {"client": "client-s", "text": "<ticket>",
                                          "answers": ["app:teams"], "run_id": null, "interpret": true}
   -> the decision (fiche / question / abstain), its trace, and the fiche's verified steps.
-     The decision is code (kefind_service.py, kefind.funnel), with the client's calibrated
-     settings (kecore-<client>/funnel-config.json) when there are some. With "interpret"
-     (default), one model call first turns the ticket into search terms (kefind.interpret),
-     recorded under the hash of the request in kecore-<client>/find-cache/: the same ticket gets
-     the same terms. The KB map of a run is read once and kept in memory (4 maps at most).
+     The decision is code (kefind_service.py, kefind.funnel). When the run has a semantic index,
+     the question is embedded once (text-embedding-3-large, recorded under the hash of its text in
+     kecore-<client>/find-cache/: the same question always gets the same vector) and decided by
+     meaning against the run's calibrated thresholds; "mode" says "semantic". Otherwise the words
+     decide, with the client's calibrated settings (funnel-config.json) and, with "interpret"
+     (default), one recorded model call that turns the ticket into search terms (kefind.interpret).
+     The KB map of a run is read once and kept in memory (4 maps at most).
 
 POST /api/kecore/tickets/scrub  (function key)  {"client": "client-s"}
   -> scrubs every raw export under tickets-<client>/raw/*.csv (kecore.tickets.scrub: personal
@@ -73,8 +77,9 @@ import dictionary_service as dictionary_svc
 import kecore_pipeline as pipeline
 import kefind_service as finder
 import scoreboard_service as sb_svc
+import semantic_service as semantic_svc
 import tickets_service as tickets_svc
-from kecore.llm import AzureOpenAIChat, RecordingLLM
+from kecore.llm import AzureOpenAIChat, AzureOpenAIEmbeddings, RecordingEmbeddings, RecordingLLM
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -111,6 +116,17 @@ def llm_config() -> dict:
     return {
         "endpoint": os.environ["KECORE_AOAI_ENDPOINT"],
         "deployment": os.environ["KECORE_AOAI_DEPLOYMENT"],
+        "api_version": os.environ.get("KECORE_AOAI_API_VERSION", "2024-10-21"),
+        "auth": "entra",
+    }
+
+
+def embedding_config() -> dict:
+    """The text-embedding-3-large deployment of the same Foundry resource -- same endpoint, same
+    keyless role (Cognitive Services OpenAI User is resource-wide, not per-deployment)."""
+    return {
+        "endpoint": os.environ["KECORE_AOAI_ENDPOINT"],
+        "deployment": os.environ.get("KECORE_AOAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large"),
         "api_version": os.environ.get("KECORE_AOAI_API_VERSION", "2024-10-21"),
         "auth": "entra",
     }
@@ -183,6 +199,29 @@ def kecore_run(context: df.DurableOrchestrationContext):
         "kecore_report",
         {**payload, "ranges": ranges, "profile_stats": profiled, "batch_stats": stats, "warnings": extracted["warnings"]},
     )
+    semantic = None
+    if payload.get("semantic", True):
+        try:
+            planned = yield context.call_activity("kecore_semantic_plan", payload)
+            fiches = pipeline.batches(planned["fiches"], payload["batch_size"])
+            cards = yield context.task_all(
+                [context.call_activity("kecore_cards", {**payload, "start": start, "end": end}) for start, end in fiches]
+            )
+            exams = yield context.task_all(
+                [context.call_activity("kecore_heldout", {**payload, "start": start, "end": end}) for start, end in fiches]
+            )
+            built = yield context.call_activity("kecore_semantic_index", payload)
+            calibrated = yield context.call_activity("kecore_calibrate", payload)
+            semantic = {
+                "fiches": planned["fiches"],
+                "cards": {k: sum(c[k] for c in cards) for k in ("questions", "dropped", "errors", "calls", "cached")},
+                "exam": {k: sum(e[k] for e in exams) for k in ("queries", "dropped", "errors", "calls", "cached")},
+                "index": built,
+                "calibration": calibrated,
+            }
+        except Exception as exc:  # the run is still published: /find then decides by words, and says why
+            semantic = {"error": str(exc)[:500]}
+    summary = yield context.call_activity("kecore_publish", {**payload, "summary": summary, "semantic": semantic})
     return summary
 
 
@@ -214,6 +253,36 @@ def kecore_report(payload: dict) -> dict:
     )
 
 
+@app.activity_trigger(input_name="payload")
+def kecore_semantic_plan(payload: dict) -> dict:
+    return semantic_svc.plan(storage(), payload)
+
+
+@app.activity_trigger(input_name="payload")
+def kecore_cards(payload: dict) -> dict:
+    return semantic_svc.cards(storage(), payload, payload["start"], payload["end"], llm=make_llm(payload))
+
+
+@app.activity_trigger(input_name="payload")
+def kecore_heldout(payload: dict) -> dict:
+    return semantic_svc.heldout(storage(), payload, payload["start"], payload["end"], llm=make_llm(payload))
+
+
+@app.activity_trigger(input_name="payload")
+def kecore_semantic_index(payload: dict) -> dict:
+    return semantic_svc.build_index(storage(), payload, make_build_embedder(payload))
+
+
+@app.activity_trigger(input_name="payload")
+def kecore_calibrate(payload: dict) -> dict:
+    return semantic_svc.calibrate_run(storage(), payload, make_build_embedder(payload))
+
+
+@app.activity_trigger(input_name="payload")
+def kecore_publish(payload: dict) -> dict:
+    return pipeline.publish(storage(), payload, payload["summary"], payload.get("semantic"))
+
+
 _chat = None
 
 
@@ -225,10 +294,62 @@ def find_llm(client: str) -> RecordingLLM:
     return RecordingLLM(_chat, mode="record", store=pipeline.StorageRecordStore(storage(), client, prefix="find-cache/"))
 
 
+_embeddings = None
+
+
+def _embedding_client() -> AzureOpenAIEmbeddings:
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = AzureOpenAIEmbeddings.from_config(embedding_config())
+    return _embeddings
+
+
+def make_build_embedder(payload: dict) -> RecordingEmbeddings:
+    """The vectors of a run's index and exam, behind the client's record (kecore-<client>/embed-cache/):
+    a run in mode "replay" reads them all and calls nothing."""
+    return RecordingEmbeddings(_embedding_client(), mode=payload["mode"], dimensions=semantic_svc.DIMENSIONS,
+                               store=pipeline.StorageRecordStore(storage(), payload["client"],
+                                                                 prefix=semantic_svc.EMBED_RECORD_PREFIX))
+
+
+def query_embedder(client: str, dimensions: int):
+    """A question's vector, behind the client's record (kecore-<client>/find-cache/): the first vector
+    recorded for a text is the one every later call gets. None when the deployment is not configured
+    or its client cannot be built: /find then decides by words and says so (mode "degraded")."""
+    try:
+        return RecordingEmbeddings(_embedding_client(), mode="record", dimensions=dimensions,
+                                   store=pipeline.StorageRecordStore(storage(), client, prefix="find-cache/"))
+    except Exception:
+        return None
+
+
+def _query_embedder_for_run(payload: dict):
+    """The tickets run and the scoreboard decide each ticket exactly as /kecore/find does: by meaning
+    when the map has an index (same record, find-cache/, so a ticket asked live and replayed in a
+    measurement gets one vector)."""
+    return query_embedder(payload["client"], semantic_svc.DIMENSIONS)
+
+
 @functools.lru_cache(maxsize=4)
-def _kb_map(client: str, run_id: str):
-    # a run's folder never changes once written: its map can be kept as long as the process lives
+def _published_map(client: str, run_id: str):
+    # a published run's folder never changes again: its map can be kept as long as the process lives
     return finder.load_map(storage(), client, run_id)
+
+
+def _kb_map(client: str, run_id: str, latest: str | None = None):
+    """The map of ``run_id``. Kept in memory only once the run is published (latest.json names it, or
+    its folder has published.json): a run still being built -- its semantic index not there yet -- is
+    read fresh on every call, so no instance ever freezes a half-built map while another serves the
+    finished one."""
+    if latest is None:
+        latest = finder.latest_run(storage(), client)
+    container = pipeline.kecore_container(client)
+    if run_id == latest or storage().read(container, pipeline.layout(run_id)["published"]) is not None:
+        return _published_map(client, run_id)
+    return finder.load_map(storage(), client, run_id)
+
+
+_kb_map.cache_clear = _published_map.cache_clear
 
 
 _CONFIG_TTL_S = 60
@@ -254,16 +375,18 @@ def kecore_find(req: func.HttpRequest) -> func.HttpResponse:
         payload = finder.validate_find_request(body, allowed_clients())
     except ValueError as exc:
         return _error(400, str(exc))
-    run_id = payload["run_id"] or finder.latest_run(storage(), payload["client"])
+    latest = finder.latest_run(storage(), payload["client"])
+    run_id = payload["run_id"] or latest
     if not run_id:
         return _error(404, "no KB map for this client yet: start a run with POST /api/kecore/runs")
     try:
-        kb_map = _kb_map(payload["client"], run_id)
+        kb_map = _kb_map(payload["client"], run_id, latest)
     except FileNotFoundError:
         return _error(404, "no KB map for this run (unknown or unfinished run)")
     # the ticket text is neither logged nor stored; only the model's search terms are recorded
     llm = find_llm(payload["client"]) if payload["interpret"] else None
-    answer = finder.respond(kb_map, payload, config=_funnel_config(payload["client"]), llm=llm)
+    embedder = query_embedder(payload["client"], kb_map.semantic.dimensions) if kb_map.semantic is not None else None
+    answer = finder.respond(kb_map, payload, config=_funnel_config(payload["client"]), llm=llm, embedder=embedder)
     if payload["observe"]:  # the dictionary's online loop (only names, never the text); never fails the answer
         try:
             from kecore_table import PENDING
@@ -281,11 +404,12 @@ def kecore_fiche(req: func.HttpRequest) -> func.HttpResponse:
         payload = finder.validate_fiche_request(dict(req.params), allowed_clients())
     except ValueError as exc:
         return _error(400, str(exc))
-    run_id = payload["run_id"] or finder.latest_run(storage(), payload["client"])
+    latest = finder.latest_run(storage(), payload["client"])
+    run_id = payload["run_id"] or latest
     if not run_id:
         return _error(404, "no KB map for this client yet")
     try:
-        kb_map = _kb_map(payload["client"], run_id)
+        kb_map = _kb_map(payload["client"], run_id, latest)
     except FileNotFoundError:
         return _error(404, "no KB map for this run")
     view = finder.fiche_payload(kb_map, payload["fiche_id"])
@@ -302,7 +426,7 @@ def kecore_dictionary(req: func.HttpRequest) -> func.HttpResponse:
     if client not in set(allowed_clients()):
         return _error(400, "unknown client")
     run_id = finder.latest_run(storage(), client)
-    dictionary = _kb_map(client, run_id).dictionary if run_id else {}
+    dictionary = _kb_map(client, run_id, run_id).dictionary if run_id else {}
     try:
         return _json(dictionary_svc.review(storage(), table(PENDING), client, dictionary, run_id))
     except ValueError as exc:  # the hand-written dictionary-decisions.json is invalid
@@ -401,7 +525,8 @@ def tickets_run_batch(payload: dict) -> dict:
     # the ticket text is neither logged nor stored elsewhere; only the model's search terms are
     # recorded, in the same per-client cache kecore/find already uses (find-cache/)
     llm = find_llm(payload["client"]) if payload["interpret"] else None
-    return tickets_svc.run_batch(storage(), table(), payload, payload["start"], payload["end"], llm=llm)
+    return tickets_svc.run_batch(storage(), table(), payload, payload["start"], payload["end"], llm=llm,
+                                 embedder=_query_embedder_for_run(payload))
 
 
 # --------------------------------------------------------------------------- slice 4: scoreboard
@@ -448,7 +573,8 @@ def scoreboard_prepare(payload: dict) -> dict:
 @app.activity_trigger(input_name="payload")
 def scoreboard_batch(payload: dict) -> dict:
     llm = find_llm(payload["client"]) if payload["interpret"] else None
-    return sb_svc.batch(storage(), payload, payload["start"], payload["end"], llm=llm)
+    return sb_svc.batch(storage(), payload, payload["start"], payload["end"], llm=llm,
+                        embedder=_query_embedder_for_run(payload))
 
 
 @app.activity_trigger(input_name="payload")

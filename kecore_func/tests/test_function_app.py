@@ -79,6 +79,26 @@ def drive(orchestrator, ctx):
         return stop.value
 
 
+def drive_throwing(orchestrator, ctx):
+    """Like ``drive``, but an activity's exception is thrown INTO the orchestrator at its yield, as
+    Durable Functions does (so the orchestrator's own try/except is exercised)."""
+    gen = orchestrator(ctx)
+    value, error = None, None
+    try:
+        while True:
+            task = gen.throw(error) if error is not None else gen.send(value)
+            error = None
+            try:
+                if task[0] == "one":
+                    value = ctx.activities[task[1]](task[2])
+                else:
+                    value = [ctx.activities[t[1]](t[2]) for t in task[1]]
+            except Exception as exc:
+                error = exc
+    except StopIteration as stop:
+        return stop.value
+
+
 def request(method, route, body=None, params=None):
     data = b"" if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode("utf-8"))
     return func.HttpRequest(method=method, url=f"http://localhost/api/{route}", body=data, params=params or {})
@@ -218,6 +238,59 @@ class Slice5RoutesTest(RoutesTest):
         not_asked = json.loads(self.fa.kecore_find(request("POST", "kecore/find", dict(ticket, interpret=False))).get_body())
         self.assertEqual(outcomes + [not_asked["interpreted"]], [True, False, None])
 
+    def test_find_embeds_the_question_when_the_run_has_an_index(self):
+        from kefind import semantic as sem
+        from kefind.cards import entries_for
+        from kefind.tests.semantic_helpers import DIMS, ConceptEmbedder
+
+        kbmap = self.fa.finder.load_map(self.storage, "client-s", "r1")
+        index, _ = sem.build(entries_for(kbmap, {}), ConceptEmbedder(), "concept-embed@test", DIMS)
+        for name, data in index.to_blobs().items():
+            self.storage.write("kecore-client-s", f"runs/r1/{name}", data)
+        # an index is used only with its calibration (here: none found, so nothing is shown alone)
+        calibration = {"index_sha256": index.sha256, "thresholds": sem.UNCALIBRATED.to_dict()}
+        self.storage.write("kecore-client-s", f"runs/r1/{sem.CALIBRATION_BLOB}", json.dumps(calibration).encode())
+        self.fa._kb_map.cache_clear()
+        seen = {}
+
+        class Query:
+            model_id = "concept-embed@test"
+
+            def embed(self, texts):
+                seen["texts"] = texts
+                return ConceptEmbedder().embed(texts)
+
+        class NoModel:  # the semantic mode interprets nothing: any call is a failure of this test
+            def complete_json(self, *args, **kwargs):
+                raise AssertionError("the interpretation model was called in semantic mode")
+
+        with unittest.mock.patch.object(self.fa, "query_embedder", lambda client, dims: seen.update(dims=dims) or Query()), \
+                unittest.mock.patch.object(self.fa, "find_llm", lambda client: NoModel()):
+            answer = json.loads(self.fa.kecore_find(request("POST", "kecore/find", {
+                "client": "client-s", "text": "Compte  VERROUILLÉ", "interpret": True})).get_body())
+        self.assertEqual((answer["mode"], seen["dims"], seen["texts"]), ("semantic", DIMS, ["compte verrouillé"]))
+        self.assertTrue(answer["decision"]["reason"].startswith("semantic_"))
+
+    def test_only_published_runs_are_kept_in_memory(self):
+        loads = []
+        real = self.fa.finder.load_map
+        self.fa._kb_map.cache_clear()
+        with unittest.mock.patch.object(self.fa.finder, "load_map",
+                                        lambda storage, client, run_id: loads.append(run_id) or real(storage, client, "r1")):
+            for _ in range(2):
+                self.fa._kb_map("client-s", "r1", "r1")  # the published latest run: read once
+            for _ in range(2):
+                self.fa._kb_map("client-s", "r-building", "r1")  # still being built: read fresh every time
+            self.storage.write("kecore-client-s", "runs/r-old/published.json", b'{"run_id": "r-old"}')
+            for _ in range(2):
+                self.fa._kb_map("client-s", "r-old", "r1")  # published earlier, pinned by a session: read once
+        self.assertEqual(loads, ["r1", "r-building", "r-building", "r-old"])
+
+    def test_the_query_embedder_is_none_when_the_deployment_is_not_configured(self):
+        self.fa._embeddings = None
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            self.assertIsNone(self.fa.query_embedder("client-s", 1024))
+
     def test_a_bad_session_key_is_a_400(self):
         self.assertEqual(self.find(observe="Session-1").status_code, 400)
 
@@ -264,6 +337,51 @@ class OrchestratorsTest(unittest.TestCase):
                    "scoreboard_batch": lambda p: {"records": p["end"] - p["start"]},
                    "scoreboard_report": lambda p: {"ranges": p["ranges"], "kb": p["kb_run_id"]}})
         self.assertEqual(drive(self.fa.scoreboard_run, ctx), {"ranges": [[0, 25], [25, 30]], "kb": "r9"})
+
+    def kecore_activities(self, fail=None):
+        def activity(name, result):
+            def run(p):
+                if name == fail:
+                    raise RuntimeError(f"{name} failed")
+                return result(p) if callable(result) else result
+            return run
+
+        names = {
+            "kecore_extract": {"fiches": 5, "warnings": []},
+            "kecore_profile": {},
+            "kecore_decompose": lambda p: {"start": p["start"]},
+            "kecore_report": {"run_id": "r1", "fiches": 5},
+            "kecore_semantic_plan": {"fiches": 5},
+            "kecore_cards": lambda p: {"questions": 10, "dropped": 1, "errors": 0, "calls": 2, "cached": 0},
+            "kecore_heldout": lambda p: {"queries": 4, "dropped": 0, "errors": 0, "calls": 2, "cached": 0},
+            "kecore_semantic_index": {"sha256": "abc", "entries": 30},
+            "kecore_calibrate": {"feasible": True},
+            "kecore_publish": lambda p: {**p["summary"], "semantic": p["semantic"]},
+        }
+        return {name: activity(name, result) for name, result in names.items()}
+
+    def test_a_kecore_run_publishes_last_after_its_semantic_folder(self):
+        ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": True}, self.kecore_activities())
+        out = drive_throwing(self.fa.kecore_run, ctx)
+        order = [c[0] for c in ctx.calls]
+        self.assertEqual(order[-1], "kecore_publish")
+        self.assertLess(order.index("kecore_report"), order.index("kecore_semantic_plan"))
+        self.assertLess(order.index("kecore_semantic_index"), order.index("kecore_calibrate"))
+        self.assertEqual(out["semantic"]["cards"]["questions"], 20)  # two batches of fiches
+        self.assertEqual(out["semantic"]["index"]["sha256"], "abc")
+
+    def test_a_failed_semantic_build_still_publishes_the_run_and_says_why(self):
+        ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": True},
+                  self.kecore_activities(fail="kecore_semantic_index"))
+        out = drive_throwing(self.fa.kecore_run, ctx)
+        self.assertEqual([c[0] for c in ctx.calls][-1], "kecore_publish")
+        self.assertIn("kecore_semantic_index failed", out["semantic"]["error"])
+
+    def test_a_run_without_semantic_skips_it(self):
+        ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": False}, self.kecore_activities())
+        out = drive_throwing(self.fa.kecore_run, ctx)
+        self.assertNotIn("kecore_cards", [c[0] for c in ctx.calls])
+        self.assertIsNone(out["semantic"])
 
     def test_no_label_no_scoreboard(self):
         out = drive(self.fa.scoreboard_run, Ctx({"client": "client-s", "sb_id": "s"},

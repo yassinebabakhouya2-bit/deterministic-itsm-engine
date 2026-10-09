@@ -125,6 +125,53 @@ class AzureOpenAIChat:
         )
 
 
+class AzureOpenAIEmbeddings:
+    """Text embeddings (e.g. text-embedding-3-large), keyless by default -- same auth and retries as
+    AzureOpenAIChat. A vector only ever feeds code: kefind ranks fiches by cosine similarity and the
+    code decides on that number (kefind.semantic); the model never picks a fiche."""
+
+    def __init__(self, config: AzureOpenAIConfig, client: RestClient | None = None):
+        self.config = config
+        host = urllib.parse.urlparse(config.endpoint).netloc
+        self.model_id = f"{config.deployment}@{host}"
+        tokens = TokenProvider(config.auth, scope=COGNITIVE_SCOPE, key_env="AZURE_OPENAI_API_KEY")
+        self._client = client or RestClient(
+            config.endpoint,
+            config.api_version,
+            tokens,
+            timeout=config.timeout_s,
+            retries=5,
+            forbidden_hint=lambda path: "your account needs the 'Cognitive Services OpenAI User' role on the resource",
+            error_class=LLMError,
+        )
+
+    @classmethod
+    def from_config(cls, data: dict) -> "AzureOpenAIEmbeddings":
+        return cls(AzureOpenAIConfig.from_dict(data))
+
+    def embed(self, texts, dimensions: int | None = None) -> list[list[float]]:
+        """One vector per text, in the same order. ``dimensions`` shortens text-embedding-3 vectors
+        (the model's own option). Empty texts are the caller's to avoid: the API refuses them."""
+        texts = list(texts)
+        if not texts:
+            return []
+        body: dict = {"input": texts}
+        if dimensions:
+            body["dimensions"] = int(dimensions)
+        path = f"/openai/deployments/{urllib.parse.quote(self.config.deployment, safe='')}/embeddings"
+        payload = self._client.request("POST", path, body)
+        try:
+            items = sorted(payload["data"], key=lambda d: d["index"])
+            vectors = [[float(x) for x in item["embedding"]] for item in items]
+        except (KeyError, TypeError, IndexError, ValueError):
+            raise LLMError(f"unexpected answer: {json.dumps(payload)[:300]}") from None
+        if len(vectors) != len(texts):
+            raise LLMError(f"expected {len(texts)} embedding(s), got {len(vectors)}")
+        if dimensions and any(len(v) != int(dimensions) for v in vectors):
+            raise LLMError(f"expected vectors of {dimensions} dimensions")
+        return vectors
+
+
 class FileRecordStore:
     """The record as files under one folder: ``<key[:2]>/<key>.json``."""
 
@@ -140,6 +187,17 @@ class FileRecordStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
 
+    def write_if_absent(self, relative: str, text: str) -> bool:
+        """Writes only when nothing is recorded yet; False when a record was already there."""
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(text)
+        except FileExistsError:
+            return False
+        return True
+
 
 class RecordingLLM:
     """Answers from the record when the same request was made before.
@@ -147,6 +205,9 @@ class RecordingLLM:
     mode 'record': read the record, call the model on a miss and record it;
     'replay': read the record only (a miss is an error, nothing is called);
     'refresh': always call the model and overwrite the record.
+    The first answer recorded for a request wins: two calls that miss at the same time (a retried
+    activity, two instances) both return the recorded one (``write_if_absent`` when the store has it),
+    so what a run wrote and what its replay rewrites are the same.
 
     Where the record lives is a ``store`` (``read(relative) -> str | None``, ``write(relative, text)``):
     a folder by default (``cache_dir``), a blob container when the engine runs in Azure. The layout
@@ -200,8 +261,111 @@ class RecordingLLM:
             "schema_name": schema_name,
             "response": {"data": result.data, "usage": asdict(result.usage), "model": result.model},
         }
-        self.store.write(relative, json.dumps(record, ensure_ascii=False, indent=1) + "\n")
-        return result
+        body = json.dumps(record, ensure_ascii=False, indent=1) + "\n"
+        writer = getattr(self.store, "write_if_absent", None)
+        if self.mode == "refresh" or writer is None:
+            self.store.write(relative, body)
+            return result
+        if writer(relative, body):
+            return result
+        raw = self.store.read(relative)  # recorded first by another call: that answer is the answer
+        if raw is None:
+            return result
+        response = json.loads(raw)["response"]
+        return LLMResult(response["data"], LLMUsage(**response.get("usage", {})), response.get("model", ""), cached=True)
+
+
+class RecordingEmbeddings:
+    """Vectors from the record when the same text was embedded before, with the same model and the
+    same number of dimensions: once a text has a vector, it keeps it, so a ranking computed from it
+    is reproducible byte for byte -- and a replay costs nothing.
+
+    mode 'record': read the record, embed the missing texts and record them; 'replay': the record
+    only (a missing text is an error, nothing is called); 'refresh': always embed and overwrite.
+    The first answer recorded for a text wins: when two calls embed the same new text at the same
+    time, the second one finds the first one's record and returns it (``write_if_absent`` when the
+    store has it), so both see the same vector."""
+
+    def __init__(self, inner, mode: str = "record", model_id: str | None = None, store=None,
+                 cache_dir: str | Path | None = None, dimensions: int = 1024, batch_size: int = 64):
+        if mode not in ("record", "replay", "refresh"):
+            raise ValueError("mode must be 'record', 'replay' or 'refresh'")
+        if store is None:
+            if cache_dir is None:
+                raise ValueError("RecordingEmbeddings needs a cache_dir or a store")
+            store = FileRecordStore(cache_dir)
+        if not isinstance(dimensions, int) or dimensions < 1:
+            raise ValueError("dimensions must be a positive integer")
+        self.inner = inner
+        self.store = store
+        self.mode = mode
+        self.model_id = model_id or getattr(inner, "model_id", "unknown")
+        self.dimensions = dimensions
+        self.batch_size = max(1, int(batch_size))
+        self.calls = 0  # requests sent to the model
+        self.hits = 0  # texts answered from the record
+        self.embedded = 0  # texts sent to the model
+
+    def key(self, text: str) -> str:
+        request = {"model": self.model_id, "dimensions": self.dimensions, "input": text}
+        return hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _relative(key: str) -> str:
+        return f"{key[:2]}/{key}.json"
+
+    def _read(self, text: str) -> list[float] | None:
+        raw = self.store.read(self._relative(self.key(text)))
+        if raw is None:
+            return None
+        vector = json.loads(raw).get("vector")
+        if not isinstance(vector, list) or len(vector) != self.dimensions:
+            raise LLMError("a recorded vector does not match this model's dimensions")
+        return [float(x) for x in vector]
+
+    def _record(self, text: str, vector: list[float]) -> list[float]:
+        relative = self._relative(self.key(text))
+        body = json.dumps({
+            "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "model_id": self.model_id,
+            "dimensions": self.dimensions,
+            "vector": vector,
+        }) + "\n"
+        writer = getattr(self.store, "write_if_absent", None)
+        if self.mode == "refresh" or writer is None:
+            self.store.write(relative, body)
+            return vector
+        if writer(relative, body):
+            return vector
+        recorded = self._read(text)  # someone recorded this text first: theirs is the vector
+        return recorded if recorded is not None else vector
+
+    def embed(self, texts) -> list[list[float]]:
+        texts = list(texts)
+        if any(not isinstance(t, str) or not t.strip() for t in texts):
+            raise ValueError("every text to embed must be a non-empty string")
+        vectors: dict[str, list[float]] = {}
+        missing: list[str] = []
+        for text in dict.fromkeys(texts):  # each distinct text once, in first-seen order
+            vector = None if self.mode == "refresh" else self._read(text)
+            if vector is None:
+                missing.append(text)
+            else:
+                vectors[text] = vector
+                self.hits += 1
+        if missing:
+            if self.mode == "replay" or self.inner is None:
+                raise LLMError(f"no recorded embedding for {len(missing)} text(s) (replay mode)")
+            for start in range(0, len(missing), self.batch_size):
+                chunk = missing[start:start + self.batch_size]
+                answers = self.inner.embed(chunk, dimensions=self.dimensions)
+                self.calls += 1
+                self.embedded += len(chunk)
+                if len(answers) != len(chunk) or any(len(v) != self.dimensions for v in answers):
+                    raise LLMError("the embedding model answered the wrong number of vectors or dimensions")
+                for text, vector in zip(chunk, answers):
+                    vectors[text] = self._record(text, [float(x) for x in vector])
+        return [vectors[text] for text in texts]
 
 
 def load_llm_config(path: str | Path) -> dict:

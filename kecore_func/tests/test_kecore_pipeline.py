@@ -46,12 +46,15 @@ def demo_storage(prefix="Kbs/"):
     return storage
 
 
-def run(storage, payload, make_llm=lambda: None, model_id=None):
+def run(storage, payload, make_llm=lambda: None, model_id=None, publish=True):
     extracted = pipeline.extract(storage, payload)
     profiled = pipeline.profile(storage, payload, llm=make_llm())
     ranges = pipeline.batches(extracted["fiches"], payload["batch_size"])
     stats = [pipeline.decompose(storage, payload, start, end, llm=make_llm()) for start, end in ranges]
-    return pipeline.report(storage, payload, ranges, profiled, stats, extracted["warnings"], model_id)
+    short = pipeline.report(storage, payload, ranges, profiled, stats, extracted["warnings"], model_id)
+    if publish:
+        pipeline.publish(storage, payload, short)
+    return short
 
 
 class ValidateTest(unittest.TestCase):
@@ -96,6 +99,16 @@ class PipelineTest(unittest.TestCase):
             self.assertIsNotNone(storage.read("kecore-clienta", name), name)
         latest = json.loads(storage.read("kecore-clienta", "latest.json"))
         self.assertEqual(latest["run_id"], "run-1")
+
+    def test_latest_is_written_by_publish_only_last(self):
+        storage = demo_storage()
+        short = run(storage, self.payload(), publish=False)
+        self.assertIsNone(storage.read("kecore-clienta", "latest.json"))
+        self.assertIsNone(storage.read("kecore-clienta", "runs/run-1/published.json"))
+        pipeline.publish(storage, self.payload(), short, {"error": "x"})
+        latest = json.loads(storage.read("kecore-clienta", "latest.json"))
+        self.assertEqual((latest["run_id"], latest["summary"]["semantic"]), ("run-1", {"error": "x"}))
+        self.assertEqual(json.loads(storage.read("kecore-clienta", "runs/run-1/published.json")), {"run_id": "run-1"})
 
     def test_limit_keeps_the_first_fiches_in_document_order(self):
         storage = demo_storage()
