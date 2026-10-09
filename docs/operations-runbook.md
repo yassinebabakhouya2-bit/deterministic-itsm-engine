@@ -3015,3 +3015,25 @@ $s.output.references | ConvertTo-Json -Depth 4
 Attendu aujourd'hui (moteur gelé, §19.13) : « comment attribuer une ligne teams » **échoue** (KB0217
 classée devant KB0233) -- c'est le cas que la nouvelle architecture doit faire passer ; il sert de
 référence de non-régression. Pas encore déployé à la date de cette entrée.
+
+### 19.16 Passe A de l'enrichissement : proposition structurée par fiche (2026-10-09, code seul)
+
+`kefind/enrich.py` (spécification : `docs/v10-deterministic-engine.md`, section « Semantic enrichment
+at ingestion… »). Un appel au modèle par fiche, schéma JSON strict (applications = énumération du
+vocabulaire fermé : table statique de kecore + dictionnaire du client), réponse enregistrée par
+`RecordingLLM` ; le code garde ce qui passe et note pourquoi il retire le reste (`dropped`) :
+intention ramenée en `UPPER_SNAKE_CASE` ou retirée ; application hors vocabulaire retirée ; citation
+retenue seulement si trouvée mot pour mot (`NormalizedText`) ET si elle nomme l'application ; une
+application que kecore lit déjà sur la fiche n'a pas besoin de citation ; sinon elle reste, marquée
+`apps_inferred` / `app_inferred` (validation humaine obligatoire) ; alias de 2 à 8 mots sans contact,
+sans entité technique ni numéro de fiche inventés, sans autre application que celles revendiquées ;
+mot-clé présent dans un alias gardé ou dans la fiche. Tout est `status: "proposed"`. La sortie ne
+contient ni horodatage ni drapeau de cache : un rejeu (`replay`) réécrit les mêmes octets sans appel
+(testé).
+
+**Pas encore branché** sur le run kecore ni déployé : aucune opération Azure. Prochaine tranche :
+activité `enrich` du run (comme `cards`), écriture `runs/<run>/enrichment/<i>.json` + résumé, puis
+passes B/C et l'onglet de revue.
+
+Tests : kefind 159 (+18, `kefind/tests/test_enrich.py` ; deux contrôles volontairement cassés font
+échouer la suite, vérifié), kecore 141, kecore_func 107, scoreboard 69, app 113.

@@ -178,6 +178,14 @@ intent from that closed enum. Code checks: apps in the dictionary, quotes found 
 alias or the fiche. Human decisions live outside the runs (like `dictionary-decisions.json`), keyed
 by (fiche, `content_sha256`), and are re-applied by the next run.
 
+Pass A is `kefind/enrich.py` (`make_enrichment`, one recorded model call per fiche, strict schema
+whose application fields are an enum of the closed vocabulary). Applications are stored as kecore's
+application ids (`teams`, not "Microsoft Teams"), the ids runtime entity extraction reads. An
+application is proven by a verbatim quote naming it, or by kecore's own reading of the fiche;
+otherwise it is kept as `apps_inferred` and the proposal needs a person. `confusable_with` is not
+written by pass A (the model sees one fiche): it comes from the collision checks of passes B/C. Not
+yet wired into the kecore run (runbook §19.16).
+
 **Runtime routing**, first level that decides wins; every answer carries `route`, the rule, the
 alias or key that decided, and the routing tables' sha256:
 
