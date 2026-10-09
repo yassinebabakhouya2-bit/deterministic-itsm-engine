@@ -103,7 +103,8 @@ def test_a_question_of_the_engine_becomes_a_choice_and_the_pick_is_guided():
     engine.run_id = "r2"  # a new kecore run between the question and the pick
     r2 = advance(r1.state, ev(action="pick:2"), with_engine(fallback(), engine, "client-s"), T0)
     assert r2.state.guide.parent_id == "kefind:r1:KB0200" and ("fiche", "KB0200", "r1") in engine.calls
-    r3 = advance(r2.state, ev(action="explain"), with_engine(fallback(), engine, "client-s"), T0)
+    st = advance(r2.state, ev(action="start"), with_engine(fallback(), engine, "client-s"), T0).state
+    r3 = advance(st, ev(action="explain"), with_engine(fallback(), engine, "client-s"), T0)
     assert r3.outbox[-1]["kind"] == "help" and all(c[2] == "r1" for c in engine.calls if c[0] == "fiche")
 
 
@@ -181,6 +182,7 @@ def test_a_fiche_decided_by_words_during_an_embedding_outage_is_offered_not_show
 def test_help_on_an_engine_step_sees_the_whole_fiche():
     engine = Engine(fiche_decision())
     st = advance(new(), ev("Compte bloqué", kind="created"), with_engine(fallback(), engine, "client-s"), T0).state
+    st = advance(st, ev(action="start"), with_engine(fallback(), engine, "client-s"), T0).state
     r = advance(st, ev(action="explain"), with_engine(fallback(), engine, "client-s"), T0)
     assert r.outbox[-1]["kind"] == "help" and "fiche" in r.outbox[-1]["text"]
 

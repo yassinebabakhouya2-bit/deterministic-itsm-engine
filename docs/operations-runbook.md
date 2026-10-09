@@ -2807,3 +2807,48 @@ KB0217 0,675, KB0233 0,611 (2e). Seule KB0217 dépasse `offer` (0,621) : la ques
 fiche, la mauvaise. La meilleure entrée de KB0233 est « attribuer une ligne téléphonique à un utilisateur
 dans office 365 » : sa carte ne dit pas « Teams », sans doute parce que le contrôle de `kefind/cards.py`
 refuse une application que la fiche ne nomme pas (à vérifier sur le texte de KB0233).
+
+### 19.12 Un seul assistant : la fiche choisie est montrée avant ses étapes (2026-10-09)
+
+Demande : fusionner l'assistant classique et le Diagnostic guidé en un seul, et montrer la fiche
+sélectionnée avant de dérouler ses étapes. Jusqu'ici, quand le moteur était sûr de sa fiche, le
+Diagnostic sautait directement à l'étape 1 ; l'assistant classique restait à côté (`/classic`).
+
+- **La fiche d'abord** (`orchestration/guide/fsm.py::_preview`, `GuideState.steps_started`) : une fiche
+  trouvée (par kefind, l'index, le juge, un choix de l'utilisateur ou « la plus proche ») est affichée
+  -- titre, résumé, prérequis, toutes ses étapes en détail, lien source, « par le moteur déterministe »
+  le cas échéant -- et rien ne démarre. Deux boutons : « ▶ Démarrer les étapes » (nouvelle action
+  `start`, `contracts.ACTION_RE`) affiche l'étape 1 ; « Ce n'est pas la bonne fiche » propose les
+  suivantes comme avant. Un message tapé à ce moment relance la recherche avec ce contexte (la même
+  fiche peut revenir) au lieu d'être pris pour une aide sur une étape pas encore atteinte. Les autres
+  actions (`done`, `blocked`…) ne font rien avant le démarrage. Aucun appel au modèle en plus.
+- **Sessions existantes** : `steps_started` vaut `true` par défaut, donc une session enregistrée avant
+  ce changement (table `diagsessions`) continue ses étapes là où elle en était ; seules les fiches
+  trouvées après le déploiement passent par l'aperçu.
+- **Webhook ServiceNow** (`/api/servicenow/webhook`) : la réponse ne contient plus d'étape `step` à la
+  création (seulement `guide`) et gagne le champ `steps_started` ; aucun consommateur de ce champ dans
+  le repo.
+- **Assistant classique** (`app/app.py`) : `/classic` et `/c/<id>` deviennent des archives en lecture
+  seule (liste et contenu des conversations enregistrées, sans zone de saisie) ; un POST y redirige
+  vers l'Assistant (`/diag`). Le lien « Assistant classique » quitte l'en-tête ; la page d'accueil de
+  l'Assistant pointe vers « Anciennes conversations de l'assistant classique ». Rien n'est effacé des
+  tables `convindex`/`convturns` ; la suppression d'une conversation reste possible. Le moteur de
+  réponse libre de l'assistant classique reste celui de la phase `OPEN` (§19.10).
+
+Tests : `tests/` 105 (était 102) -- `test_guide_fsm.py` (aperçu sans étape, actions ignorées avant le
+démarrage, rejet avant démarrage, nouvelle description = nouvelle recherche, session antérieure sans
+le champ), `test_guide_app.py` et `test_kefind_ports.py` (démarrage explicite). Smoke test d'import du
+vrai `app/app.py` avec les clients Azure simulés (leçon §11.6) : `/` → `/diag`, `/classic` et `/c/<id>`
+en 200 sans zone de saisie, POST → 302 vers `/diag`, `/healthz` 200.
+
+**Déployer** (après le commit, depuis le poste de l'opérateur) :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+.\deploy-webapp.ps1
+```
+
+Vérifier : un nouveau diagnostic « Mon compte est bloqué, je n'arrive plus à me connecter à Windows »
+affiche KB0120 LOCKED ACCOUNT avec ses étapes et le bouton « Démarrer les étapes », sans « Étape 1 sur
+… » ; après le clic, l'étape 1. `/classic` montre les anciennes conversations sans zone de saisie.
+Pas encore déployé à la date de cette entrée.

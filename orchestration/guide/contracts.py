@@ -24,7 +24,7 @@ class Phase(str, Enum):
 TERMINAL = (Phase.SOLVED,)
 SourceSystem = Literal["servicenow_kb", "sharepoint"]
 RiskFlag = Literal["privileged_access", "data_deletion", "mfa_reset", "security_incident"]
-ACTION_RE = re.compile(r"^(pick:[1-3]|done|blocked|explain|back|wrong_fiche|solved_yes|solved_no|none)$")
+ACTION_RE = re.compile(r"^(pick:[1-3]|start|done|blocked|explain|back|wrong_fiche|solved_yes|solved_no|none)$")
 
 
 class Variable(Strict):
@@ -113,6 +113,9 @@ class GuideState(Strict):
     selected_parent_id: Optional[str] = None
     guide: Optional[Guide] = None
     current_step: int = Field(0, ge=0)        # == len(steps) means "all done, verify"
+    # False while the chosen fiche is only shown (title, summary, steps), before the user starts it;
+    # True by default so a session stored before this field existed keeps walking its steps.
+    steps_started: bool = True
     step_attempts: int = Field(0, ge=0)
     open_turns: list[OpenTurn] = Field([], max_length=8)
     seen_event_ids: list[str] = []

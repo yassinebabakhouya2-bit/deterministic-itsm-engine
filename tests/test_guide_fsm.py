@@ -54,11 +54,52 @@ def ev(text="", action=None, kind="reply", att=()):
     return Event(event_id=f"e{_n[0]}", kind=kind, text=text, action=action, attachments=list(att))
 
 
-def test_strong_match_goes_straight_to_the_guide_with_first_step():
-    r = advance(new(), ev("reset mot de passe", kind="created"), ports(), T0)
+def started(text="x", p=None):
+    """A session whose fiche was found and whose steps the user started."""
+    p = p or ports()
+    st = advance(new(), ev(text, kind="created"), p, T0).state
+    return advance(st, ev(action="start"), p, T0).state
+
+
+def test_strong_match_shows_the_fiche_and_waits_for_the_user_to_start_its_steps():
+    p = ports()
+    r = advance(new(), ev("reset mot de passe", kind="created"), p, T0)
     assert r.state.phase == Phase.GUIDING and r.state.guide.parent_id == "A"
-    assert [m["kind"] for m in r.outbox] == ["guide", "step"]
+    assert [m["kind"] for m in r.outbox] == ["guide"] and not r.state.steps_started
     assert len(r.state.guide.steps) == 3 and r.state.guide.guide_sha256
+    for act in ("done", "blocked", "explain", "back", "solved_yes"):      # nothing runs before the start
+        assert advance(r.state, ev(action=act), p, T0).outbox == []
+    s = advance(r.state, ev(action="start"), p, T0)
+    assert s.state.steps_started and s.state.current_step == 0
+    assert s.outbox == [{"kind": "step", "index": 0, "step": s.state.guide.steps[0].model_dump()}]
+
+
+def test_a_fiche_rejected_before_its_steps_start_proposes_the_others():
+    p = ports([cand("A", 3.5), cand("B", 2.0), cand("C", 1.5)])
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    r = advance(st, ev(action="wrong_fiche"), p, T0)
+    assert r.state.phase == Phase.LOCATE and r.state.guide is None and "A" in r.state.rejected_parent_ids
+    assert [c.parent_id for c in r.state.choices] == ["B", "C"]
+
+
+def test_a_description_before_the_start_searches_again_instead_of_helping_on_a_step():
+    seen = []
+    p = ports([cand("A", 3.5)], help_=lambda *a: seen.append(a) or {})
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    p2 = ports([cand("B", 3.5)], help_=lambda *a: seen.append(a) or {})
+    r = advance(st, ev("en fait c'est sur le VPN"), p2, T0)
+    assert seen == [] and r.state.guide.parent_id == "B" and not r.state.steps_started
+    assert [m["kind"] for m in r.outbox] == ["guide"]
+
+
+def test_a_session_stored_before_the_preview_existed_keeps_walking_its_steps():
+    p = ports()
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    legacy = st.model_dump()
+    legacy.pop("steps_started")
+    old = type(st).model_validate(legacy)
+    assert old.steps_started
+    assert advance(old, ev(action="done"), p, T0).state.current_step == 1
 
 
 def test_ambiguous_match_asks_to_choose_and_pick_starts_the_guide():
@@ -89,7 +130,7 @@ def test_unanswered_clarifications_end_with_best_fiche_marked_approximate():
 
 def test_walkthrough_done_back_and_solved():
     p = ports()
-    st = advance(new(), ev("x", kind="created"), p, T0).state
+    st = started(p=p)
     for i in range(3):
         r = advance(st, ev(action="done"), p, T0)
         st = r.state
@@ -105,7 +146,7 @@ def test_walkthrough_done_back_and_solved():
 
 def test_blocked_step_gets_help_from_the_fiche_and_offers_other_fiche_after_two_tries():
     p = ports()
-    st = advance(new(), ev("x", kind="created"), p, T0).state
+    st = started(p=p)
     r1 = advance(st, ev("je ne vois pas Comptes"), p, T0)
     assert r1.outbox[0]["kind"] == "help" and "je ne vois pas Comptes" in r1.outbox[0]["text"]
     assert not r1.outbox[0]["offer_other"] and r1.state.current_step == 0
@@ -115,14 +156,14 @@ def test_blocked_step_gets_help_from_the_fiche_and_offers_other_fiche_after_two_
 
 def test_explain_does_not_count_as_a_failed_attempt():
     p = ports()
-    st = advance(new(), ev("x", kind="created"), p, T0).state
+    st = started(p=p)
     r = advance(st, ev(action="explain"), p, T0)
     assert r.state.step_attempts == 0 and r.outbox[0]["kind"] == "help"
 
 
 def test_wrong_fiche_proposes_others_and_never_the_rejected_one():
     p = ports([cand("A", 3.5), cand("B", 2.0), cand("C", 1.5)])
-    st = advance(new(), ev("x", kind="created"), p, T0).state
+    st = started(p=p)
     r = advance(st, ev(action="wrong_fiche"), p, T0)
     assert r.state.phase == Phase.LOCATE and "A" in r.state.rejected_parent_ids
     assert [c.parent_id for c in r.state.choices] == ["B", "C"]
@@ -130,7 +171,7 @@ def test_wrong_fiche_proposes_others_and_never_the_rejected_one():
 
 def test_problem_persists_moves_to_next_fiche_and_falls_back_to_an_open_answer():
     p = ports([cand("A", 3.5)])
-    st = advance(new(), ev("x", kind="created"), p, T0).state
+    st = started(p=p)
     for _ in range(3):
         st = advance(st, ev(action="done"), p, T0).state
     r = advance(st, ev(action="solved_no"), p, T0)
@@ -216,7 +257,7 @@ def test_open_answer_falls_back_to_a_stuck_notice_if_the_model_itself_fails():
 
 def test_same_event_is_idempotent_and_empty_events_do_nothing():
     p = ports()
-    st = advance(new(), ev("x", kind="created"), p, T0).state
+    st = started(p=p)
     e = ev(action="done")
     a = advance(st, e, p, T0)
     b = advance(a.state, e, p, T0)

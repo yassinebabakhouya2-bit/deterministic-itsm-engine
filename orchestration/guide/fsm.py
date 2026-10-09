@@ -3,8 +3,10 @@
 LOCATE  -> find the exact fiche (retrieval score + margin, cross-checked by an LLM
            judge; otherwise the user picks among <= 3 fiches; after `max_rounds`
            unanswered clarifications the best fiche is taken as "approximate").
-GUIDING -> the fiche's steps are shown, then walked one by one (done / blocked /
-           explain / back); help comes from the fiche only.
+GUIDING -> the chosen fiche is shown first (title, summary, every step) and nothing
+           runs until the user starts it (or says it is the wrong fiche); its steps
+           are then walked one by one (done / blocked / explain / back); help comes
+           from the fiche only.
 OPEN    -> no fiche matches (deterministically or by search): the free-form
            diagnostic answers instead (the classic assistant's own engine,
            reused -- never a second, duplicated answer path), grounded in the
@@ -210,8 +212,8 @@ def _start_guiding(st: GuideState, cand: KbCandidate, p: Ports, out: List[dict],
         return False
     st.guide, st.selected_parent_id, st.choices = g, cand.parent_id, []
     st.phase, st.current_step, st.step_attempts, st.locate_rounds = Phase.GUIDING, 0, 0, 0
+    st.steps_started = False                      # the fiche is shown; the user starts its steps
     out.append({"kind": "guide", "guide": g.model_dump()})
-    _emit_step(st, out)
     return True
 
 
@@ -316,9 +318,29 @@ def _next_fiche(st: GuideState, evt: Event, p: Ports, out: List[dict], text: str
     _locate(st, evt, p, out, force_choice=True)
 
 
+def _preview(st: GuideState, evt: Event, p: Ports, out: List[dict]) -> None:
+    """The fiche is shown, its steps not started: start them, reject the fiche, or say more --
+    a new description searches again (the same fiche may come back) rather than being taken
+    as help on a step the user has not reached."""
+    act = evt.action
+    if act == "start":
+        st.steps_started = True
+        _emit_step(st, out)
+    elif act == "wrong_fiche":
+        _next_fiche(st, evt, p, out, "Compris, ce n'est pas la bonne fiche. Voici d'autres pistes.")
+    elif act is None:
+        if not _ingest(st, evt, p) and not evt.attachments:
+            return
+        st.guide, st.selected_parent_id, st.current_step, st.step_attempts = None, None, 0, 0
+        st.phase, st.locate_rounds = Phase.LOCATE, 0
+        _locate(st, evt, p, out)
+
+
 def _guiding(st: GuideState, evt: Event, p: Ports, out: List[dict]) -> None:
     g, n, act = st.guide, len(st.guide.steps), evt.action
-    if act == "done":
+    if not st.steps_started:
+        _preview(st, evt, p, out)
+    elif act == "done":
         if st.current_step < n:
             st.current_step, st.step_attempts = st.current_step + 1, 0
         _emit_step(st, out)

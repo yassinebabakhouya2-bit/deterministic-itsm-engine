@@ -114,6 +114,10 @@ Two choices made with the decision:
 
 The classic assistant's own free-form RAG answer (`orchestration/answer.py::diagnostic_query_core_keyless`) is now also the Diagnostic's fallback when `kefind` and the search index find no fiche (`Phase.OPEN`, runbook §19.10) — `kefind` still decides every fiche; the fallback never does.
 
+Since 2026-10-09 the two assistants are one (runbook §19.12): the chosen fiche is shown first (title,
+summary, every step) and its steps only run once the user starts them; `/classic` keeps the conversations
+saved before the merge, read-only.
+
 ## The semantic mode: fiches found by meaning, thresholds calibrated on the KB (2026-10-09)
 
 The funnel below ranks by words (BM25F). Measured offline on the 175 ranked fiches of client-s, with

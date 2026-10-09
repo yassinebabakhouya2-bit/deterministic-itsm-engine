@@ -73,14 +73,23 @@ def sid_of(resp):
     return resp.headers["Location"].split("/diag/s/")[1].split("?")[0]
 
 
-def test_full_flow_summary_then_steps_then_solved():
+def start_steps(c, sid):
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "start"})
+
+
+def test_full_flow_fiche_shown_then_steps_then_solved():
     app, _ = make_app()
     c = app.test_client()
     r = post(c, "/diag/new", {"client_id": "client-s", "text": "reset mdp"})
     sid = sid_of(r)
     page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
-    assert "Cette fiche explique la reinitialisation." in page and "Étape 1 sur 2" in page
+    assert "Cette fiche explique la reinitialisation." in page and "Fiche sélectionnée" in page
+    assert 'value="start"' in page and "Étape 1 sur 2" not in page and "pas encore démarrées" in page
+    assert "Ouvrez Parametres." in page and "Cliquez sur Comptes." in page   # every step, before starting
     assert "Ouvrir les parametres" in page and "<table" not in page
+    start_steps(c, sid)
+    page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
+    assert "Étape 1 sur 2" in page and 'value="start"' not in page and "0 / 2 étapes faites" in page
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "done"})
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "done"})
     page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
@@ -97,6 +106,8 @@ def test_ambiguous_start_shows_choice_buttons():
     page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
     assert "Quelle fiche correspond" in page and 'value="pick:1"' in page
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "pick:1"})
+    assert 'value="start"' in c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
+    start_steps(c, sid)
     assert "Étape 1 sur 2" in c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
 
 
@@ -104,6 +115,7 @@ def test_blocked_step_shows_help_text():
     app, _ = make_app()
     c = app.test_client()
     sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "x"}))
+    start_steps(c, sid)
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "text": "je ne trouve pas"})
     page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
     assert "Cherchez l&#39;icone engrenage." in page and "Trouvé dans la fiche" in page
@@ -120,6 +132,7 @@ def test_a_question_not_covered_by_the_fiche_says_so_instead_of_a_badge():
     app, _ = make_app(aoai=UngroundedAoai())
     c = app.test_client()
     sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "x"}))
+    start_steps(c, sid)
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "text": "question hors fiche"})
     page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
     assert "n'est pas détaillé dans la fiche" in page and "Trouvé dans la fiche" not in page
@@ -233,8 +246,10 @@ def test_a_fiche_the_engine_shows_is_guided_word_for_word():
     c = app.test_client()
     sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "mot de passe expiré"}))
     page = page_of(c, sid)
-    assert "par le moteur déterministe" in page and "Texte exact de la fiche" in page
-    assert "Appuyez sur Ctrl+Alt+Suppr" in page and "Étape 1 sur 2" in page
+    assert "par le moteur déterministe" in page and "Appuyez sur Ctrl+Alt+Suppr" in page
+    start_steps(c, sid)
+    page = page_of(c, sid)
+    assert "Texte exact de la fiche" in page and "Étape 1 sur 2" in page
     assert engine.calls[0] == "find"
 
 

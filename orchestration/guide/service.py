@@ -231,9 +231,10 @@ class GuideService:
                 "candidates": [c.model_dump() for c in state.candidates[:3]],
                 "choices": [c.model_dump() for c in state.choices],
                 "guide": g.model_dump() if g else None, "current_step": state.current_step,
+                "steps_started": state.steps_started,
                 "step_attempts": state.step_attempts}
 
 
-ACTION_TEXT = {"done": "C'est fait.", "blocked": "Ça ne marche pas.", "explain": "Pouvez-vous m'expliquer ?",
+ACTION_TEXT = {"start": "Démarrer les étapes.", "done": "C'est fait.", "blocked": "Ça ne marche pas.", "explain": "Pouvez-vous m'expliquer ?",
                "back": "Revenir à l'étape précédente.", "wrong_fiche": "Ce n'est pas la bonne fiche.",
                "solved_yes": "Problème résolu.", "solved_no": "Le problème persiste.", "none": "Aucune de ces fiches."}

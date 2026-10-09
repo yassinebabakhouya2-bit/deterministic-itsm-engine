@@ -712,7 +712,7 @@ PAGE = """
       <p>Connecté via Entra ID — le client affiché ci-dessous est déterminé automatiquement par votre organisation.</p>
     </div>
   </div>
-  <a href="/diag" style="margin-left:auto;margin-right:14px;color:var(--txt);font-size:.85rem;font-weight:600;text-decoration:none">Nouvel assistant →</a>
+  <a href="/diag" style="margin-left:auto;margin-right:14px;color:var(--txt);font-size:.85rem;font-weight:600;text-decoration:none">Assistant →</a>
   {% if itsm_enabled %}<a href="/itsm" style="margin-right:14px;color:var(--txt);font-size:.85rem;font-weight:600;text-decoration:none">Tickets ITSM →</a>{% endif %}
   <div class="profile-menu">
     <button type="button" class="profile-avatar" id="profile-avatar-btn"
@@ -725,8 +725,8 @@ PAGE = """
 </header>
 <div class="layout">
   <aside class="sidebar">
-    <a class="sidebar-new" href="/?client_id={{ client_id }}">＋ Nouvelle conversation</a>
-    <div class="sidebar-section-label">Conversations</div>
+    <a class="sidebar-new" href="/diag?client_id={{ client_id }}">＋ Nouveau diagnostic</a>
+    <div class="sidebar-section-label">Anciennes conversations</div>
     <div class="conv-list">
       {% for c in conversations %}
       <div class="conv-row">
@@ -759,7 +759,14 @@ PAGE = """
     <div class="error">{{ error }}</div>
     {% endif %}
 
-    {% if not turns %}
+    {% if read_only %}
+    <div class="welcome">
+      <div class="welcome-title">Assistant classique : archives</div>
+      <div class="welcome-sub">L'assistant classique est désormais intégré à l'<a href="/diag?client_id={{ client_id }}">Assistant</a> :
+        il montre d'abord la fiche trouvée, puis vous guide pas à pas, et répond librement quand aucune fiche ne correspond.
+        Vos conversations enregistrées avant cette fusion restent consultables ici, en lecture seule.</div>
+    </div>
+    {% elif not turns %}
     <div class="welcome">
       <div class="welcome-title">Comment puis-je vous aider ?</div>
       <div class="welcome-sub">Posez une question sur vos procédures IT — la réponse combine votre
@@ -882,6 +889,7 @@ PAGE = """
     {% endfor %}
   </div></div>
 
+  {% if not read_only %}
   <form method="post" class="composer" enctype="multipart/form-data">
     <input type="hidden" name="conversation_id" value="{{ active_conversation_id or '' }}">
     <div class="composer-inner">
@@ -900,6 +908,7 @@ PAGE = """
       </div>
     </div>
   </form>
+  {% endif %}
   {% endif %}
   </div>
 </div>
@@ -1048,6 +1057,12 @@ def _handle(conversation_id):
         or request.args.get("client_id")
         or (allowed_clients[0] if allowed_clients else "")
     )
+    # Merged into the Assistant (app/diag_tab.py, 2026-10-09): this page only reads the
+    # conversations saved before the merge. A question posted here goes to the Assistant;
+    # the answering code below stays for that reason only and is no longer reached.
+    if request.method == "POST":
+        return redirect(url_for("diag.home", client_id=client_id) if client_id in allowed_clients
+                        else url_for("diag.home"))
     query = request.form.get("query", "")
     # Detected up front (2026-09-... "capture seule, sans texte" UI
     # request): the file itself is only read further down, once we know
@@ -1163,14 +1178,15 @@ def _handle(conversation_id):
         active_conversation_id=conversation_id,
         example_questions=EXAMPLE_QUESTIONS,
         itsm_enabled=itsm_access_for_request(),
+        read_only=True,
     )
 
 
 @app.route("/")
 def root():
-    # One entry point: the unified assistant (closest KB fiche shown at once, then the
-    # guided diagnostic) lives in app/diag_tab.py. The previous single-shot assistant
-    # stays reachable at /classic (and keeps its saved conversations).
+    # One entry point: the unified assistant (the chosen KB fiche shown first, its steps
+    # run once the user starts them, the free-form answer when no fiche matches) lives in
+    # app/diag_tab.py. /classic only shows the conversations saved before the merge.
     return redirect("/diag")
 
 

@@ -4,7 +4,7 @@
 # Routes:
 #   GET  /diag                     list of my sessions + new diagnostic form
 #   POST /diag/new                 start a session (text and/or screenshot)
-#   GET  /diag/s/<id>              fiche choice, step summary, current step, help
+#   GET  /diag/s/<id>              fiche choice, the chosen fiche (shown before its steps run), current step, help
 #   POST /diag/s/<id>/reply        action (done/blocked/...), text and/or screenshot
 #   POST /diag/s/<id>/writeback    an ITSM agent validates the note for the session's ServiceNow ticket
 #   POST /api/servicenow/webhook   ServiceNow ticket event (HMAC signed, JSON in / JSON out)
@@ -437,7 +437,7 @@ def create_diagnostic_blueprint(table_service, deps, store=None, writeback=None)
         except Conflict:
             abort(409)
         return jsonify({k: view[k] for k in ("session_id", "state", "terminal", "guide", "current_step",
-                                             "outbox")})
+                                             "steps_started", "outbox")})
 
     @bp.route("/diag/internal/sweep", methods=["POST"])
     def sweep():
@@ -488,7 +488,6 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 </style></head><body>
 <header><h1>KnowledgeEngine v9</h1>
 <a class="cur" href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a>{% if labels_nav %}<a href="/labels">Labellisation</a><a href="/dictionary">Dictionnaire</a>{% endif %}
-<a href="/classic" class="mut" style="font-weight:400">Assistant classique</a>
 <span class="mut" style="margin-left:auto">{{ display_name }}</span></header>
 <main>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -496,7 +495,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 
 {% if view == "home" %}
 <div class="card"><b>Décrivez votre problème</b>
-<p class="mut">Collez le texte du problème et/ou joignez une capture d'écran. L'assistant trouve la fiche exacte, vous montre un résumé des étapes, puis vous accompagne étape par étape jusqu'à la résolution.</p>
+<p class="mut">Collez le texte du problème et/ou joignez une capture d'écran. L'assistant trouve la fiche de la base de connaissances, vous la montre avec ses étapes, puis, quand vous la validez, vous accompagne étape par étape jusqu'à la résolution. Si aucune fiche ne correspond, il répond librement à partir de la base.</p>
 <form method="post" action="/diag/new" enctype="multipart/form-data">
 {% if clients|length > 1 %}<select name="client_id">{% for c in clients %}<option value="{{ c }}" {{ 'selected' if c==client_id }}>{{ c }}</option>{% endfor %}</select>
 {% else %}<input type="hidden" name="client_id" value="{{ client_id }}">{% endif %}
@@ -510,7 +509,8 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <td><a class="l" href="/diag/s/{{ r.session_id }}?client_id={{ client_id }}">{{ r.title or r.session_id }}</a>
 <div class="mut">{{ r.ticketId or ('Application') }} · {{ (r.updatedUtc or '')[:16].replace('T',' ') }}</div></td>
 <td style="text-align:right"><span class="badge b-{{ r.state }}">{{ states.get(r.state, r.state) }}</span></td></tr>{% endfor %}</table>
-{% else %}<p class="mut">Aucune session.</p>{% endif %}</div>
+{% else %}<p class="mut">Aucune session.</p>{% endif %}
+<p class="mut" style="margin:10px 0 0"><a class="l" href="/classic?client_id={{ client_id }}">Anciennes conversations de l'assistant classique</a> (lecture seule)</p></div>
 
 {% else %}
 {% set g = s.guide %}
@@ -531,9 +531,9 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 {% if g.summary %}<div>{{ g.summary }}</div>{% endif %}
 {% if g.approximate %}<div class="mut" style="margin-top:6px">Je n'ai pas pu confirmer que c'est exactement la bonne fiche : dites-le-moi si elle ne correspond pas.</div>{% endif %}
 {% if g.preconditions %}<p class="mut" style="margin:10px 0 0"><b>Avant de commencer :</b> {{ g.preconditions|join(' · ') }}</p>{% endif %}
-<div class="bar"><i style="width:{{ (100 * [cur, n]|min / n)|round|int }}%"></i></div>
-<div class="mut">{{ [cur, n]|min }} / {{ n }} étapes faites</div>
-<ol class="st">{% for st in g.steps %}<li class="{{ 'done' if loop.index0 < cur else ('cur' if loop.index0 == cur else '') }}">
+{% if s.steps_started %}<div class="bar"><i style="width:{{ (100 * [cur, n]|min / n)|round|int }}%"></i></div>
+<div class="mut">{{ [cur, n]|min }} / {{ n }} étapes faites</div>{% else %}<div class="mut" style="margin-top:10px">{{ n }} étape{{ 's' if n > 1 }} · pas encore démarrées</div>{% endif %}
+<ol class="st">{% for st in g.steps %}<li class="{{ '' if not s.steps_started else ('done' if loop.index0 < cur else ('cur' if loop.index0 == cur else '')) }}">
 <span class="n">{{ '✓' if loop.index0 < cur else loop.index }}</span><span>{{ st.title }}</span></li>{% endfor %}</ol>
 {% if g.source_url %}<div class="mut" style="margin-top:8px">Source : <a class="l" href="{{ g.source_url }}" rel="noopener noreferrer">ouvrir la fiche</a></div>{% endif %}
 </div></aside>
@@ -572,7 +572,20 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <div class="row"><button class="lnk" type="submit" name="action" value="none">Aucune de ces fiches</button></div></div>
 {% endif %}
 
-{% if g and s.state == 'GUIDING' %}
+{% if g and s.state == 'GUIDING' and not s.steps_started %}
+<div class="card" id="focus" style="border-left:4px solid var(--acc)">
+<div class="mut">📄 Fiche {{ 'la plus proche' if g.approximate else 'sélectionnée' }}{% if g.parent_id.startswith('kefind:') %} par le moteur déterministe{% endif %}</div>
+<h2 style="margin:4px 0 6px;font-size:1.2rem">{{ g.title }}</h2>
+{% if g.summary %}<div>{{ g.summary }}</div>{% endif %}
+{% if g.preconditions %}<p class="mut" style="margin:10px 0 0"><b>Avant de commencer :</b> {{ g.preconditions|join(' · ') }}</p>{% endif %}
+<details style="margin-top:10px"><summary class="mut" style="cursor:pointer">▸ voir les {{ n }} étape{{ 's' if n > 1 }} en détail</summary>
+<ol style="margin:8px 0 0;padding-left:22px">{% for st in g.steps %}<li style="margin-bottom:6px"><b>{{ st.title }}</b><div style="white-space:pre-wrap">{{ st.instruction }}</div></li>{% endfor %}</ol></details>
+{% if g.source_url %}<div class="mut" style="margin-top:8px">Source : <a class="l" href="{{ g.source_url }}" rel="noopener noreferrer">ouvrir la fiche</a></div>{% endif %}
+<div class="row"><button class="ok" type="submit" name="action" value="start">▶ Démarrer les étapes</button>
+<button class="alt" type="submit" name="action" value="wrong_fiche">Ce n'est pas la bonne fiche</button></div></div>
+{% endif %}
+
+{% if g and s.state == 'GUIDING' and s.steps_started %}
 {% if cur < n %}{% set stp = g.steps[cur] %}
 <div class="card step" id="focus" style="border-left:4px solid var(--acc)"><div class="mut">Étape {{ cur + 1 }} sur {{ n }}</div>
 <h2>{{ stp.title }}</h2><div class="ins">{{ stp.instruction }}</div>
@@ -599,7 +612,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <button class="alt" type="submit" name="action" value="solved_no">✗ Non, pas encore</button></div></div>
 {% endif %}
 
-<div class="card"{% if not g and not s.choices and s.state != 'OPEN' %} id="focus"{% endif %}><div class="mut">{% if g %}Une question ou un blocage sur cette étape ? Décrivez-le ou joignez une capture.{% elif s.state == 'OPEN' %}Continuez à décrire le problème ou joignez une capture : je poursuis le diagnostic.{% elif s.state == 'STUCK' %}Décrivez le problème autrement ou joignez une capture.{% else %}Précisez le problème pour affiner la recherche (optionnel).{% endif %}</div>
+<div class="card"{% if not g and not s.choices and s.state != 'OPEN' %} id="focus"{% endif %}><div class="mut">{% if g and not s.steps_started %}Ce n'est pas tout à fait ça ? Précisez le problème : je relance la recherche.{% elif g %}Une question ou un blocage sur cette étape ? Décrivez-le ou joignez une capture.{% elif s.state == 'OPEN' %}Continuez à décrire le problème ou joignez une capture : je poursuis le diagnostic.{% elif s.state == 'STUCK' %}Décrivez le problème autrement ou joignez une capture.{% else %}Précisez le problème pour affiner la recherche (optionnel).{% endif %}</div>
 <textarea name="text" placeholder="Votre message…"></textarea>
 <div class="row"><input type="file" name="screenshot" accept="image/png,image/jpeg,image/webp" multiple>
 <button type="submit">Envoyer</button></div></div>
