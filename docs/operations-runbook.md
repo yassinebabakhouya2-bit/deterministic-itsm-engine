@@ -1178,7 +1178,7 @@ Diagnostic en cours pour trouver le fichier exact : la pagination de `scopeRepet
 
 **Conséquence** : l'étape 5 du plan Jalon 8 (tester 2-3 vidéos) est bloquée — aucune vidéo n'est encore arrivée dans `video-raw-client-s`, donc `logic-video-index-client-s` n'a encore rien à traiter.
 
-**Pivot** : `find_failure2.ps1` remplace chaque appel `az rest` par un `Invoke-RestMethod` natif PowerShell avec un jeton bearer obtenu une seule fois (`az account get-access-token`), pour contourner le parsing d'URL problématique de `az rest`/CLI. Pas encore exécuté à l'heure de cette entrée.
+**Pivot** : `find_failure2.ps1` remplace chaque appel `az rest` par un `Invoke-RestMethod` natif PowerShell avec un jeton bearer obtenu une seule fois (`az account get-access-token`), pour contourner le parsing d'URL problématique de `az rest`/CLI. Pas encore exécuté à l'heure de cette entrée. (Script ponctuel retiré du dépôt le 2026-10-09, §19.13 : la technique -- `Invoke-RestMethod` + jeton bearer de `az account get-access-token`, en suivant `nextLink` -- suffit à le refaire.)
 
 ### 10.10 CAUSE RACINE trouvee (2026-09-26) — abonnement Azure DESACTIVE pour non-paiement
 
@@ -2873,3 +2873,43 @@ une vraie fiche), KB0233 « Associate a phone line » -- la bonne, 4e. L'écran 
 la fiche ne l'est pas : le classement (§19.11) est le problème, pas l'affichage. Le résumé de la carte
 répète le titre (pour une fiche du moteur, `summary` = son libellé). Arrêt des changements de code à la
 demande de Yassine, le temps de faire le point (voir la suite de cette section).
+
+### 19.13 Remise au propre avant la nouvelle architecture (2026-10-09)
+
+Arrêt des ajustements successifs du choix de fiche. Direction retenue (validée par Yassine) :
+**enrichissement sémantique à l'ingestion → routage déterministe au runtime** -- métadonnées
+structurées par fiche (intention canonique d'une taxonomie fermée, application du dictionnaire,
+alias FR/EN, citations vérifiées), proposées par le modèle à l'ingestion, contrôlées par le code,
+**validées par une personne** ; au runtime, routage par niveaux L0 identifiant → L1 alias validé
+(inclusion de tokens) → L2 (intention, application) → L3 repli par le sens (moteur actuel, gelé,
+jamais « exact ») → L4 réponse libre. Spécification complète : `docs/v10-deterministic-engine.md`,
+section « Semantic enrichment at ingestion, deterministic routing at runtime » ; ordre : nettoyage → vérité terrain (30-50 cas dans
+`/labels`) → règle d'exclusion des fiches vides/LIBRE → passes d'enrichissement A/B/C + revue →
+tables de routage → benchmark (fiche fausse montrée comme exacte = 0) → déploiement.
+
+Nettoyage (ce commit) :
+- `git revert` de `3ba23b2` (fiche « la plus proche » affichée d'office, sans liste) : un
+  contournement d'interface d'un problème de classement, qui affichait KB0217 en grand pour
+  « comment attribuer une ligne teams ». Retour au comportement de `cb52d7f` : une fiche certaine est
+  montrée (aperçu, puis « Démarrer les étapes ») ; une fiche incertaine donne la liste « Quelle fiche
+  correspond ? ». Le paragraphe de §19.12 qui décrit `3ba23b2` reste, comme historique. Conflit du
+  revert sur ce runbook résolu en gardant le journal intact.
+- Supprimés : `find_failure.ps1`, `find_failure2.ps1`, `check_repetition.ps1` (racine, débogage
+  ponctuel du 2026-10-01 avec un `runId` codé en dur ; technique décrite plus haut) et
+  `scripts/diag-encoding.ps1` (« Diagnostic v5 », ponctuel, cité nulle part).
+- Le mode sémantique (`c4a7104`, `1af2ce6`) reste déployé et **gelé** : plus aucun réglage ; son sort
+  (repli L3 ou simplification) se décide au benchmark.
+
+Tests `tests/` 105 (retour à l'état de `cb52d7f`) ; smoke test d'import de `app/app.py` OK.
+
+**Déployer le revert** (Web App seulement ; la Function kecore n'est pas touchée) :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+git checkout main; git pull
+.\deploy-webapp.ps1
+```
+
+Vérifier : « comment attribuer une ligne teams » redonne la liste « Quelle fiche correspond ? »
+(KB0217, KB0032, KB0233) ; « Mon compte est bloqué, je n'arrive plus à me connecter à Windows »
+montre KB0120 avec « Démarrer les étapes ». Pas encore déployé à la date de cette entrée.

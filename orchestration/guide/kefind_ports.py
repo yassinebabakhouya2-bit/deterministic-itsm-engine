@@ -7,10 +7,9 @@ are the fiche's own sentences, verified at decomposition:
 
 - the engine shows a fiche -> it is THE fiche (score 4, the only "strong" candidate), and the judge
   confirms the engine's choice instead of asking a model;
-- the engine asks (a choice between fiches, or which application) -> the fiches it offers (score 1.5,
-  never strong), one per branch of its question in turn: the first is shown as the closest fiche
-  (approximate), the others one click away (2026-10-09: no list to pick from first); no model
-  overrides the engine's order;
+- the engine asks (a choice between fiches, or which application) -> the fiches it offers are the
+  choices (score 1.5, never strong), one per branch of its question in turn, the person picks; no
+  model overrides the question;
 - the engine abstains, has no map for the client, or cannot be reached -> the search index takes
   over, exactly as before (``fallback`` ports): no question goes unanswered because of the engine;
 - the engine's interpretation failed (a model error) and no entity of the ticket backed its decision
@@ -24,8 +23,8 @@ are the fiche's own sentences, verified at decomposition:
   found nothing close, or every fiche it offered was rejected: that is the answer -- no search index
   and no model judge pick a fiche instead (the free-form OPEN answer follows, labelled as such);
 - the engine decided by words because the embedding service was down (``mode: "degraded"``): its
-  fiche is only the closest (approximate), never THE fiche -- the same question gets a semantic
-  decision once the service is back, and no step runs until the person starts the fiche shown.
+  fiche is offered, never shown as THE fiche -- the same question gets a semantic decision once the
+  service is back, so an outage never guides anyone on a fiche the person did not confirm.
 
 A candidate of the engine is ``kefind:<run id>:<fiche id>``: the KB map that made the decision is
 pinned in the session, so a pick or a help request later reads the same fiche even after a new
@@ -166,7 +165,7 @@ class KefindPorts:
                 for c in cands:
                     if fiche_id_of(c.parent_id) == decision.get("fiche_id"):
                         return c.parent_id
-            return None  # the code did not decide: its first fiche is shown as the closest only
+            return None  # the code did not decide: the person chooses among its fiches
         return self.fallback.judge(st, cands)
 
     def load_chunks(self, parent_id: str) -> Dict[str, str]:

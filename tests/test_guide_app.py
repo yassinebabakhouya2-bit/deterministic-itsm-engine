@@ -99,16 +99,14 @@ def test_full_flow_fiche_shown_then_steps_then_solved():
     assert "Problème résolu" in page and "Transmis" not in page
 
 
-def test_an_uncertain_start_shows_the_closest_fiche_with_the_others_one_click_away():
+def test_ambiguous_start_shows_choice_buttons():
     app, _ = make_app(strong=False)
     c = app.test_client()
     sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "probleme"}))
     page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
-    assert "Quelle fiche correspond" not in page and "Fiche la plus proche" in page and 'value="start"' in page
-    assert "Autres fiches proches" in page and 'value="pick:1">K2</button>' in page
+    assert "Quelle fiche correspond" in page and 'value="pick:1"' in page
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "pick:1"})
-    page = c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
-    assert "Fiche sélectionnée" in page and 'value="pick:1">K1</button>' in page
+    assert 'value="start"' in c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
     start_steps(c, sid)
     assert "Étape 1 sur 2" in c.get(f"/diag/s/{sid}?client_id=client-s").get_data(as_text=True)
 
@@ -266,8 +264,7 @@ def test_a_question_of_the_engine_offers_its_fiches():
     app, _ = make_app(engine=FakeEngine(kind="question"))
     c = app.test_client()
     page = page_of(c, sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "probleme"})))
-    assert "Quelle fiche correspond" not in page and "Fiche la plus proche par le moteur déterministe" in page
-    assert "Réinitialiser son mot de passe Windows" in page and 'value="pick:1">Configurer Outlook</button>' in page
+    assert "Quelle fiche correspond" in page and "Configurer Outlook" in page and "correspondance forte" not in page
 
 
 def test_a_ticket_number_comes_from_itsm_agents_only_and_well_formed():

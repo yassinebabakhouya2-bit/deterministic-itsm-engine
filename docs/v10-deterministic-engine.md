@@ -116,8 +116,7 @@ The classic assistant's own free-form RAG answer (`orchestration/answer.py::diag
 
 Since 2026-10-09 the two assistants are one (runbook §19.12): the chosen fiche is shown first (title,
 summary, every step) and its steps only run once the user starts them; `/classic` keeps the conversations
-saved before the merge, read-only. When no fiche is certain (an engine question, a degraded decision), the
-closest one is shown, marked as such, with the next ones one click away -- never a list to pick from first.
+saved before the merge, read-only.
 
 ## The semantic mode: fiches found by meaning, thresholds calibrated on the KB (2026-10-09)
 
