@@ -39,15 +39,23 @@ class MemoryTable:
             raise labels_tab.Conflict()
         self.upsert(entity)
 
+    def delete(self, client, row_key):
+        self.rows.pop((client, row_key), None)
+
     def list(self, client, select=None):
         rows = [dict(r) for (p, _), r in sorted(self.rows.items()) if p == client]
         return [{k: v for k, v in r.items() if k in select} for r in rows] if select else rows
 
 
-def make_app(access=True, clients=(CLIENT,), me="alice"):
-    tables = {name: MemoryTable() for name in ("tickets", "fiches", "labels", "scores")}
+SEEDS = {CLIENT: [("comment attribuer une ligne teams", ["KB0233"]), ("Mon compte est bloqué", ["KB0120"]),
+                  ("une fiche absente de la carte", ["KB9999"])]}
+
+
+def make_app(access=True, clients=(CLIENT,), me="alice", ref_seeds=SEEDS):
+    tables = {name: MemoryTable() for name in ("tickets", "fiches", "labels", "scores", "refs")}
     for fiche_id, label, searchable in (("KB0120", "KB0120- LOCKED ACCOUNT", True), ("KB0200", "KB0200- VPN", True),
-                                        ("KB0300", "KB0300- INFO", False)):
+                                        ("KB0300", "KB0300- INFO", False),
+                                        ("KB0233", "KB0233 -  Associate a phone line", True)):
         tables["fiches"].upsert({"PartitionKey": CLIENT, "RowKey": fiche_id.lower(), "fiche_id": fiche_id,
                                  "label": label, "searchable": searchable})
     seeds = [("I1", "fiche", "KB0120"), ("I2", "fiche", "KB0120"), ("I3", "fiche", "KB0200"),
@@ -60,7 +68,7 @@ def make_app(access=True, clients=(CLIENT,), me="alice"):
             "kefind_candidates": json.dumps([c for c in (shown, "KB0200", "KB0300") if c]),
             "kefind_question": "Laquelle de ces fiches ?" if kind == "question" else "", "kefind_kb_run": "r1"})
     deps = {"allowed_clients": lambda: list(clients), "user_id": lambda: me, "display_name": lambda: me.title(),
-            "label_access": lambda: access}
+            "label_access": lambda: access, "ref_seeds": ref_seeds}
     app = Flask(__name__)
     app.register_blueprint(labels_tab.create_labels_blueprint(tables, deps))
 
@@ -224,3 +232,106 @@ def test_two_first_labels_at_once_cannot_both_win():
     r = post(app.test_client(), f"/labels/{CLIENT}/t/I3", {"decision": "confirm", "seen": ""})
     assert "msg=changed" in r.headers["Location"]
     assert json.loads(original_get(CLIENT, "I3")["expected"]) == ["KB0200"]
+
+
+# ------------------------------------------------------------ reference questions
+def refs_of(tables):
+    return {r["text"]: (json.loads(r["expected"]), r) for (_, _), r in tables["refs"].rows.items()}
+
+
+def test_a_reference_question_is_saved_with_its_fiche_or_none():
+    app, tables = make_app()
+    c = app.test_client()
+    r = post(c, f"/labels/{CLIENT}/refs", {"text": "  comment attribuer   une ligne teams ", "fiche": "KB0233",
+                                           "decision": "fiche"})
+    assert "msg=ref_saved" in r.headers["Location"]
+    post(c, f"/labels/{CLIENT}/refs", {"text": "la machine à café fuit", "decision": "none"})
+    refs = refs_of(tables)
+    expected, row = refs["comment attribuer une ligne teams"]
+    assert expected == ["KB0233"] and row["RowKey"] == labels_tab.ref_id("Comment attribuer une ligne TEAMS")
+    assert row["RowKey"].startswith("ref-") and row["labeled_by_name"] == "Alice" and row["source"] == "form"
+    assert refs["la machine à café fuit"][0] == []
+    page = c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)
+    assert "KB0233 -  Associate a phone line" in page and "aucune fiche" in page
+    assert "<b>2</b> questions" in c.get(f"/labels?client={CLIENT}").get_data(as_text=True)
+
+
+def test_the_same_question_twice_is_one_row_and_only_its_fiche_can_change():
+    app, tables = make_app()
+    c = app.test_client()
+    post(c, f"/labels/{CLIENT}/refs", {"text": "Mon compte est bloqué", "fiche": "KB0200", "decision": "fiche"})
+    again = post(c, f"/labels/{CLIENT}/refs", {"text": "mon compte  est BLOQUÉ", "fiche": "KB0120", "decision": "fiche"})
+    assert "msg=ref_exists" in again.headers["Location"] and len(tables["refs"].rows) == 1
+    (_, row), = refs_of(tables).values()
+    edit = c.get(f"/labels/{CLIENT}/refs?id={row['RowKey']}").get_data(as_text=True)
+    assert "Modifier la fiche attendue" in edit and 'value="KB0200"' in edit
+    post(c, f"/labels/{CLIENT}/refs", {"id": row["RowKey"], "seen": row["labeled_at"], "fiche": "KB0120",
+                                       "decision": "fiche", "text": "ignored on an edit"})
+    assert refs_of(tables)["Mon compte est bloqué"][0] == ["KB0120"]
+
+
+def test_an_edit_over_someone_elses_change_is_refused():
+    app, tables = make_app()
+    c = app.test_client()
+    post(c, f"/labels/{CLIENT}/refs", {"text": "Mon compte est bloqué", "fiche": "KB0120", "decision": "fiche"})
+    (_, row), = refs_of(tables).values()
+    r = post(c, f"/labels/{CLIENT}/refs", {"id": row["RowKey"], "seen": "an older timestamp", "decision": "none"})
+    assert "msg=ref_changed" in r.headers["Location"]
+    assert refs_of(tables)["Mon compte est bloqué"][0] == ["KB0120"]
+
+
+def test_bad_reference_input_is_refused():
+    app, tables = make_app()
+    c = app.test_client()
+    assert "msg=ref_text" in post(c, f"/labels/{CLIENT}/refs", {"text": "ab", "decision": "none"}).headers["Location"]
+    assert "msg=ref_text" in post(c, f"/labels/{CLIENT}/refs", {"text": "x" * 501, "decision": "none"}).headers["Location"]
+    unknown = post(c, f"/labels/{CLIENT}/refs", {"text": "une question", "fiche": "KB9999", "decision": "fiche"})
+    assert "msg=unknown_fiche" in unknown.headers["Location"]
+    assert post(c, f"/labels/{CLIENT}/refs", {"text": "une question", "decision": "maybe"}).status_code == 400
+    assert post(c, f"/labels/{CLIENT}/refs", {"text": "une question", "decision": "none"}, origin=False).status_code == 403
+    assert c.get(f"/labels/{CLIENT}/refs?id=I1").status_code == 404
+    assert post(c, f"/labels/{CLIENT}/refs/I1/delete", {}).status_code == 404
+    assert tables["refs"].rows == {}
+
+
+def test_reference_questions_need_the_group_and_the_client():
+    app, _ = make_app(access=False)
+    c = app.test_client()
+    assert c.get(f"/labels/{CLIENT}/refs").status_code == 403
+    assert post(c, f"/labels/{CLIENT}/refs", {"text": "question", "decision": "none"}).status_code == 403
+    assert post(c, f"/labels/{CLIENT}/refs/seed", {}).status_code == 403
+    app, _ = make_app(clients=("clienta",))
+    assert app.test_client().get(f"/labels/{CLIENT}/refs").status_code == 403
+
+
+def test_a_reference_question_is_escaped_and_can_be_deleted():
+    app, tables = make_app()
+    c = app.test_client()
+    post(c, f"/labels/{CLIENT}/refs", {"text": "<script>alert(1)</script> écran noir", "decision": "none"})
+    page = c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)
+    assert "<script>alert(1)" not in page and "&lt;script&gt;" in page
+    (_, row), = refs_of(tables).values()
+    assert "msg=ref_deleted" in post(c, f"/labels/{CLIENT}/refs/{row['RowKey']}/delete", {}).headers["Location"]
+    assert tables["refs"].rows == {}
+
+
+def test_the_repository_questions_are_imported_on_a_click_create_only():
+    app, tables = make_app()
+    c = app.test_client()
+    page = c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)
+    assert "3 questions livrées avec le dépôt" in page and tables["refs"].rows == {}   # a page view writes nothing
+    post(c, f"/labels/{CLIENT}/refs", {"text": "Mon compte est bloqué", "fiche": "KB0200", "decision": "fiche"})
+    assert "msg=ref_seeded" in post(c, f"/labels/{CLIENT}/refs/seed", {}).headers["Location"]
+    refs = refs_of(tables)
+    assert refs["comment attribuer une ligne teams"][0] == ["KB0233"]
+    assert refs["comment attribuer une ligne teams"][1]["source"] == "seed"
+    assert refs["Mon compte est bloqué"][0] == ["KB0200"]       # a person's label is never overwritten
+    assert "une fiche absente de la carte" not in refs           # its fiche is not in the map
+    post(c, f"/labels/{CLIENT}/refs/seed", {})
+    assert len(tables["refs"].rows) == 2
+
+
+def test_the_repository_file_holds_the_priority_case():
+    seeds = labels_tab.load_ref_seeds()
+    assert ("comment attribuer une ligne teams", ["KB0233"]) in seeds["client-s"]
+    assert all(e for _, e in seeds["client-s"])

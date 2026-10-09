@@ -551,7 +551,7 @@ def scoreboard_run(context: df.DurableOrchestrationContext):
     payload = context.get_input()
     prepared = yield context.call_activity("scoreboard_prepare", payload)
     if not prepared["count"]:
-        return {"client": payload["client"], "sb_id": payload["sb_id"], "error": "no labeled ticket yet",
+        return {"client": payload["client"], "sb_id": payload["sb_id"], "error": "no labeled ticket or reference question yet",
                 "prepared": prepared}
     payload = {**payload, "kb_run_id": prepared["kb_run_id"]}
     ranges = pipeline.batches(prepared["count"], sb_svc.BATCH_SIZE)
@@ -565,9 +565,9 @@ def scoreboard_run(context: df.DurableOrchestrationContext):
 
 @app.activity_trigger(input_name="payload")
 def scoreboard_prepare(payload: dict) -> dict:
-    from kecore_table import LABELS
+    from kecore_table import LABELS, REFERENCES
 
-    return sb_svc.prepare(storage(), table(), table(LABELS), payload)
+    return sb_svc.prepare(storage(), table(), table(LABELS), payload, refs_table=table(REFERENCES))
 
 
 @app.activity_trigger(input_name="payload")

@@ -386,7 +386,7 @@ class OrchestratorsTest(unittest.TestCase):
     def test_no_label_no_scoreboard(self):
         out = drive(self.fa.scoreboard_run, Ctx({"client": "client-s", "sb_id": "s"},
                                                 {"scoreboard_prepare": lambda p: {"count": 0}}))
-        self.assertEqual(out["error"], "no labeled ticket yet")
+        self.assertEqual(out["error"], "no labeled ticket or reference question yet")
 
 
 import unittest.mock  # noqa: E402  (used by RoutesTest)

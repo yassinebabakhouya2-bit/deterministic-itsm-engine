@@ -5,6 +5,8 @@ One partition per client (``PartitionKey``) in every table:
                 last blank run's finding for it (``kefind_*`` properties, merged in)
   kefindfiches  the fiches a labeler may pick (one row per fiche of the KB map last used)
   ticketlabels  the human labels, written by the Web App's labeling tab, read here
+  refquestions  reference questions typed by a person with the fiche they need (or none), written by
+                the labeling tab, read by the scoreboard next to the labeled tickets
   kecorescores  one row per scoreboard run (the headline numbers)
   kefindpending the dictionary's candidate names seen in live questions (dictionary_service.py)
 
@@ -26,6 +28,7 @@ from azure.identity import DefaultAzureCredential
 TICKETS = "tickets"
 FICHES = "kefindfiches"
 LABELS = "ticketlabels"
+REFERENCES = "refquestions"
 SCORES = "kecorescores"
 PENDING = "kefindpending"
 

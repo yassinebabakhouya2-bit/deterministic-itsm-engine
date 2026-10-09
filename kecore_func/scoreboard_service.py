@@ -16,6 +16,12 @@ chosen on half A and confirmed on half B, as the scoreboard README asks -- a thr
 only when both halves hold it under the ceiling. A labeled fiche also accepts what the KB graph maps
 it to (its canonical twin, the fiche replacing it): that is the fiche the engine is able to show.
 
+Reference questions (``refquestions``, typed in the labeling tab with the fiche they need, or none)
+are measured with the labeled tickets, in the same dataset and the same numbers -- they are ground truth
+too -- and also listed one by one in the report's non-regression section: a question passes when the
+expected fiche is the one shown, or, expecting none, when no fiche is shown. Their ids start with
+``ref-`` (``REF_PREFIX``), so they never collide with a ticket id.
+
 Outputs, under kecore-<client>/scoreboard/<id>/: dataset.jsonl (the frozen labeled set), results/,
 results.jsonl, report.md, summary.json; scoreboard/latest.json names the last run; one row per run
 in the ``kecorescores`` table (what the labeling tab displays).
@@ -34,7 +40,7 @@ import kefind_service as finder
 from kecore.tickets import ticket_text
 from kefind.funnel_engine import FunnelEngine
 from scoreboard.dataset import Ticket, parse_expected, ticket_from_dict
-from scoreboard.metrics import Rate, calibrate, summarize, tickets_needed
+from scoreboard.metrics import Rate, calibrate, canonical, summarize, tickets_needed
 from scoreboard.pricing import Prices
 from scoreboard.report import build_report, fmt_rate, pct
 from scoreboard.runner import run_engine
@@ -45,6 +51,8 @@ MAX_APPLY_WRONG = 0.10  # a floor measured against a looser ceiling may be read,
 BATCH_SIZE = 25
 LATEST = "scoreboard/latest.json"
 _ID_RE = re.compile(r"[0-9A-Za-z-]{1,64}")  # always fullmatch
+REF_PREFIX = "ref-"
+MAX_REF_TEXT = 500
 
 
 def validate_scoreboard_request(body, allowed_clients, sb_id: str) -> dict:
@@ -94,6 +102,23 @@ def labels_of(labels_table, client: str) -> dict[str, list[str]]:
     return out
 
 
+def references_of(refs_table, client: str) -> list[tuple[str, str, list[str]]]:
+    """(id, question, expected fiche ids) of the client's reference questions, in id order; a row
+    without a ``ref-`` id, a question or a readable expectation is left out."""
+    out = []
+    for row in refs_table.list(client) if refs_table is not None else []:
+        ref_id, text = row.get("RowKey") or "", " ".join(str(row.get("text") or "").split())
+        if not ref_id.startswith(REF_PREFIX) or not _ID_RE.fullmatch(ref_id) or not text:
+            continue
+        try:
+            expected = parse_expected(json.loads(row.get("expected") or "null"))
+        except (ValueError, TypeError):
+            continue
+        if expected is not None:
+            out.append((ref_id, text[:MAX_REF_TEXT], expected))
+    return out
+
+
 def accepted(kbmap, expected: list[str]) -> list[str]:
     """The labeled fiches, plus what the graph maps each one to (the fiche the engine can show)."""
     out: list[str] = []
@@ -108,8 +133,9 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def prepare(storage: pipeline.Storage, tickets_table, labels_table, payload: dict) -> dict:
-    """Freezes the labeled set the run measures (dataset.jsonl): ticket text, accepted fiches, half."""
+def prepare(storage: pipeline.Storage, tickets_table, labels_table, payload: dict, refs_table=None) -> dict:
+    """Freezes the labeled set the run measures (dataset.jsonl): ticket text, accepted fiches, half --
+    the labeled tickets, then the reference questions."""
     client = payload["client"]
     run_id = payload.get("run_id") or finder.latest_run(storage, client)
     if not run_id:
@@ -129,11 +155,15 @@ def prepare(storage: pipeline.Storage, tickets_table, labels_table, payload: dic
             continue
         tickets.append(Ticket(ticket_id, client, text, expected=accepted(kbmap, labels[ticket_id]),
                               meta={"split": split_of(ticket_id), "labeled": labels[ticket_id]}))
+    references = references_of(refs_table, client)
+    for ref_id, text, expected in references:
+        tickets.append(Ticket(ref_id, client, text, expected=accepted(kbmap, expected),
+                              meta={"split": split_of(ref_id), "labeled": expected, "source": "reference"}))
     data = "".join(json.dumps(t.to_dict(), ensure_ascii=False) + "\n" for t in tickets).encode("utf-8")
     storage.write(pipeline.kecore_container(client), layout(payload["sb_id"])["dataset"], data)
     return {"sb_id": payload["sb_id"], "kb_run_id": run_id, "count": len(tickets),
             "with_fiche": sum(1 for t in tickets if t.expected), "without_fiche": sum(1 for t in tickets if not t.expected),
-            "missing": missing, "empty": empty, "dataset_sha256": _sha256(data)}
+            "references": len(references), "missing": missing, "empty": empty, "dataset_sha256": _sha256(data)}
 
 
 def _dataset(storage: pipeline.Storage, payload: dict) -> list[Ticket]:
@@ -262,6 +292,41 @@ def _split_section(rec: dict, current: float, deployed) -> list[str]:
     return lines
 
 
+def reference_results(records: list[dict], tickets: list[Ticket]) -> dict:
+    """Each reference question, passed or failed: the expected fiche shown, or (expecting none) no fiche shown."""
+    by_id = {r["ticket_id"]: r for r in canonical(records)}  # the first run, as the headline numbers read it
+    rows = []
+    for t in tickets:
+        if t.meta.get("source") != "reference" or t.ticket_id not in by_id:
+            continue
+        record = by_id[t.ticket_id]
+        got = record["fiches"][0] if record.get("kind") == "fiche" and record.get("fiches") else None
+        passed = (got in record["expected"]) if record["expected"] else got is None
+        rows.append({"id": t.ticket_id, "text": t.text, "expected": list(t.meta.get("labeled") or []),
+                     "kind": record.get("kind"), "shown": got, "first": (record.get("fiches") or [None])[0],
+                     "error": record.get("error"), "passed": bool(passed and not record.get("error"))})
+    return {"n": len(rows), "passed": sum(r["passed"] for r in rows),
+            "failed": [r["id"] for r in rows if not r["passed"]], "rows": rows}
+
+
+def _reference_section(refs: dict) -> list[str]:
+    if not refs["n"]:
+        return []
+    lines = ["## Reference questions (non-regression)", "",
+             f"{refs['passed']} / {refs['n']} pass (expected fiche shown, or no fiche shown when none is expected).", "",
+             "| Question | Expected | Engine | Pass |", "|---|---|---|---|"]
+    for r in refs["rows"]:
+        if r["error"]:
+            engine = f"error: {r['error']}"
+        elif r["shown"]:
+            engine = f"shows {r['shown']}"
+        else:
+            engine = f"{r['kind']} (first: {r['first'] or '-'})"
+        cells = (r["text"][:90], ", ".join(r["expected"]) or "none", engine, "yes" if r["passed"] else "**NO**")
+        lines.append("| " + " | ".join(" ".join(str(c).split()).replace("|", "\\|") for c in cells) + " |")
+    return lines + [""]
+
+
 def _rate(data: dict) -> Rate:
     return Rate(data["k"], data["n"])
 
@@ -285,7 +350,10 @@ def report(storage: pipeline.Storage, scores_table, payload: dict, ranges: list[
     failures = sum(int(b.get("interpret_failures") or 0) for b in (batches or []))
     refused = sum(int(b.get("interpret_refused") or 0) for b in (batches or []))
     source = deployed_source(storage, client)
+    refs = reference_results(records, tickets)
     markdown = markdown.rstrip() + "\n\n" + "\n".join(_split_section(rec, current, deployed)).rstrip() + "\n"
+    if refs["n"]:
+        markdown += "\n" + "\n".join(_reference_section(refs)).rstrip() + "\n"
     if source.get("kb_run_id") and current and source["kb_run_id"] != payload["kb_run_id"]:
         markdown += (f"\n**Warning:** the floor deployed now ({current:.4g}) was calibrated on map "
                      f"{source['kb_run_id']}, not on this one ({payload['kb_run_id']}).\n")
@@ -299,7 +367,7 @@ def report(storage: pipeline.Storage, scores_table, payload: dict, ranges: list[
     summary.update(sb_id=payload["sb_id"], client=client, kb_run_id=payload["kb_run_id"], prepared=prepared,
                    interpret=payload["interpret"], interpret_failures=failures, interpret_refused=refused,
                    deployed_source=source,
-                   recommendation=rec, deployed_min_show=current,
+                   recommendation=rec, deployed_min_show=current, references=refs,
                    deployed=deployed.to_dict() if deployed else None)
     storage.write(container, paths["results"], "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records).encode("utf-8"))
     storage.write(container, paths["report"], markdown.encode("utf-8"))
@@ -314,6 +382,7 @@ def report(storage: pipeline.Storage, scores_table, payload: dict, ranges: list[
         "recommended_min_show": rec["min_show"], "confirmed": rec["confirmed"], "reason": rec["reason"],
         "deployed_min_show": current, "interpret": payload["interpret"], "interpret_failures": failures,
         "interpret_refused": refused,
+        "references": {"n": refs["n"], "passed": refs["passed"], "failed": refs["failed"]},
     }
     scores_table.upsert({
         "PartitionKey": client, "RowKey": payload["sb_id"], "kb_run": payload["kb_run_id"],
@@ -324,6 +393,7 @@ def report(storage: pipeline.Storage, scores_table, payload: dict, ranges: list[
         "recommended_min_show": "" if rec["min_show"] is None else f"{rec['min_show']:.6f}",
         "confirmed": rec["confirmed"], "reason": rec["reason"][:500], "max_wrong": payload["max_wrong"],
         "deployed_min_show": current, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ref_k": refs["passed"], "ref_n": refs["n"], "ref_failed": json.dumps(refs["failed"])[:2000],
     })
     return short
 

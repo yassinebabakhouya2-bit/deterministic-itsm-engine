@@ -16,6 +16,15 @@
 #     a label saved meanwhile by someone else is never overwritten silently;
 #   - "I don't know" skips a ticket without inventing a label.
 #
+# Reference questions (2026-10-09, table refquestions): a question typed the way a technician asks
+# it ("comment attribuer une ligne teams") with the fiche it needs, or none. Real tickets cannot hold
+# those short typed questions; the scoreboard measures both, and lists every reference question in a
+# non-regression section of its report. The question is the row's identity (ref-<sha256 of its
+# normalized text>): typing it twice edits the same row, never a duplicate; its fiche can be changed,
+# its text cannot (a new wording is a new question). config/reference-questions.yaml holds the
+# questions the repository ships with; a person imports them with one click (never on a page view),
+# create-only: a question already there keeps the label a person gave it.
+#
 # Security rules enforced SERVER-SIDE (never trusted from the form):
 #   - access: tenant + Entra group (config/labels.yaml, else config/itsm.yaml's agents) from
 #     Easy Auth's validated claims only, AND the client must be one the user may see
@@ -47,7 +56,10 @@ with open(_CONFIG_DIR / "itsm.yaml", encoding="utf-8") as _f:
 
 _ACCESS = LABELS_CONFIG.get("access") or _ITSM_ACCESS
 _TABLES = {"tickets": "tickets", "fiches": "kefindfiches", "labels": "ticketlabels", "scores": "kecorescores",
-           **(LABELS_CONFIG.get("tables") or {})}
+           "refs": "refquestions", **(LABELS_CONFIG.get("tables") or {})}
+_REF_SEEDS_PATH = _CONFIG_DIR / "reference-questions.yaml"
+REF_PREFIX = "ref-"          # the scoreboard reads only rows with this prefix (kecore_func/scoreboard_service.py)
+REF_MIN_CHARS, REF_MAX_CHARS = 3, 500
 _LOCAL_DEV = os.environ.get("LOCAL_DEV_LABELS") == "1"
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # always fullmatch: "$" would let a trailing newline in
 
@@ -69,6 +81,13 @@ MESSAGES = {
     "unknown_fiche": "Fiche inconnue : choisissez-la dans la liste proposée.",
     "empty": "Cochez au moins une fiche, ou choisissez « Aucune fiche ne couvre ce ticket ».",
     "changed": "Ce ticket vient d'être étiqueté par quelqu'un d'autre : vérifiez son étiquette puis recommencez.",
+    "ref_saved": "Question de référence enregistrée.",
+    "ref_deleted": "Question de référence supprimée.",
+    "ref_text": "La question doit faire entre 3 et 500 caractères.",
+    "ref_exists": "Cette question existe déjà : modifiez sa fiche ci-dessous.",
+    "ref_changed": "Cette question vient d'être modifiée par quelqu'un d'autre : vérifiez-la puis recommencez.",
+    "ref_seeded": "Questions du dépôt importées. Celles déjà présentes gardent leur étiquette ; celles dont la fiche "
+                  "n'est pas dans la carte actuelle sont laissées de côté.",
 }
 
 
@@ -98,6 +117,30 @@ def _order(user_id: str, row_key: str) -> str:
     """A stable pseudo-random order of its own for each labeler (the export's order would cluster
     similar tickets, and one shared order would send two labelers to the same ticket)."""
     return hashlib.sha256(f"{user_id}\x00{row_key}".encode("utf-8")).hexdigest()
+
+
+def ref_id(text: str) -> str:
+    """The row id of a reference question: its normalized text (case, spacing), hashed."""
+    normalized = " ".join(text.split()).casefold()
+    return REF_PREFIX + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def load_ref_seeds(path: Path = _REF_SEEDS_PATH) -> dict:
+    """client -> [(question, [fiche ids])] from config/reference-questions.yaml; a malformed entry is skipped."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    out: dict = {}
+    for client, items in (data.items() if isinstance(data, dict) else []):
+        for item in items if isinstance(items, list) else []:
+            text = " ".join(str((item or {}).get("text") or "").split()) if isinstance(item, dict) else ""
+            expected = item.get("expected") if isinstance(item, dict) else None
+            if REF_MIN_CHARS <= len(text) <= REF_MAX_CHARS and isinstance(expected, list) \
+                    and all(isinstance(e, str) and e for e in expected):
+                out.setdefault(str(client), []).append((text, list(expected)))
+    return out
 
 
 def _candidates(ticket: dict) -> list:
@@ -146,6 +189,9 @@ class AzureTable:
         except ResourceExistsError:
             raise Conflict() from None
 
+    def delete(self, client, row_key):
+        self._client.delete_entity(partition_key=client, row_key=row_key)
+
     def update(self, entity, etag):
         """Merges into the row only if it is still the one read (If-Match), else raises Conflict."""
         from azure.core import MatchConditions
@@ -160,19 +206,22 @@ class AzureTable:
 
 
 def azure_tables(table_service) -> dict:
-    """The four tables, the labels one created if missing (the other three belong to fn-kecore)."""
-    try:
-        table_service.create_table(_TABLES["labels"])
-    except Exception:
-        pass  # exists, or the role is not propagated yet: the first write will say so
+    """The five tables, labels and refs created if missing (the other three belong to fn-kecore)."""
+    for key in ("labels", "refs"):
+        try:
+            table_service.create_table(_TABLES[key])
+        except Exception:
+            pass  # exists, or the role is not propagated yet: the first write will say so
     return {key: AzureTable(table_service.get_table_client(name)) for key, name in _TABLES.items()}
 
 
 def create_labels_blueprint(tables: dict, deps: dict):
-    """tables: tickets / fiches / labels / scores, each with list(client, select), get(client, key),
-    upsert(entity); labels also with create(entity) and update(entity, etag), both raising Conflict.
-    deps: allowed_clients(), user_id(), display_name(), label_access()."""
+    """tables: tickets / fiches / labels / scores / refs, each with list(client, select), get(client, key),
+    upsert(entity); labels and refs also with create(entity) and update(entity, etag), both raising
+    Conflict, and refs with delete(client, key). deps: allowed_clients(), user_id(), display_name(),
+    label_access(); ref_seeds (optional): client -> [(question, [fiche ids])], else the repository's file."""
     bp = Blueprint("labels", __name__)
+    ref_seeds = deps.get("ref_seeds")
 
     @bp.app_context_processor
     def _nav():
@@ -242,8 +291,13 @@ def create_labels_blueprint(tables: dict, deps: dict):
         except Exception as exc:  # role not propagated, table missing...
             error = f"Lecture impossible : {type(exc).__name__}"
         recent = sorted(progress["labels"].values(), key=lambda r: r.get("labeled_at", ""), reverse=True)[:15]
+        refs = []
+        try:
+            refs = _refs(client)
+        except Exception as exc:
+            error = error or f"Lecture impossible : {type(exc).__name__}"
         return render_template_string(
-            PAGE, view="home", clients=clients, client=client, p=progress, score=score, recent=recent,
+            PAGE, view="home", clients=clients, client=client, p=progress, score=score, recent=recent, refs=refs,
             kinds=KIND_LABELS, error=error, msg=MESSAGES.get(request.args.get("msg", "")),
             display_name=deps["display_name"]())
 
@@ -330,6 +384,112 @@ def create_labels_blueprint(tables: dict, deps: dict):
         except Conflict:
             return back("changed")
         return redirect(url_for("labels.next_ticket", client=client, msg="skipped" if decision == "skip" else "saved"))
+
+    # ------------------------------------------------------------ reference questions
+    def _refs(client) -> list:
+        rows = [r for r in tables["refs"].list(client) if str(r.get("RowKey", "")).startswith(REF_PREFIX)]
+        for r in rows:
+            try:
+                r["expected_list"] = json.loads(r.get("expected") or "[]")
+            except ValueError:
+                r["expected_list"] = []
+        return sorted(rows, key=lambda r: (r.get("text") or "").casefold())
+
+    def _ref_entity(client, rid, text, expected, source) -> dict:
+        return {"PartitionKey": client, "RowKey": rid, "text": text,
+                "expected": json.dumps(expected, ensure_ascii=False), "source": source,
+                "labeled_by_id": deps["user_id"]() or "unknown-user",
+                "labeled_by_name": deps["display_name"]() or "Utilisateur", "labeled_at": _now_utc()}
+
+    @bp.route("/labels/<client>/refs")
+    def refs(client):
+        _guard(client)
+        catalog = _catalog(client)
+        editing = None
+        rid = request.args.get("id", "")
+        if rid:
+            if not _ID_RE.fullmatch(rid) or not rid.startswith(REF_PREFIX):
+                abort(404)
+            editing = tables["refs"].get(client, rid)
+            if editing is None:
+                abort(404)
+            editing["expected_list"] = json.loads(editing.get("expected") or "[]")
+        options = sorted(catalog.values(), key=lambda r: (r.get("label") or r["fiche_id"]).lower())
+        seeds = (ref_seeds if ref_seeds is not None else load_ref_seeds()).get(client, [])
+        return render_template_string(
+            PAGE, view="refs", client=client, refs=_refs(client), catalog=catalog, options=options, editing=editing,
+            seeds=len(seeds), msg=MESSAGES.get(request.args.get("msg", "")), display_name=deps["display_name"]())
+
+    @bp.route("/labels/<client>/refs", methods=["POST"])
+    def save_ref(client):
+        _guard(client)
+        if not _same_origin():
+            abort(403)
+        catalog = _catalog(client)
+        rid = request.form.get("id", "")
+
+        def back(code, row_id=""):
+            return redirect(url_for("labels.refs", client=client, msg=code, **({"id": row_id} if row_id else {})))
+
+        decision = request.form.get("decision", "")
+        if decision not in ("fiche", "none"):
+            abort(400)
+        if rid:                                         # an existing question: only its fiche changes
+            if not _ID_RE.fullmatch(rid) or not rid.startswith(REF_PREFIX):
+                abort(404)
+            existing = tables["refs"].get(client, rid)
+            if existing is None:
+                abort(404)
+            if existing.get("labeled_at", "") != request.form.get("seen", ""):
+                return back("ref_changed", rid)
+            text = existing.get("text") or ""
+        else:
+            existing = None
+            text = " ".join((request.form.get("text") or "").split())
+            if not REF_MIN_CHARS <= len(text) <= REF_MAX_CHARS:
+                return back("ref_text")
+            rid = ref_id(text)
+        expected: list = []
+        if decision == "fiche":
+            fiche_id = (request.form.get("fiche") or "").strip()
+            if fiche_id not in catalog:
+                return back("unknown_fiche", rid if existing else "")
+            expected = [fiche_id]
+        entity = _ref_entity(client, rid, text, expected, (existing or {}).get("source") or "form")
+        try:
+            if existing is None:
+                tables["refs"].create(entity)
+            else:
+                tables["refs"].update(entity, existing.get("_etag"))
+        except Conflict:
+            return back("ref_exists" if existing is None else "ref_changed", rid)
+        return back("ref_saved")
+
+    @bp.route("/labels/<client>/refs/<rid>/delete", methods=["POST"])
+    def delete_ref(client, rid):
+        _guard(client)
+        if not _same_origin():
+            abort(403)
+        if not _ID_RE.fullmatch(rid) or not rid.startswith(REF_PREFIX):
+            abort(404)
+        tables["refs"].delete(client, rid)
+        return redirect(url_for("labels.refs", client=client, msg="ref_deleted"))
+
+    @bp.route("/labels/<client>/refs/seed", methods=["POST"])
+    def seed_refs(client):
+        """The repository's reference questions, create-only: a question already there is left as it is."""
+        _guard(client)
+        if not _same_origin():
+            abort(403)
+        catalog = _catalog(client)
+        for text, expected in (ref_seeds if ref_seeds is not None else load_ref_seeds()).get(client, []):
+            if any(f not in catalog for f in expected):
+                continue
+            try:
+                tables["refs"].create(_ref_entity(client, ref_id(text), text, expected, "seed"))
+            except Conflict:
+                continue
+        return redirect(url_for("labels.refs", client=client, msg="ref_seeded"))
 
     return bp
 
@@ -434,12 +594,64 @@ PAGE = """
     </div>
   </div>
   <div class="card">
+    <h2>Questions de référence</h2>
+    <p class="muted">Des questions telles qu'un technicien les tape (« comment attribuer une ligne teams »), avec la fiche attendue
+      ou aucune : le scoreboard les mesure avec les tickets et les liste une par une (non-régression).</p>
+    <p><b>{{ refs|length }}</b> question{{ 's' if refs|length > 1 }}{% if score and score.ref_n %} — dernier score : <b>{{ score.ref_k }} / {{ score.ref_n }}</b> justes{% endif %}</p>
+    <div class="btns"><a class="btn b-main" href="/labels/{{ client }}/refs">Gérer les questions de référence →</a></div>
+  </div>
+  <div class="card">
     <h2>Dernières étiquettes</h2>
     <table><tr><th>Ticket</th><th>Étiquette</th><th>Par</th></tr>
     {% for r in recent %}<tr><td><a href="/labels/{{ client }}/t/{{ r.RowKey }}">{{ r.RowKey }}</a></td>
       <td>{% if r.skipped %}<span class="muted">passé</span>{% elif r.expected == '[]' %}aucune fiche{% else %}{{ r.expected }}{% endif %}</td>
       <td class="muted">{{ r.labeled_by_name }} — {{ (r.labeled_at or '')[:16].replace('T', ' ') }}</td></tr>
     {% else %}<tr><td colspan="3" class="muted">Aucune étiquette pour l'instant.</td></tr>{% endfor %}</table>
+  </div>
+
+{% elif view == "refs" %}
+  <p><a class="muted" href="/labels?client={{ client }}">← Retour</a></p>
+  <div class="grid">
+    <div class="card">
+      {% if editing %}
+      <h2>Modifier la fiche attendue</h2>
+      <pre class="f">{{ editing.text }}</pre>
+      <form method="post" action="/labels/{{ client }}/refs">
+        <input type="hidden" name="id" value="{{ editing.RowKey }}"><input type="hidden" name="seen" value="{{ editing.labeled_at }}">
+        <div class="k">Fiche attendue</div>
+        <input type="text" name="fiche" list="all-fiches" value="{{ editing.expected_list[0] if editing.expected_list else '' }}" placeholder="Tapez quelques mots du titre…" autocomplete="off">
+        <div class="btns"><button class="b-main" name="decision" value="fiche">Enregistrer</button>
+          <button class="b-soft" name="decision" value="none">Aucune fiche ne couvre cette question</button>
+          <a class="btn b-soft" href="/labels/{{ client }}/refs">Annuler</a></div>
+      </form>
+      {% else %}
+      <h2>Nouvelle question de référence</h2>
+      <form method="post" action="/labels/{{ client }}/refs">
+        <div class="k">Question, telle qu'un technicien la tape</div>
+        <input type="text" name="text" maxlength="500" placeholder="comment attribuer une ligne teams" autocomplete="off">
+        <div class="k" style="margin-top:10px">Fiche attendue</div>
+        <input type="text" name="fiche" list="all-fiches" placeholder="Tapez quelques mots du titre…" autocomplete="off">
+        <div class="btns"><button class="b-main" name="decision" value="fiche">Ajouter avec cette fiche</button>
+          <button class="b-soft" name="decision" value="none">Ajouter : aucune fiche ne couvre cette question</button></div>
+      </form>
+      {% endif %}
+      <datalist id="all-fiches">{% for o in options %}<option value="{{ o.fiche_id }}">{{ o.label }}</option>{% endfor %}</datalist>
+      {% if seeds %}
+      <form method="post" action="/labels/{{ client }}/refs/seed" style="margin-top:16px">
+        <p class="muted">{{ seeds }} question{{ 's' if seeds > 1 }} livrée{{ 's' if seeds > 1 }} avec le dépôt (config/reference-questions.yaml). L'import n'écrase jamais une question déjà présente.</p>
+        <button class="b-soft">Importer les questions du dépôt</button>
+      </form>
+      {% endif %}
+    </div>
+    <div class="card">
+      <h2>Questions de référence ({{ refs|length }})</h2>
+      <table><tr><th>Question</th><th>Fiche attendue</th><th></th></tr>
+      {% for r in refs %}<tr><td>{{ r.text }}<div class="muted">{{ r.labeled_by_name }} — {{ (r.labeled_at or '')[:16].replace('T', ' ') }}{% if r.source == 'seed' %} · dépôt{% endif %}</div></td>
+        <td>{% if r.expected_list %}{% for f in r.expected_list %}{{ catalog[f].label if f in catalog else f }}{% if f not in catalog %} <span class="muted">(absente de la carte)</span>{% endif %}{% endfor %}{% else %}<span class="muted">aucune fiche</span>{% endif %}</td>
+        <td style="white-space:nowrap"><a href="/labels/{{ client }}/refs?id={{ r.RowKey }}">Modifier</a>
+          <form method="post" action="/labels/{{ client }}/refs/{{ r.RowKey }}/delete" style="display:inline"><button class="b-soft" style="padding:3px 8px;font-size:.8rem">Supprimer</button></form></td></tr>
+      {% else %}<tr><td colspan="3" class="muted">Aucune question de référence pour l'instant.</td></tr>{% endfor %}</table>
+    </div>
   </div>
 
 {% else %}

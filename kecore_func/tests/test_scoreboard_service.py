@@ -160,6 +160,62 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(summary["deployed"]["exact"]["k"], 0)  # with the deployed floor it is only offered
 
 
+def reference(table, ref_id, text, expected):
+    table.upsert({"PartitionKey": CLIENT, "RowKey": ref_id, "text": text, "expected": json.dumps(expected)})
+
+
+class ReferenceQuestionsTest(unittest.TestCase):
+    def test_unreadable_reference_rows_are_left_out(self):
+        refs = MemoryTable()
+        reference(refs, "ref-a1", "  comment   attribuer une ligne teams ", ["KB0233"])
+        reference(refs, "ref-a2", "Ma machine à café fuit", [])
+        reference(refs, "I9", "pas un identifiant de référence", ["KB0120"])
+        reference(refs, "ref-a3", "", ["KB0120"])
+        refs.upsert({"PartitionKey": CLIENT, "RowKey": "ref-a4", "text": "x", "expected": "{not json"})
+        self.assertEqual(sb.references_of(refs, CLIENT), [("ref-a1", "comment attribuer une ligne teams", ["KB0233"]),
+                                                          ("ref-a2", "Ma machine à café fuit", [])])
+        self.assertEqual(sb.references_of(None, CLIENT), [])
+
+    def test_reference_questions_are_measured_with_the_tickets_and_listed_one_by_one(self):
+        storage = kb_storage(fiche(), *filler())
+        tickets, labels, refs, scores = MemoryTable(), MemoryTable(), MemoryTable(), MemoryTable()
+        ticket(tickets, "I1", "Active Directory : locked account")
+        label(labels, "I1", ["KB0120"])
+        reference(refs, "ref-locked", "Active Directory : locked account", ["KB0120"])
+        reference(refs, "ref-wrong", "Active Directory : locked account", ["KB0900 - imprimante bourrage papier"])
+        reference(refs, "ref-none", "la machine à café du 3e étage fuit", [])
+        payload = sb.validate_scoreboard_request({"client": CLIENT, "interpret": False}, [CLIENT], "sb-ref")
+
+        prepared = sb.prepare(storage, tickets, labels, payload, refs_table=refs)
+        self.assertEqual((prepared["count"], prepared["references"]), (4, 3))
+        dataset = pipeline.read_jsonl(storage.read("kecore-client-s", sb.layout("sb-ref")["dataset"]))
+        self.assertEqual([d["ticket_id"] for d in dataset], ["I1", "ref-locked", "ref-none", "ref-wrong"])
+        self.assertEqual(dataset[1]["meta"]["source"], "reference")
+        payload["kb_run_id"] = prepared["kb_run_id"]
+        ranges = pipeline.batches(prepared["count"], 2)
+        for start, end in ranges:
+            sb.batch(storage, payload, start, end)
+        short = sb.report(storage, scores, payload, ranges, prepared)
+
+        self.assertEqual(short["tickets"], 4)                       # one dataset, one set of numbers
+        self.assertEqual(short["references"]["n"], 3)
+        self.assertIn("ref-wrong", short["references"]["failed"])  # KB0120 shown, another fiche expected
+        self.assertNotIn("ref-locked", short["references"]["failed"])
+        report = sb.latest(storage, CLIENT)["report_md"]
+        self.assertIn("## Reference questions (non-regression)", report)
+        self.assertIn("**NO**", report)
+        row = scores.get(CLIENT, "sb-ref")
+        self.assertEqual((row["ref_n"], row["ref_k"]), (3, short["references"]["passed"]))
+
+    def test_expecting_no_fiche_passes_only_when_no_fiche_is_shown(self):
+        tickets = [sb.Ticket("ref-1", CLIENT, "q", expected=[], meta={"source": "reference", "labeled": []}),
+                   sb.Ticket("ref-2", CLIENT, "q", expected=[], meta={"source": "reference", "labeled": []}),
+                   sb.Ticket("I1", CLIENT, "q", expected=["KB1"], meta={})]
+        records = [record("ref-1", [], kind="abstain"), record("ref-2", [], "KB1"), record("I1", ["KB1"], "KB1")]
+        refs = sb.reference_results(records, tickets)
+        self.assertEqual((refs["n"], refs["passed"], refs["failed"]), (2, 1, ["ref-2"]))
+
+
 class InterpretationFailureTest(unittest.TestCase):
     def test_model_failures_are_counted_reported_and_block_the_floor(self):
         from kecore.llm import LLMError

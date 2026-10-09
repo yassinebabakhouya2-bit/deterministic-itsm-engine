@@ -203,7 +203,9 @@ a human decision can force a fiche back in. Implemented in `kecore/exclusion.py`
 titles, and 200 characters excluded a real two-line policy fiche of the demo KB.
 
 **Order and gate**: ground truth first (30-50 real technician questions with their fiche in
-`/labels`, including "comment attribuer une ligne teams" -> KB0233 and questions no fiche answers);
+`/labels`, including "comment attribuer une ligne teams" -> KB0233 and questions no fiche answers --
+typed questions live in `/labels/<client>/refs`, table `refquestions`, measured by the scoreboard with
+the labeled tickets and listed one by one in its non-regression section, runbook §19.15);
 then the exclusion rule; then passes A/B/C and the review tab; then the routing tables and L0-L2;
 then the benchmark on the scoreboard, same set before and after (McNemar). Deploy only if a wrong
 fiche shown as exact (L0-L2) is **0** and right-fiche-first is at least today's engine's.

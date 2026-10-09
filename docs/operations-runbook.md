@@ -2965,3 +2965,53 @@ $s.output.exclusion | ConvertTo-Json -Depth 4
 
 Attendu : KB0266 dans `fiche_ids` (règle `title_pattern`). Lire la liste complète : chaque fiche
 exclue doit l'être à raison ; sinon `force_include`. Pas encore déployé à la date de cette entrée.
+
+### 19.15 Questions de référence : vérité terrain tapée à la main, mesurée par le scoreboard (2026-10-09)
+
+Étape 2 du plan (§19.13). `/labels` ne savait étiqueter que les vrais tickets de l'export ; une
+question tapée comme un technicien la tape (« comment attribuer une ligne teams ») n'avait nulle part
+où vivre, donc ne pouvait pas être mesurée.
+
+- **Onglet** `/labels/<client>/refs` (`app/labels.py`, même accès que l'étiquetage : tenant + groupe
+  Entra + client autorisé ; POST même origine) : une question en texte libre (3 à 500 caractères) et
+  sa fiche attendue (choisie dans le catalogue de la carte), ou « aucune fiche ». Table
+  `refquestions` (créée par la Web App si absente), `RowKey` = `ref-` + sha256 du texte normalisé
+  (casse, espaces) : la même question tapée deux fois est une seule ligne. Seule la fiche d'une
+  question se modifie (une autre formulation est une autre question) ; une modification par-dessus
+  celle de quelqu'un d'autre est refusée (comme les étiquettes de tickets). Suppression possible.
+  Carte « Questions de référence » sur l'accueil de `/labels`, avec le dernier score.
+- **Questions livrées avec le dépôt** : `config/reference-questions.yaml` (client-s : « comment
+  attribuer une ligne teams » → KB0233, « Mon compte est bloqué » → KB0120). Elles n'entrent dans la
+  table que sur un clic « Importer les questions du dépôt » (jamais à l'affichage d'une page),
+  sans jamais écraser une question déjà étiquetée ; une question dont la fiche n'est pas dans la carte
+  actuelle est laissée de côté.
+- **Scoreboard** (`kecore_func/scoreboard_service.py`) : `prepare` lit `refquestions` en plus de
+  `ticketlabels` ; les questions entrent dans le même jeu (`dataset.jsonl`, `meta.source:
+  "reference"`) et les mêmes chiffres. Le rapport gagne une section « Reference questions
+  (non-regression) » : une ligne par question, réussie si la fiche attendue est montrée, ou, sans
+  fiche attendue, si aucune fiche n'est montrée. `summary.json` → `references` ; ligne
+  `kecorescores` → `ref_k`, `ref_n`, `ref_failed` (affichés par `/labels`). Aucun changement
+  d'infrastructure : les rôles Table de la Function et de la Web App sont au niveau du compte.
+
+Tests : app 113 (+8, `tests/test_labels_app.py`), kecore_func 107 (+3), kecore 141, kefind 141,
+scoreboard 69 ; smoke test d'import de `app/app.py` OK.
+
+**Déployer** (Web App et Function), puis importer et mesurer :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+git checkout main; git pull
+.\deploy-webapp.ps1
+.\scripts\deploy-kecore-function.ps1
+# Dans /labels -> « Gérer les questions de référence » -> « Importer les questions du dépôt », puis :
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$body = @{ client = 'client-s' } | ConvertTo-Json
+$sb   = Invoke-RestMethod -Method Post -Uri "$base/kecore/scoreboard/runs?code=$key" -Body $body -ContentType 'application/json'
+do { Start-Sleep -Seconds 20; $s = Invoke-RestMethod $sb.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending', 'Running')
+$s.output.references | ConvertTo-Json -Depth 4
+```
+
+Attendu aujourd'hui (moteur gelé, §19.13) : « comment attribuer une ligne teams » **échoue** (KB0217
+classée devant KB0233) -- c'est le cas que la nouvelle architecture doit faire passer ; il sert de
+référence de non-régression. Pas encore déployé à la date de cette entrée.

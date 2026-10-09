@@ -1,0 +1,11 @@
+# Reference questions shipped with the repository, per client: the way a technician types them, with
+# the fiche ids they need ([] = no fiche covers them). They reach the refquestions table only when a
+# person clicks "Importer les questions du dépôt" in /labels/<client>/refs -- create-only: a question
+# already there keeps the label a person gave it, and one whose fiche is not in the current map is
+# left out. The scoreboard then measures them with the labeled tickets (non-regression section).
+# Question text stays French (it is what technicians type); see CLAUDE.md's language rule.
+client-s:
+  - text: "comment attribuer une ligne teams"
+    expected: [KB0233]
+  - text: "Mon compte est bloqué"
+    expected: [KB0120]
