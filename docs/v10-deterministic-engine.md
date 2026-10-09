@@ -194,10 +194,13 @@ not routable at L1 and goes to review; an (intent, app) key shared by two valida
 intended (L2 asks) or fixed in review.
 
 **System exclusion** (in kecore's `report` phase, before any index): a fiche is excluded when its
-normalized label contains a pattern of the client's list (default `LIBRE`, `A REUTILISER`,
-`OBSOLETE`, `NE PAS UTILISER`), or when it has no verified step and under 200 characters of
-non-boilerplate text. Every exclusion is listed with its reason in the run; a human decision can
-force a fiche back in.
+normalized title or document name contains, as whole words, a pattern of the client's list (default
+`A REUTILISER`, `NE PAS UTILISER`), or when it has no verified step and under 40 characters of body (text without
+boilerplate and without the fiche's own title). Every exclusion is listed with its reason in the run;
+a human decision can force a fiche back in. Implemented in `kecore/exclusion.py`, applied by the run's
+`report` phase (runbook §19.14). The defaults narrowed from the first draft (`LIBRE`, `A REUTILISER`,
+`OBSOLETE`, `NE PAS UTILISER`, 200 characters) once measured: a bare `LIBRE` or `OBSOLETE` matches real
+titles, and 200 characters excluded a real two-line policy fiche of the demo KB.
 
 **Order and gate**: ground truth first (30-50 real technician questions with their fiche in
 `/labels`, including "comment attribuer une ligne teams" -> KB0233 and questions no fiche answers);

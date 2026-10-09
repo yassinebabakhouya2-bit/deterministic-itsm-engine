@@ -7,7 +7,7 @@ separate, retryable Durable Functions activity and nothing lives on an operator'
   profile    fiches.jsonl                         -> runs/<run>/profile.json
   decompose  fiches.jsonl[start:end] + profile    -> runs/<run>/decomposed/<index>.json
   report     decomposed/*                         -> runs/<run>/{fiches.decomposed.jsonl, report.md,
-                                                     summary.json, graph.json}
+                                                     summary.json, graph.json, excluded.json}
   (semantic) the run's map                        -> runs/<run>/semantic/ (semantic_service.py)
   publish    the run's summary                    -> latest.json, last: a published run never changes
 
@@ -19,6 +19,12 @@ record it replaces, so a run in mode "replay" re-reads earlier answers and never
 
 This module never imports an Azure SDK: storage is any object with list/read/write, so the
 whole pipeline is tested in memory.
+
+System exclusion (kecore.exclusion, 2026-10-09): ``report`` keeps placeholder and empty fiches out of
+the map -- fiches.decomposed.jsonl and graph.json hold only the fiches kept, so neither the semantic
+index nor any decision ever sees the others; report.md and summary.json still describe every fiche
+decomposed (the decomposition itself is unchanged), and excluded.json lists each exclusion with its
+rule. The client's rules and its forced inclusions are kecore-<client>/exclusion-config.json.
 """
 
 from __future__ import annotations
@@ -30,6 +36,8 @@ from pathlib import PurePosixPath
 from typing import Protocol
 
 from kecore.decompose import DecomposedFiche, Decomposer
+from kecore.exclusion import ExclusionRules
+from kecore.exclusion import apply as apply_exclusion
 from kecore.fiches import DOCUMENT_EXTENSIONS, Fiche, fiches_from_documents
 from kecore.profile import Profile, build_profile
 from kecore.report import build_report
@@ -39,6 +47,7 @@ MODES = ("replay", "record")
 LLM_RECORD_PREFIX = "llm-cache/"
 LATEST = "latest.json"
 DICTIONARY_DECISIONS = "dictionary-decisions.json"
+EXCLUSION_CONFIG = "exclusion-config.json"
 DEFAULT_BATCH = 10
 MAX_BATCH = 50
 _PREFIX_RE = re.compile(r"^[\w\-. /]{0,200}$")
@@ -78,6 +87,7 @@ def layout(run_id: str) -> dict[str, str]:
         "report": base + "report.md",
         "summary": base + "summary.json",
         "graph": base + "graph.json",
+        "excluded": base + "excluded.json",
         "published": base + "published.json",
         "latest": LATEST,
     }
@@ -306,9 +316,13 @@ def report(storage: Storage, payload: dict, ranges: list[list[int]], profile_sta
             "input_tokens": sum(b.get("input_tokens", 0) for b in batch_stats),
             "output_tokens": sum(b.get("output_tokens", 0) for b in batch_stats),
         }
+    exclusion = apply_exclusion(decomposed, exclusion_rules(storage, payload["client"]))
     markdown, summary = build_report(payload["client"], decomposed, _load_profile(storage, payload), llm_stats, warnings)
-    graph = build_graph(decomposed)
-    storage.write(container, paths["decomposed"], _jsonl(d.to_dict() for d in decomposed))
+    summary["exclusion"] = exclusion.stats()
+    markdown += _exclusion_section(exclusion)
+    graph = build_graph(exclusion.kept)
+    storage.write(container, paths["decomposed"], _jsonl(d.to_dict() for d in exclusion.kept))
+    storage.write(container, paths["excluded"], _json(exclusion.to_dict()))
     storage.write(container, paths["report"], markdown.encode("utf-8"))
     storage.write(container, paths["summary"], _json(summary))
     storage.write(container, paths["graph"], _json(graph.to_dict()))
@@ -317,8 +331,33 @@ def report(storage: Storage, payload: dict, ranges: list[list[int]], profile_sta
     short["llm"] = summary.get("llm", {})
     short["dictionary"] = profile_stats.get("dictionary")
     short["graph"] = graph.stats()
+    short["exclusion"] = summary["exclusion"]
     short["run_id"] = payload["run_id"]
     return short
+
+
+def exclusion_rules(storage: Storage, client: str) -> ExclusionRules:
+    """kecore-<client>/exclusion-config.json, else the defaults. A malformed file fails the run with a
+    clear error rather than excluding fiches by rules nobody wrote."""
+    data = storage.read(kecore_container(client), EXCLUSION_CONFIG)
+    if data is None:
+        return ExclusionRules()
+    try:
+        return ExclusionRules.from_dict(json.loads(data.decode("utf-8")))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"{kecore_container(client)}/{EXCLUSION_CONFIG} is invalid: {exc}") from exc
+
+
+def _exclusion_section(exclusion) -> str:
+    """The fiches kept out of the map, for a person to check (a wrong exclusion is undone by force_include)."""
+    lines = ["", "## Fiches excluded from the map", ""]
+    if not exclusion.excluded:
+        return "\n".join(lines + ["None.", ""])
+    lines += ["| Fiche | Title | Rule | Detail |", "|---|---|---|---|"]
+    for e in exclusion.excluded:
+        lines.append("| " + " | ".join(" ".join(str(x).split()).replace("|", "\\|")
+                                       for x in (e.fiche_id, e.title, e.rule, e.detail)) + " |")
+    return "\n".join(lines + [""])
 
 
 def publish(storage: Storage, payload: dict, short: dict, semantic: dict | None = None) -> dict:

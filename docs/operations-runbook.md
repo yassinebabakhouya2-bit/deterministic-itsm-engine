@@ -2913,3 +2913,55 @@ git checkout main; git pull
 Vérifier : « comment attribuer une ligne teams » redonne la liste « Quelle fiche correspond ? »
 (KB0217, KB0032, KB0233) ; « Mon compte est bloqué, je n'arrive plus à me connecter à Windows »
 montre KB0120 avec « Démarrer les étapes ». Pas encore déployé à la date de cette entrée.
+
+### 19.14 Règle 3 : exclusion des fiches de réemploi et vides (2026-10-09)
+
+Première tranche de la nouvelle architecture (§19.13). `kecore/exclusion.py` (code seul, aucun appel
+au modèle), appliqué par la phase `report` du run (`kecore_func/kecore_pipeline.py`) :
+
+- **fiche de réemploi** : titre ou nom de document qui contient, en mots entiers (casse, accents,
+  ponctuation ignorés), un motif de la liste du client -- par défaut `A REUTILISER`, `NE PAS UTILISER`.
+  « KB0266 - LIBRE - A REUTILISER » est exclue ;
+- **fiche vide** : aucune étape vérifiée ET moins de 40 caractères de corps (texte sans gabarit ni titre).
+
+Les fiches exclues ne sont ni dans `fiches.decomposed.jsonl` ni dans `graph.json` : ni l'index
+sémantique, ni le funnel, ni le catalogue d'étiquetage ne les voient. `report.md` et `summary.json`
+décrivent toujours toutes les fiches décomposées (les chiffres de décomposition ne bougent pas) ;
+`runs/<run>/excluded.json` liste chaque exclusion avec sa règle, `report.md` a une section « Fiches
+excluded from the map », le résumé du run un bloc `exclusion`.
+
+**Écart à la spécification validée, mesuré** : la première version (motifs `LIBRE` et `OBSOLETE`
+seuls, seuil 200 caractères) aurait exclu de vraies fiches -- `LIBRE` seul attrape « espace disque
+libre », et 200 caractères excluait la fiche de démo « Politique des mots de passe » (2 lignes utiles,
+126 caractères de corps, 0 étape). Défauts resserrés en conséquence ; un client élargit sa liste.
+
+**Réglage par client** (facultatif) : `kecore-<client>/exclusion-config.json`, lu à chaque run ; un
+fichier mal formé fait échouer le run avec un message clair (aucune exclusion par une règle que
+personne n'a écrite) :
+
+```json
+{"title_patterns": ["A REUTILISER", "NE PAS UTILISER"], "min_chars": 40, "force_include": []}
+```
+
+`force_include` remet une fiche exclue à tort, quelles que soient les règles.
+
+Tests : kecore 141 (+9, `kecore/tests/test_exclusion.py`), kecore_func 104 (+2), kefind 141,
+scoreboard 69, app 105.
+
+**Déployer et vérifier** (Function seule ; un run en `record` relit les cartes et l'examen déjà
+enregistrés : seules les fiches nouvelles ou changées coûtent un appel) :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+git checkout main; git pull
+.\scripts\deploy-kecore-function.ps1
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$body = @{ client = 'client-s'; source_prefix = 'Kbs/'; mode = 'record' } | ConvertTo-Json
+$run  = Invoke-RestMethod -Method Post -Uri "$base/kecore/runs?code=$key" -Body $body -ContentType 'application/json'
+do { Start-Sleep -Seconds 30; $s = Invoke-RestMethod $run.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending', 'Running')
+$s.output.exclusion | ConvertTo-Json -Depth 4
+```
+
+Attendu : KB0266 dans `fiche_ids` (règle `title_pattern`). Lire la liste complète : chaque fiche
+exclue doit l'être à raison ; sinon `force_include`. Pas encore déployé à la date de cette entrée.

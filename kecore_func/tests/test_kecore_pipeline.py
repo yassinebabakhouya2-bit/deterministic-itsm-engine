@@ -110,6 +110,40 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((latest["run_id"], latest["summary"]["semantic"]), ("run-1", {"error": "x"}))
         self.assertEqual(json.loads(storage.read("kecore-clienta", "runs/run-1/published.json")), {"run_id": "run-1"})
 
+    def test_placeholder_and_empty_fiches_stay_out_of_the_map_but_are_listed(self):
+        storage = demo_storage()
+        storage.write("kb-clienta", "Kbs/KB0010266 - LIBRE - A REUTILISER.md",
+                      "# KB0010266 - LIBRE - A REUTILISER\n\nNuméro libre, à réutiliser pour une nouvelle fiche.\n".encode())
+        storage.write("kb-clienta", "Kbs/KB0010267 - Vide.md", "# KB0010267 - Vide\n\nA compléter.\n".encode())
+        short = run(storage, self.payload())
+        excluded = json.loads(storage.read("kecore-clienta", "runs/run-1/excluded.json"))
+        rules = {e["title"]: e["rule"] for e in excluded["excluded"]}
+        self.assertEqual(rules, {"KB0010266 - LIBRE - A REUTILISER": "title_pattern", "KB0010267 - Vide": "empty"})
+        kept = pipeline.read_jsonl(storage.read("kecore-clienta", "runs/run-1/fiches.decomposed.jsonl"))
+        self.assertEqual(len(kept), excluded["kept"])
+        self.assertFalse({e["fiche_id"] for e in excluded["excluded"]} & {f["fiche_id"] for f in kept})
+        self.assertEqual(short["fiches"], len(kept) + 2)             # the report still describes every fiche
+        self.assertEqual(short["exclusion"]["excluded"], 2)
+        self.assertIn("## Fiches excluded from the map", storage.read("kecore-clienta", "runs/run-1/report.md").decode())
+        graph = json.loads(storage.read("kecore-clienta", "runs/run-1/graph.json"))
+        self.assertNotIn("KB0010266", json.dumps(graph))
+
+    def test_a_person_can_force_a_fiche_back_in_and_a_broken_config_fails_the_run(self):
+        storage = demo_storage()
+        storage.write("kb-clienta", "Kbs/KB0010267 - Vide.md", "# KB0010267 - Vide\n\nA compléter.\n".encode())
+        run(storage, self.payload())
+        fiche_id = json.loads(storage.read("kecore-clienta", "runs/run-1/excluded.json"))["excluded"][0]["fiche_id"]
+        storage.write("kecore-clienta", pipeline.EXCLUSION_CONFIG, json.dumps({"force_include": [fiche_id]}).encode())
+        payload = pipeline.validate_request({"client": "clienta", "source_prefix": "Kbs/", "batch_size": 4},
+                                            ["clienta"], "run-2")
+        short = run(storage, payload)
+        self.assertEqual(short["exclusion"]["excluded"], 0)
+        storage.write("kecore-clienta", pipeline.EXCLUSION_CONFIG, b'{"min_chars": "deux cents"}')
+        with self.assertRaises(ValueError) as caught:
+            run(storage, pipeline.validate_request({"client": "clienta", "source_prefix": "Kbs/", "batch_size": 4},
+                                                   ["clienta"], "run-3"))
+        self.assertIn(pipeline.EXCLUSION_CONFIG, str(caught.exception))
+
     def test_limit_keeps_the_first_fiches_in_document_order(self):
         storage = demo_storage()
         extracted = pipeline.extract(storage, self.payload(limit=2))
