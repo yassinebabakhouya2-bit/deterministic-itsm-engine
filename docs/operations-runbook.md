@@ -3091,6 +3091,28 @@ l'opérateur (dossier temporaire, `-Encoding UTF8`, arrêt si le run n'est pas `
   tokens (L1), « comment attribuer une ligne teams » ne serait couverte par aucun alias proposé ; elle
   relève de L2 (intention + application) ou d'un alias ajouté en revue. C'est le rôle prévu de la
   validation humaine et des passes B/C.
+- **Les 22 erreurs** (lues dans les propositions) : 21 × `HTTP 429 ... exceeded token rate limit`
+  sur le déploiement `gpt-4o` (francecentral), 1 × délai de connexion (`cannot reach ... timed out`).
+  Cause : le déploiement `gpt-4o` a 30 kTPM (`generationCapacity`, `infra/modules/foundry.bicep`) et
+  sert aussi l'Assistant en direct ; le run en lance 4 activités à la fois
+  (`maxConcurrentActivityFunctions: 4`, `kecore_func/host.json`), chacune enchaînant ses appels
+  (~2-3 k jetons par fiche) : le quota est dépassé, et les 5 nouvelles tentatives de `RestClient`
+  (attente `Retry-After`, plafonnée à 60 s) ne suffisent pas pour 21 fiches. Pendant le run, l'Assistant
+  en direct partage ce quota. Les 158 réponses réussies sont enregistrées : un nouveau run `record` ne
+  refait que ces 22 appels.
+- **Intentions** : 154 intentions distinctes pour 158 fiches -- en pratique une par fiche ; seules 4 sont
+  partagées, par des fiches quasi jumelles (KB0205/KB0321 Printer Logic, KB0058/KB0164 Cortex,
+  KB0134/KB0320 mot de passe, K0090/KB0131 ticket). KB0217 : `TRANSFERT_APPELS_TEAMS` (l'application
+  dans l'intention, contre la consigne), `teams` ; KB0233 : `ASSOCIATION_LIGNE_TELEPHONIQUE`, `teams` :
+  les deux fiches Teams ont des intentions distinctes, L2 peut les départager. KB0120 :
+  `DEVERROUILLAGE_COMPTE_UTILISATEUR`, `active-directory`, mais un alias « réinitialiser mot de passe
+  utilisateur » qui est un autre besoin (KB0134/KB0320) : exemple de ce que la revue doit couper.
+- **Constat de conception** : avec la règle L1 telle que spécifiée (tous les tokens d'un alias présents
+  dans la question), aucune des deux questions de référence ne serait couverte par les alias proposés :
+  « comment attribuer une ligne teams » ({attribuer, ligne, teams}) contre « attribuer un numéro dans
+  teams » ou « configurer une ligne dans teams » ; « Mon compte est bloqué » ({compte, bloqué}) contre
+  « compte utilisateur bloqué ». Les alias du modèle sont des phrases complètes, plus longues que les
+  questions. Décision à prendre avant la passe B (voir la conversation du jour).
 
 ### 19.17 Incident : déploiements partis d'un dépôt local en conflit (2026-10-09)
 
@@ -3150,6 +3172,7 @@ faut savoir avant de se fier aux sorties de §19.14-19.16.
 | 6 | mineur | le bloc d'inspection de §19.16 télécharge ~182 fichiers de contenu client dans la racine du dépôt (non ignorés par git) et les relit sans `-Encoding UTF8` | accents illisibles dans ce qu'on regarde ; données client à côté du code |
 | 7 | mineur | dans un bloc collé, un `POST` qui échoue laisse `$run` / `$sb` / `$s` d'un run précédent de la même session | les chiffres d'un ancien run affichés comme ceux du nouveau |
 | 8 | mineur | §19.15 lance le scoreboard avant le clic d'import ; sa sortie (`references`) ne montre ni les questions ni la fiche montrée | mesure à 0 question ; rien à lire sur le cas KB0233 |
+| 10 | majeur (constaté au run réel) | la passe A lance 4 activités en parallèle sur un déploiement `gpt-4o` de 30 kTPM partagé avec l'Assistant en direct ; un 429 qui persiste après 5 essais devient une erreur de fiche | 21 fiches sur 180 sans proposition au premier run ; l'Assistant ralenti pendant le run |
 | 9 | mineur, préexistant | pendant un scoreboard, une panne d'embeddings fait décider une question par les mots sans que l'enregistrement le dise (`kefind/funnel_engine.py:_vector`) | un verdict de non-régression qui ne correspond pas à `/find`, sans marque |
 
 Réfutés (non-défauts sur les données réelles) : questions de référence dans les moitiés A/B du seuil
