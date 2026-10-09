@@ -3068,3 +3068,22 @@ Tests : kefind 159 (+18, `kefind/tests/test_enrich.py` ; deux contrôles volonta
 échouer la suite, vérifié), kecore_func 113 (+6 : `test_enrichment_service.py` -- un fichier par fiche,
 résumé, rejeu octet pour octet sans appel ; orchestration : avant `publish`, échec isolé, option
 `enrich`), kecore 141, scoreboard 69, app 113.
+
+### 19.17 Incident : déploiements partis d'un dépôt local en conflit (2026-10-09)
+
+**Symptôme.** Quatre blocs « merge + deploy » enchaînés : chaque `git pull` / `git merge --ff-only`
+échoue (`docs/operations-runbook.md: needs merge`, `you need to resolve your current index first`),
+`git push` est refusé (`non-fast-forward`), mais `deploy-kecore-function.ps1` et `deploy-webapp.ps1`
+s'exécutent quand même (15:22, 15:41, 15:52, 15:54 UTC) et réussissent. La Function déployée ne sert ni
+`kecore_enrich` ni `kecore_enrich_summary` : ce n'est pas le code de la branche (`b05de4f`).
+
+**Cause.** Le clone de l'opérateur était resté au milieu d'une fusion (conflit sur ce runbook, non
+résolu) ; PowerShell continue un bloc collé après l'échec d'une commande native (`git` rend un code de
+sortie, pas une exception) ; les scripts de déploiement zippent l'arbre de travail tel qu'il est. Les
+deux applications tournent donc sur un état local inconnu (au mieux `main` d'avant `16d709b`).
+
+**Correction.** (1) Sortir de la fusion et aligner le clone sur `origin` (commandes dans la conversation
+du 2026-10-09, à consigner ici avec leur sortie) ; (2) ne déployer qu'après un `git status` propre et un
+`git log -1` qui montre le commit attendu ; (3) dans un bloc collé, arrêter au premier échec git :
+`git pull; if ($LASTEXITCODE) { throw "git pull a échoué" }` (idem après `merge` et `push`).
+Redéploiement Function + Web App à refaire depuis le bon commit.
