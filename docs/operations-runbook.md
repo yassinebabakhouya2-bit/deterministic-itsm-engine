@@ -3069,6 +3069,29 @@ Tests : kefind 159 (+18, `kefind/tests/test_enrich.py` ; deux contrôles volonta
 résumé, rejeu octet pour octet sans appel ; orchestration : avant `publish`, échec isolé, option
 `enrich`), kecore 141, scoreboard 69, app 113.
 
+**Premier run réel avec la règle 3 et la passe A (2026-10-09, `main` = `7798a72`).** Bloc donné à
+l'opérateur (dossier temporaire, `-Encoding UTF8`, arrêt si le run n'est pas `Completed`) ; `record`,
+`client-s`, `Kbs/`. Run `Completed` (~40 min).
+
+- **Exclusion** : 242 fiches décomposées, 240 gardées, 2 exclues par motif de titre :
+  `KB0264 - LIBRE - A REUTILISER`, `KB0266 - LIBRE - A REUTILISER`. Aucune fiche vide exclue.
+- **Sémantique** (inchangé, gelé) : variante `none`, 180 fiches classées (181 avant : une des deux
+  fiches exclues était classée).
+- **Passe A** : 180 fiches, **22 en erreur** (`error` non vide, cause à lire dans les fichiers),
+  158 appels gpt-4o (`gpt-4o-2024-11-20`), 0 relu du cache ; 158 avec une intention, 101 avec une
+  application principale, 13 avec une application principale déduite (sans citation ni lecture par
+  kecore : KB0022, KB00308, KB0041, KB0050, KB0131, KB0134, KB0157, KB0195, KB0205, KB0272, KB0312,
+  KB0320, KB0339), 1 752 alias gardés, 74 retraits par les contrôles.
+- **KB0233 -  Associate a phone line** : intention `ASSOCIATION_LIGNE_TELEPHONIQUE`,
+  `primary_app` = `teams` **prouvée** par la citation « Edit the file SFITFR Teams SDA Inventory
+  Exploitation inside Teams. » ; `sharepoint` et `entra-id` gardées comme déduites (citations retirées :
+  une URL `…sharepoint.com…` et `portal.azure.com` ne nomment pas l'application pour le code) ;
+  8 alias FR dont « ajouter une ligne dans teams », « attribuer un numéro dans teams »,
+  « configurer une ligne dans teams » -- **mais pas « attribuer une ligne teams »** : par inclusion de
+  tokens (L1), « comment attribuer une ligne teams » ne serait couverte par aucun alias proposé ; elle
+  relève de L2 (intention + application) ou d'un alias ajouté en revue. C'est le rôle prévu de la
+  validation humaine et des passes B/C.
+
 ### 19.17 Incident : déploiements partis d'un dépôt local en conflit (2026-10-09)
 
 **Symptôme.** Quatre blocs « merge + deploy » enchaînés : chaque `git pull` / `git merge --ff-only`
