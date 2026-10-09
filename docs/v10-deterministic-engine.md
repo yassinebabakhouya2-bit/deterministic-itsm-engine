@@ -150,6 +150,61 @@ and replaced two components: the relevance signal and the calibration source.
 
 Operations, artifacts and deployment: runbook §19.11.
 
+## Semantic enrichment at ingestion, deterministic routing at runtime (decided 2026-10-09)
+
+Why: the semantic mode above ranks by a score. Measured, it puts the right fiche first 46% of the
+time on the KB exam, and live it shows "KB0217 - Transfert d'appels TEAMS" for "comment attribuer
+une ligne teams" (the right fiche, "KB0233 - Associate a phone line", came 3rd or 4th). The engine
+is deterministic -- the same question always gets the same answer -- but determinism is not
+correctness. Decision (runbook §19.13): move the meaning upstream, into structured per-fiche
+metadata written at ingestion, checked by code and **validated by a person**; at runtime, route
+through tables, not scores. The semantic mode is frozen (no more tuning) until the benchmark below
+decides whether it stays as the L3 fallback.
+
+**Per-fiche metadata** (`kecore-<client>/runs/<run>/enrichment/<fiche_id>.json`):
+`canonical_intent` (a value of the client's closed taxonomy), `primary_app` / `supported_apps`
+(values of the client's application dictionary), `app_evidence` (verbatim quotes, checked with
+`NormalizedText`) and `app_inferred` (no quote: allowed, but validation is mandatory),
+`semantic_aliases_fr` / `semantic_aliases_en`, `trigger_keywords` (never route on their own),
+`confusable_with`, `status` (`proposed` / `validated` / `rejected`), `content_sha256` (a changed
+fiche goes back to review), `excluded`, `provenance` (model, request hash, prompt version).
+
+**Extraction**, three passes, every answer recorded under its request hash (`RecordingLLM`: a replay
+rewrites the same metadata with no model call -- reproducibility comes from the record, not from
+`temperature=0`): A, per fiche, a strict JSON Schema proposal; B, once per client, the proposed
+intents merged into a closed taxonomy, reviewed, frozen and versioned; C, each fiche assigned an
+intent from that closed enum. Code checks: apps in the dictionary, quotes found verbatim, aliases
+2-8 words with no invented technical entity (`novel_technical_entities`), keywords present in an
+alias or the fiche. Human decisions live outside the runs (like `dictionary-decisions.json`), keyed
+by (fiche, `content_sha256`), and are re-applied by the next run.
+
+**Runtime routing**, first level that decides wins; every answer carries `route`, the rule, the
+alias or key that decided, and the routing tables' sha256:
+
+| Level | Rule | Result |
+|---|---|---|
+| L0 identifier | a fiche number, error or event code known to one fiche | that fiche, exact |
+| L1 validated alias | every token of a **validated** alias is among the question's tokens (fixed, versioned normalization: case, accents, punctuation, frozen FR/EN stop words, a validated inflection table); the most specific alias wins | that fiche, exact |
+| L2 (intent, app) | the model maps the question onto the closed (intent, app) enum (recorded under the normalized question's hash; code validates the enum); table lookup | one validated fiche: exact; several: a closed question; none: L3 |
+| L3 meaning | today's semantic ranking, app filter only when exactly one app is detected and a fiche carries it | never exact: proposals |
+| L4 nothing | -- | the free-form answer (`Phase.OPEN`), labelled as such |
+
+Collisions are resolved at ingestion, never at runtime: an alias token set claimed by two fiches is
+not routable at L1 and goes to review; an (intent, app) key shared by two validated fiches is either
+intended (L2 asks) or fixed in review.
+
+**System exclusion** (in kecore's `report` phase, before any index): a fiche is excluded when its
+normalized label contains a pattern of the client's list (default `LIBRE`, `A REUTILISER`,
+`OBSOLETE`, `NE PAS UTILISER`), or when it has no verified step and under 200 characters of
+non-boilerplate text. Every exclusion is listed with its reason in the run; a human decision can
+force a fiche back in.
+
+**Order and gate**: ground truth first (30-50 real technician questions with their fiche in
+`/labels`, including "comment attribuer une ligne teams" -> KB0233 and questions no fiche answers);
+then the exclusion rule; then passes A/B/C and the review tab; then the routing tables and L0-L2;
+then the benchmark on the scoreboard, same set before and after (McNemar). Deploy only if a wrong
+fiche shown as exact (L0-L2) is **0** and right-fiche-first is at least today's engine's.
+
 ## How the funnel finds a fiche (slice 3)
 
 `kefind.funnel.find` replaces the 5-step `kefind` pipeline above for the
