@@ -2773,3 +2773,37 @@ gagne (à égalité : la plus stricte) ; seule la gagnante passe la moitié test
 calibration) et `recall_test`. Grille des marges élargie à 0,30.
 
 Tests : kecore 132, kefind 141, kecore_func 102, scoreboard 71, app 102 (548).
+
+**Run des variantes (commit `1af2ce6`, 2026-10-09).** Déployé par `.\scripts\deploy-kecore-function.ps1`
+(zip-deploy, 202, 30 fonctions servies), puis `POST /kecore/runs` (`client-s`, `Kbs/`, `record`) :
+181 fiches (174 au run précédent : la KB a bougé, les chiffres entre runs ne se comparent pas au
+point près ; entre variantes, si), 2 344 entrées avant contrôles, 2 groupes `same_label`. Examen :
+178 fiches, 688 questions, 0 erreur du modèle ; 338 en calibration, 350 en test. Tableau : moitié
+calibration (`calibration.json` → `variants`).
+
+| Variante | Entrées (questions retirées) | Rappel @1 / @3 / @5 (calibration) | Seuils floor / margin / offer | Bonne fiche montrée | Mauvaise | Questions | Bonne parmi proposées |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `code` | 1 769 (512, + 63 résumés) | 40,5 / 62,1 / 69,5 % | 0,694 / 0,155 / 0,580 | 7,4 % | 0,9 % | 85,5 % | 57,4 % |
+| `balanced` | 2 053 (291) | 47,9 / 66,9 / 73,1 % | 0,718 / 0,165 / 0,606 | 6,8 % | 0,9 % | 84,3 % | 63,5 % |
+| **`none`** (gagnante) | 2 344 (0) | 45,9 / 70,1 / 76,0 % | 0,682 / 0,105 / 0,621 | 15,7 % | 0,9 % | 73,1 % | 65,2 % |
+
+Moitié test (`none`) : bonne fiche montrée 15,7 % [12,3–19,9] (cible 70 %), mauvaise 1,4 % [0,6–3,3]
+(sûr), questions 70,9 % (cible 25 %), abstentions 12 %, bonne fiche parmi les proposées 61,7 % (cible
+95 %), fiche montrée sans bonne réponse 4,3 % (≤ 10 %, sûr) ; `recall_test` @1 46,3 %, @3 68,6 %, @5
+74,9 %. `withheld: false`, `acceptance.passed: false` (utilité seule). Les fiches montrées sont justes à
+92 % (55 sur 60) : 1 sur 12 est fausse.
+
+Lecture : le contrôle de proximité ne protégeait rien (même 0,9 % de mauvaises fiches dans les trois
+variantes) et coûtait du rappel ; le retirer double les fiches montrées. Mais aucun seuil ne peut dépasser
+le rappel@1 (≈ 46 %) : la cible de 70 % est hors d'atteinte avec ce classement, quel que soit le
+réglage. Ce qui limite maintenant, c'est le classement, pas la calibration. À noter : l'examen est
+volontairement difficile (français seulement, sans les mots du titre, bruit) ; son écart avec de vrais
+tickets n'est pas mesuré.
+
+`POST /kecore/find`, `mode: semantic` dans les deux cas, mais KB0233 n'est jamais proposée :
+« comment attribuer une ligne teams » → `semantic_below_floor`, KB0217 Transfert d'appels TEAMS 0,656
+(par son nom), KB0032 0,611, KB0233 Associate a phone line 0,580 (3e) ; « Attribuer une ligne teams » →
+KB0217 0,675, KB0233 0,611 (2e). Seule KB0217 dépasse `offer` (0,621) : la question propose une seule
+fiche, la mauvaise. La meilleure entrée de KB0233 est « attribuer une ligne téléphonique à un utilisateur
+dans office 365 » : sa carte ne dit pas « Teams », sans doute parce que le contrôle de `kefind/cards.py`
+refuse une application que la fiche ne nomme pas (à vérifier sur le texte de KB0233).
