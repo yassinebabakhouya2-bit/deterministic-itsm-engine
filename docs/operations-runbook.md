@@ -3122,6 +3122,25 @@ l'opérateur (dossier temporaire, `-Encoding UTF8`, arrêt si le run n'est pas `
   « compte utilisateur bloqué ». Les alias du modèle sont des phrases complètes, plus longues que les
   questions. Décision à prendre avant la passe B (voir la conversation du jour).
 
+**Run de complément des 22 fiches en erreur (2026-10-09, lancé à 17:17 UTC, `main` = `7798a72`, donc
+avant le lot 1 de §19.19 : 4 activités à la fois, 5 essais sur 429).** Même corps (`client-s`, `Kbs/`,
+`record`) ; bloc donné à l'opérateur : arrêt si la clé manque ou si le run n'est pas `Completed`,
+propositions téléchargées dans `%TEMP%\enrichment-<run>`, lues en UTF-8. Run
+`20261009T171756Z-9f081f` `Completed` (~30 min de suivi).
+
+- **Exclusion** : inchangée, `KB0264 - LIBRE - A REUTILISER`, `KB0266 - LIBRE - A REUTILISER`.
+- **Passe A** : 180 fiches, **0 erreur**, 22 appels gpt-4o (les 22 fiches en erreur du premier run),
+  158 réponses relues de l'enregistrement : l'enregistrement a joué son rôle, seules les réponses
+  manquantes ont été demandées. 180 avec une intention, 115 avec une application principale (+14),
+  les **mêmes 13** applications principales déduites qu'au premier run (aucune parmi les 22 nouvelles),
+  1 999 alias gardés (+247), 77 retraits (+3). Aucune proposition avec `error` dans le dossier téléchargé.
+- **Pourquoi il est passé sans le lot 1** : 22 appels au lieu de 180, la charge reste sous les 30 kTPM du
+  déploiement partagé. Le défaut §19.18 #10 reste vrai pour un run qui rappelle tout le modèle (nouvelle
+  clé d'enregistrement, nouveau client) : c'est le lot 1 (`llm_parallelism`, 12 essais sur 429) qui le
+  corrige, une fois déployé.
+- Non mesuré à ce run : le nombre d'intentions distinctes sur 180 (154 sur 158 au premier run) ; à
+  relire avant la passe B.
+
 ### 19.17 Incident : déploiements partis d'un dépôt local en conflit (2026-10-09)
 
 **Symptôme.** Quatre blocs « merge + deploy » enchaînés : chaque `git pull` / `git merge --ff-only`
