@@ -2902,6 +2902,8 @@ Nettoyage (ce commit) :
 
 Tests `tests/` 105 (retour à l'état de `cb52d7f`) ; smoke test d'import de `app/app.py` OK.
 
+> ⚠ Ne plus coller ce bloc tel quel (aucun arrêt sur échec git ; incident §19.17) : utiliser les blocs de §19.19.
+
 **Déployer le revert** (Web App seulement ; la Function kecore n'est pas touchée) :
 
 ```powershell
@@ -2947,6 +2949,8 @@ personne n'a écrite) :
 
 Tests : kecore 141 (+9, `kecore/tests/test_exclusion.py`), kecore_func 104 (+2), kefind 141,
 scoreboard 69, app 105.
+
+> ⚠ Ne plus coller ce bloc tel quel (aucun arrêt sur échec git ; incident §19.17) : utiliser les blocs de §19.19.
 
 **Déployer et vérifier** (Function seule ; un run en `record` relit les cartes et l'examen déjà
 enregistrés : seules les fiches nouvelles ou changées coûtent un appel) :
@@ -2996,6 +3000,8 @@ où vivre, donc ne pouvait pas être mesurée.
 Tests : app 113 (+8, `tests/test_labels_app.py`), kecore_func 107 (+3), kecore 141, kefind 141,
 scoreboard 69 ; smoke test d'import de `app/app.py` OK.
 
+> ⚠ Ne plus coller ce bloc tel quel (aucun arrêt sur échec git ; incident §19.17) : utiliser les blocs de §19.19.
+
 **Déployer** (Web App et Function), puis importer et mesurer :
 
 ```powershell
@@ -3040,6 +3046,8 @@ l'orchestration) gagne un bloc `enrichment` (+ appels/cache du modèle). Option 
 `POST /kecore/runs` (vrai par défaut). Un échec n'empêche pas la publication : `enrichment.error` dit
 pourquoi. Rien ne lit encore ce dossier pour router. Coût : un appel gpt-4o par fiche classée
 (~180 pour client-s), enregistré ; un rejeu ne coûte rien.
+
+> ⚠ Ne plus coller ce bloc tel quel (aucun arrêt sur échec git ; incident §19.17) : utiliser les blocs de §19.19.
 
 **Déployer et regarder ce que la passe A propose** (Function seule) :
 
@@ -3183,3 +3191,143 @@ traitée en §19.17) ; ordre du bloc §19.15 hors cas déjà connus.
 
 Le bloc donné à l'opérateur pour le run de la passe A (même jour) évite déjà #6 (dossier temporaire,
 `-Encoding UTF8`) et s'arrête si le run n'est pas `Completed`.
+
+**État après le lot 1 (§19.19)** : corrigés (code, tests, revue adverse ; à déployer) : #1, #2, #3, #6,
+#10. En partie : #7 (les blocs de §19.19 remettent leurs variables à zéro et s'arrêtent sur erreur ; les
+anciens blocs portent un avertissement) et #8 (le bloc 3 de §19.19 sépare l'import et le scoreboard et
+affiche chaque question). Restent : #4 (catalogue d'étiquetage non rafraîchi par le run kecore), #5
+(`exclusion-config.json` : BOM, `force_include` sans correspondance), #9 (décision dégradée non marquée
+dans le scoreboard).
+
+### 19.19 Déployer et lancer un run sans risque : les blocs à utiliser (2026-10-09)
+
+Lot 1 des corrections de la revue §19.18 (défauts 1, 2, 3, 6, 10), lui-même relu par une revue adverse
+avant commit (18 constats, 15 confirmés et corrigés, dont un mode `-FromOnboarding` pour les scripts
+d'installation). Ces blocs remplacent ceux de §19.13-19.16 ; ils s'arrêtent à la première erreur et ne
+déploient qu'un commit propre de `main`. **Ne pas redéployer la Function pendant qu'un run kecore
+tourne** (un run lancé avant garde sa forme d'origine à la reprise, mais rien ne sert de le risquer).
+
+**Ce que font maintenant les scripts** (`scripts/deploy-guard.ps1`, appelé par `deploy-webapp.ps1` et
+`scripts/deploy-kecore-function.ps1`) : refus de déployer si une fusion, un revert, un cherry-pick ou un
+rebase est en cours, si un fichier suivi ou non suivi a changé dans ce qui serait déployé (pour la Web
+App : `app/`, `orchestration/`, `config/`, `requirements.txt`, `README.md` ; pour la Function :
+`kecore_func/`, `kecore/`, `kefind/`, `scoreboard/` -- `CLAUDE.md` ou un fichier ignoré par git ne
+comptent pas), ou si `HEAD` n'est pas `origin/main` après un `fetch` (`-AllowNotMain` pour déployer
+volontairement autre chose) ; le commit est écrit dans le paquet (`BUILD_COMMIT`). La Function répond
+`GET /api/kecore/version` avec ce commit ; le script attend (environ 10 minutes, à l'horloge) que l'hôte
+réponde avec **ce** commit et serve **toutes** les fonctions déclarées dans `kecore_func/function_app.py`,
+sinon il lève une erreur. Une erreur pendant la fabrication du paquet arrête tout avant le déploiement.
+Si `az webapp deploy` sort en erreur, `deploy-webapp.ps1` le dit sans conclure (son propre suivi peut
+échouer sur un vrai succès, §7 : ouvrir le site et le journal de déploiement avant de relancer). Les
+erreurs sont des `throw` : un bloc collé s'arrête, contrairement à un `exit`.
+`scripts/bootstrap-new-tenant.ps1` et `scripts/attach-external-tenant.ps1` appellent
+`deploy-webapp.ps1 -FromOnboarding` : ils réécrivent `config/engine.<client>.yaml` et `config/itsm.yaml`
+juste avant, ces changements-là partent (paquet marqué `<commit>+local-changes`, chacun affiché), tout
+autre changement bloque toujours, n'importe quel commit est accepté, et un échec de `az webapp deploy`
+leur revient en code de sortie (leur avertissement §7 habituel) au lieu d'une erreur.
+Testé avec PowerShell 7.4 sur une copie du dépôt (faux `origin`, faux `az`) : dépôt propre, `CLAUDE.md`
+modifié, installation avec configs réécrites -> déploie ; fichier suivi modifié, fichier non suivi,
+revert en cours, `HEAD` en avance sur `origin/main`, installation avec un changement de code, échec de
+`az webapp deploy`, fichier illisible dans le paquet, hôte sur l'ancien commit, fonction non servie ->
+refus. Pas testé sous Windows PowerShell 5.1 (syntaxe compatible, ASCII seulement).
+
+**1. Mettre à jour et déployer**
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+$ErrorActionPreference = 'Stop'
+git checkout main;  if ($LASTEXITCODE) { throw "git checkout main a échoué" }
+git pull --ff-only; if ($LASTEXITCODE) { throw "git pull a échoué" }
+.\deploy-webapp.ps1
+.\scripts\deploy-kecore-function.ps1
+```
+
+**2. Lancer un run kecore et regarder ce que la passe A propose** (vérifie d'abord que la Function sert
+le commit du dépôt ; un contrôle d'état raté n'arrête pas le suivi ; fichiers dans un dossier temporaire,
+hors du dépôt, lus en UTF-8 ; variables d'un run précédent remises à zéro)
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+$ErrorActionPreference = 'Stop'; $run = $null; $s = $null
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+if ($LASTEXITCODE -or -not $key) { throw "clé de la Function introuvable" }
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$want = "$(git rev-parse HEAD)".Trim(); $served = (Invoke-RestMethod "$base/kecore/version?code=$key").commit
+if ($served -ne $want) { throw "la Function sert $served, pas $want : relancer .\scripts\deploy-kecore-function.ps1" }
+$body = @{ client = 'client-s'; source_prefix = 'Kbs/'; mode = 'record' } | ConvertTo-Json
+$run  = Invoke-RestMethod -Method Post -Uri "$base/kecore/runs?code=$key" -Body $body -ContentType 'application/json'
+"suivi : $($run.statusQueryGetUri)"
+do {
+    Start-Sleep -Seconds 30
+    try { $s = Invoke-RestMethod $run.statusQueryGetUri } catch { Write-Warning "état illisible, nouvel essai : $($_.Exception.Message)"; continue }
+    $s.runtimeStatus
+} while (-not $s -or $s.runtimeStatus -in 'Pending', 'Running')
+if ($s.runtimeStatus -ne 'Completed') { $s | ConvertTo-Json -Depth 6; throw "run $($s.runtimeStatus)" }
+"--- run"; $s.output.run_id
+"--- exclusion";  $s.output.exclusion | ConvertTo-Json -Depth 4
+"--- enrichment"; $s.output.enrichment | ConvertTo-Json -Depth 4
+$runId = $s.output.run_id
+$dir = Join-Path $env:TEMP "enrichment-$runId"; New-Item -ItemType Directory -Force $dir | Out-Null
+az storage blob download-batch --account-name stknowledgeengine3v9 --auth-mode login -s kecore-client-s -d $dir --pattern "runs/$runId/enrichment/*" -o none
+if ($LASTEXITCODE) { throw "téléchargement des propositions impossible (rôle Storage Blob Data Reader ?)" }
+$all = Get-ChildItem $dir -Recurse -Filter '0*.json' | ForEach-Object { Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json }
+"--- erreurs"; $all | Where-Object error | ForEach-Object { "{0} : {1}" -f $_.fiche_id, $_.error.Substring(0, [Math]::Min(120, $_.error.Length)) }
+"--- KB0233"; $all | Where-Object { $_.fiche_id -like 'KB0233*' } | ConvertTo-Json -Depth 5
+```
+
+Si le bloc s'arrête pendant le suivi (fenêtre fermée, réseau coupé), le run continue dans Azure : **ne
+pas recoller le bloc** (cela lancerait un second run et doublerait les appels au modèle). Reprendre le
+suivi avec l'adresse affichée après « suivi : », puis recoller les lignes qui suivent la boucle :
+
+```powershell
+$run = [pscustomobject]@{ statusQueryGetUri = '<adresse affichée après « suivi : »>' }; $s = $null
+do { Start-Sleep -Seconds 30; try { $s = Invoke-RestMethod $run.statusQueryGetUri } catch { continue }; $s.runtimeStatus } while (-not $s -or $s.runtimeStatus -in 'Pending', 'Running')
+```
+
+**3. Questions de référence, puis scoreboard** (deux temps : l'import est un clic dans la page)
+
+a. Ouvrir `https://app-knowledgeengine3-v9.azurewebsites.net/labels/client-s/refs`. Le tableau « livrées
+avec le dépôt » doit montrer « comment attribuer une ligne teams » -> `KB0233 -  Associate a phone line`
+et « Mon compte est bloqué » -> `KB0120- LOCKED ACCOUNT`, état « à importer ». Cliquer « Importer les
+questions du dépôt » ; les deux passent à « présente ».
+
+b. Puis :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+$ErrorActionPreference = 'Stop'; $sb = $null; $s = $null
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+if ($LASTEXITCODE -or -not $key) { throw "clé de la Function introuvable" }
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$sb = Invoke-RestMethod -Method Post -Uri "$base/kecore/scoreboard/runs?code=$key" -Body (@{ client = 'client-s' } | ConvertTo-Json) -ContentType 'application/json'
+"suivi : $($sb.statusQueryGetUri)"
+do {
+    Start-Sleep -Seconds 20
+    try { $s = Invoke-RestMethod $sb.statusQueryGetUri } catch { Write-Warning "état illisible, nouvel essai : $($_.Exception.Message)"; continue }
+    $s.runtimeStatus
+} while (-not $s -or $s.runtimeStatus -in 'Pending', 'Running')
+if ($s.runtimeStatus -ne 'Completed') { $s | ConvertTo-Json -Depth 6; throw "scoreboard $($s.runtimeStatus)" }
+$s.output | Select-Object tickets, with_fiche, exact, wrong_shown, references | ConvertTo-Json -Depth 4
+(Invoke-RestMethod "$base/kecore/scoreboard/latest?client=client-s&code=$key").summary.references.rows |
+  ForEach-Object { "{0} | attendu {1} | montré {2} | 1re {3} | {4}" -f $_.text, ($_.expected -join ', '), $_.shown, $_.first, $(if ($_.passed) { 'OK' } else { 'NON' }) }
+```
+
+**Débit du modèle** (défaut 10) : un run `record` envoie désormais les lots qui appellent le modèle
+(décomposition, cartes, examen, passe A) **deux à la fois** (`llm_parallelism`, 1 à 8, dans le corps de
+`POST /kecore/runs` ; un run `replay` les lance tous ensemble), et chaque appel d'un run attend son tour
+après un 429 jusqu'à 12 fois (ce que demande `Retry-After`, 60 s au plus) au lieu de 5 -- de même le
+run de tickets et le scoreboard. Un `/find` en direct, au contraire, abandonne vite : délai de lecture
+25 s et 2 nouvelles tentatives (la Web App n'attend que 30 s). Un run lancé avant ce déploiement (sans
+`llm_parallelism` dans son entrée) garde sa forme d'origine s'il est rejoué après. Le quota `gpt-4o` (30 kTPM) reste partagé avec l'Assistant : relever
+`generationCapacity` (Bicep) ou donner aux runs leur propre déploiement est une décision d'infra, pas
+prise ici (changer de déploiement change la clé des enregistrements : tout serait rappelé au modèle).
+
+**Erreurs réseau** (défaut 3) : un délai ou une connexion coupée pendant la lecture de la réponse est
+désormais réessayé comme un délai de connexion (`kecore/azure.py`), et une fiche dont l'appel échoue
+quand même garde son erreur sans faire tomber son lot (`kefind/enrich.py`).
+
+**Questions de référence** (défaut 1) : une question du dépôt (ou tapée dans `/labels`) peut nommer sa
+fiche par son numéro (`KB0233`) ; elle est retrouvée dans le catalogue si une seule fiche porte ce
+numéro (`KB0233 -  Associate a phone line`), sinon la question est listée « non importable » avec la
+raison sur `/labels/<client>/refs` -- jamais devinée entre deux fiches. La page montre l'état de chaque
+question du dépôt avant l'import.

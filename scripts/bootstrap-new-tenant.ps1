@@ -1151,9 +1151,9 @@ try {
         # clients of -Clients (never the demo credentials, eval data or other clients there).
         $localClients = @(Get-LocalClients)
         if ($localClients.Count -gt 0) {
-            & (Join-Path $root 'deploy-webapp.ps1') -ResourceGroup $ResourceGroup -WebAppName $web -ClientsLocal $localClients
+            & (Join-Path $root 'deploy-webapp.ps1') -ResourceGroup $ResourceGroup -WebAppName $web -ClientsLocal $localClients -FromOnboarding
         } else {
-            & (Join-Path $root 'deploy-webapp.ps1') -ResourceGroup $ResourceGroup -WebAppName $web -SkipClientsLocal
+            & (Join-Path $root 'deploy-webapp.ps1') -ResourceGroup $ResourceGroup -WebAppName $web -SkipClientsLocal -FromOnboarding
         }
         if ($LASTEXITCODE -ne 0) {
             Write-Warning 'az webapp deploy reported a failure - its status poll can fail on a real success (runbook 7): open the site before re-running.'

@@ -247,7 +247,7 @@ try {
         Write-Host "  Before testing: .\deploy-webapp.ps1 -ResourceGroup $ResourceGroup -WebAppName $web -ClientsLocal $($ClientsLocal -join ',')"
     } else {
         Write-Step "Web app code with the client configs ($web)"
-        & (Join-Path $root 'deploy-webapp.ps1') -ResourceGroup $ResourceGroup -WebAppName $web -ClientsLocal $ClientsLocal
+        & (Join-Path $root 'deploy-webapp.ps1') -ResourceGroup $ResourceGroup -WebAppName $web -ClientsLocal $ClientsLocal -FromOnboarding
         if ($LASTEXITCODE -ne 0) {
             Write-Warning 'az webapp deploy reported a failure - its status poll can fail on a real success (runbook 7): open the site before re-running.'
         }

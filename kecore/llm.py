@@ -51,6 +51,8 @@ class AzureOpenAIConfig:
     seed: int = 7
     max_tokens: int = 4000
     timeout_s: float = 120.0
+    retries: int = 5            # new attempts after a transport failure or a 5xx (kecore.azure.RestClient)
+    throttle_retries: int = 5   # new attempts after a 429; offline runs raise it, the live path lowers both
 
     @classmethod
     def from_dict(cls, data: dict) -> "AzureOpenAIConfig":
@@ -84,7 +86,8 @@ class AzureOpenAIChat:
             config.api_version,
             tokens,
             timeout=config.timeout_s,
-            retries=5,
+            retries=config.retries,
+            throttle_retries=config.throttle_retries,
             forbidden_hint=lambda path: "your account needs the 'Cognitive Services OpenAI User' role on the resource",
             error_class=LLMError,
         )
@@ -140,7 +143,8 @@ class AzureOpenAIEmbeddings:
             config.api_version,
             tokens,
             timeout=config.timeout_s,
-            retries=5,
+            retries=config.retries,
+            throttle_retries=config.throttle_retries,
             forbidden_hint=lambda path: "your account needs the 'Cognitive Services OpenAI User' role on the resource",
             error_class=LLMError,
         )

@@ -6,6 +6,7 @@ CLI ('az login'). They are renewed before they expire and once on HTTP 401.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
@@ -94,10 +95,13 @@ def urllib_transport(method: str, url: str, headers: dict, body, timeout: float)
         request.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-            return response.status, (json.loads(raw) if raw else {}), dict(response.headers)
+            raw = response.read()
+            status, response_headers = response.status, dict(response.headers)
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except (OSError, http.client.HTTPException):
+            raw = ""  # the status line arrived, its body did not: the status alone decides (429/5xx retried)
         try:
             payload = json.loads(raw) if raw else {}
         except ValueError:
@@ -105,6 +109,17 @@ def urllib_transport(method: str, url: str, headers: dict, body, timeout: float)
         return exc.code, payload, dict(exc.headers or {})
     except urllib.error.URLError as exc:
         raise AzureError(f"cannot reach {url.split('?')[0]}: {exc.reason}") from None
+    except (OSError, http.client.HTTPException) as exc:
+        # urllib wraps only the sending side (DNS, connect, TLS, request) in URLError: a timeout or a
+        # dropped connection while waiting for or reading the answer comes out bare (TimeoutError,
+        # RemoteDisconnected, ConnectionResetError, IncompleteRead). Seen on the first real pass-A run
+        # (runbook 19.18 #3): one slow answer took a whole batch of fiches down with it.
+        raise AzureError(f"connection to {url.split('?')[0]} lost while reading the answer: "
+                         f"{type(exc).__name__}: {exc}") from None
+    try:
+        return status, (json.loads(raw.decode("utf-8")) if raw else {}), response_headers
+    except ValueError:  # a 2xx whose body is not JSON (cut, or a proxy's page): retried like a lost answer
+        raise AzureError(f"{url.split('?')[0]} answered HTTP {status} with a body that is not JSON") from None
 
 
 def error_message(payload) -> str:
@@ -118,17 +133,22 @@ def error_message(payload) -> str:
 
 
 class RestClient:
-    """JSON over HTTPS with retries on throttling and one token renewal on 401."""
+    """JSON over HTTPS with retries on throttling and one token renewal on 401.
+
+    ``retries`` bounds the new attempts after a transport failure or a 5xx; ``throttle_retries`` (default:
+    the same) bounds those after a 429, each one waiting what the service asks (``Retry-After``, at most
+    60 s). An offline run can afford to wait its turn on a shared quota; a live question cannot."""
 
     def __init__(self, endpoint: str, api_version: str, tokens: TokenProvider, transport=urllib_transport,
                  timeout: float = 30.0, retries: int = 3, sleep=time.sleep, forbidden_hint=None,
-                 error_class=AzureError):
+                 error_class=AzureError, throttle_retries: int | None = None):
         self.endpoint = endpoint.rstrip("/")
         self.api_version = api_version
         self.tokens = tokens
         self.transport = transport
         self.timeout = timeout
         self.retries = retries
+        self.throttle_retries = retries if throttle_retries is None else throttle_retries
         self.sleep = sleep
         self.forbidden_hint = forbidden_hint
         self.error_class = error_class
@@ -136,7 +156,7 @@ class RestClient:
     def request(self, method: str, path: str, body=None) -> dict:
         url = f"{self.endpoint}{path}{'&' if '?' in path else '?'}api-version={self.api_version}"
         refreshed = False
-        attempt = 0
+        attempt = throttled = 0
         while True:
             try:
                 response = self.transport(method, url, self.tokens.headers(), body, self.timeout)
@@ -157,7 +177,11 @@ class RestClient:
                 self.tokens.headers(force_refresh=True)
                 refreshed = True
                 continue
-            if status in (429, 500, 502, 503, 504) and attempt < self.retries:
+            if status == 429 and throttled < self.throttle_retries:
+                self.sleep(_retry_delay(headers, throttled, cap=60.0))
+                throttled += 1
+                continue
+            if status in (500, 502, 503, 504) and attempt < self.retries:
                 self.sleep(_retry_delay(headers, attempt))
                 attempt += 1
                 continue
@@ -169,7 +193,7 @@ class RestClient:
             return payload if isinstance(payload, dict) else {}
 
 
-def _retry_delay(headers: dict, attempt: int) -> float:
+def _retry_delay(headers: dict, attempt: int, cap: float = 30.0) -> float:
     for key in ("retry-after-ms", "Retry-After-Ms", "x-ms-retry-after-ms"):
         if headers.get(key):
             try:
@@ -182,4 +206,4 @@ def _retry_delay(headers: dict, attempt: int) -> float:
                 return min(float(headers[key]), 60.0)
             except ValueError:
                 pass
-    return float(min(2 ** attempt, 30))
+    return float(min(2 ** attempt, cap))

@@ -9,6 +9,7 @@ Run from the repository root:  python -m unittest discover -s kecore_func/tests
 
 import importlib
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -299,6 +300,18 @@ class Slice5RoutesTest(RoutesTest):
             else self.tables.setdefault(name or "tickets", MemoryTable())
         self.assertEqual(self.find(observe="ab" * 16).status_code, 200)
 
+    def test_the_version_route_says_which_commit_was_packaged(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "BUILD_COMMIT")
+            with unittest.mock.patch.object(self.fa, "BUILD_COMMIT", path):
+                self.assertEqual(json.loads(self.fa.kecore_version(request("GET", "kecore/version")).get_body()),
+                                 {"commit": "unknown"})                     # a tree deployed without the script
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("7798a72c0ffee\n")
+                self.assertEqual(json.loads(self.fa.kecore_version(request("GET", "kecore/version")).get_body()),
+                                 {"commit": "7798a72c0ffee"})
+
     def test_the_next_run_reads_the_review_decisions(self):
         for session in ("a1", "b2", "c3"):
             self.find(observe=session * 8)
@@ -414,6 +427,74 @@ class OrchestratorsTest(unittest.TestCase):
         ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": False, "enrich": True},
                   self.kecore_activities())
         self.assertEqual(drive_throwing(self.fa.kecore_run, ctx)["enrichment"]["fiches"], 5)
+
+    def waves(self, payload):
+        sizes = []
+
+        class Recording(Ctx):
+            def task_all(self, tasks):
+                sizes.append([t[1] for t in tasks])
+                return super().task_all(tasks)
+
+        ctx = Recording(payload, self.kecore_activities())
+        out = drive_throwing(self.fa.kecore_run, ctx)
+        return out, sizes, ctx
+
+    def test_a_record_run_calls_the_model_two_batches_at_a_time_by_default(self):
+        out, sizes, ctx = self.waves({"client": "client-s", "run_id": "r1", "batch_size": 1, "mode": "record",
+                                      "semantic": True, "enrich": True, "llm_parallelism": 2})
+        self.assertTrue(sizes and all(len(wave) <= 2 for wave in sizes))
+        self.assertEqual(sum(len(w) for w in sizes if w[0] == "kecore_decompose"), 5)   # nothing skipped
+        self.assertEqual(sum(len(w) for w in sizes if w[0] == "kecore_enrich"), 5)
+        decomposed = [c[1]["start"] for c in ctx.calls if c[0] == "kecore_decompose"]
+        self.assertEqual(decomposed, [0, 1, 2, 3, 4])                                   # in range order
+        self.assertEqual(out["semantic"]["cards"]["questions"], 50)
+
+    def test_a_replay_runs_every_batch_at_once_and_the_width_is_a_parameter(self):
+        _, sizes, _ = self.waves({"client": "client-s", "run_id": "r1", "batch_size": 1, "mode": "replay",
+                                  "semantic": False, "enrich": True, "llm_parallelism": 2})
+        self.assertEqual([len(w) for w in sizes], [5, 5])
+        _, sizes, _ = self.waves({"client": "client-s", "run_id": "r1", "batch_size": 1, "mode": "record",
+                                  "semantic": False, "enrich": False, "llm_parallelism": 3})
+        self.assertEqual([len(w) for w in sizes], [3, 2])
+
+    def test_offline_runs_wait_their_turn_and_a_live_question_gives_up_quickly(self):
+        env = {"KECORE_AOAI_ENDPOINT": "https://acct.openai.azure.com", "KECORE_AOAI_DEPLOYMENT": "gpt-4o"}
+        with unittest.mock.patch.dict(os.environ, env), \
+                unittest.mock.patch.object(self.fa, "storage", lambda: None), \
+                unittest.mock.patch.object(self.fa, "_chat", {}), \
+                unittest.mock.patch.object(self.fa, "_embeddings", {}):
+            run = self.fa.make_llm({"client": "client-s", "mode": "record"}).inner._client
+            live = self.fa.find_llm("client-s").inner._client
+            measured = self.fa.find_llm("client-s", live=False).inner._client
+            live_vectors = self.fa.query_embedder("client-s", 1024).inner._client
+            measured_vectors = self.fa.query_embedder("client-s", 1024, live=False).inner._client
+            built_vectors = self.fa.make_build_embedder({"client": "client-s", "mode": "record"}).inner._client
+        for client in (run, measured, measured_vectors, built_vectors):
+            self.assertEqual((client.throttle_retries, client.retries, client.timeout),
+                             (self.fa.BATCH_THROTTLE_RETRIES, 5, 120.0))
+        for client in (live, live_vectors):
+            self.assertEqual((client.throttle_retries, client.retries, client.timeout), (2, 2, 25.0))
+
+    def test_measurements_use_the_batch_budget_and_find_the_live_one(self):
+        seen = []
+        fake_llm = lambda client, live=True: seen.append(("llm", live))  # noqa: E731
+        fake_vectors = lambda client, dims, live=True: seen.append(("vectors", live))  # noqa: E731
+        with unittest.mock.patch.object(self.fa, "find_llm", fake_llm), \
+                unittest.mock.patch.object(self.fa, "query_embedder", fake_vectors), \
+                unittest.mock.patch.object(self.fa, "storage", lambda: None), \
+                unittest.mock.patch.object(self.fa, "table", lambda name=None: None), \
+                unittest.mock.patch.object(self.fa.sb_svc, "batch", lambda *a, **k: {}), \
+                unittest.mock.patch.object(self.fa.tickets_svc, "run_batch", lambda *a, **k: {}):
+            self.fa.scoreboard_batch({"client": "client-s", "interpret": True, "start": 0, "end": 1})
+            self.fa.tickets_run_batch({"client": "client-s", "interpret": True, "start": 0, "end": 1, "run_id": "r1"})
+        self.assertEqual(seen, [("llm", False), ("vectors", False)] * 2)
+
+    def test_a_run_started_before_llm_parallelism_existed_replays_with_its_original_shape(self):
+        out, sizes, _ = self.waves({"client": "client-s", "run_id": "r1", "batch_size": 1, "mode": "record",
+                                    "semantic": True, "enrich": True})            # no llm_parallelism: an old input
+        self.assertEqual(sorted({len(w) for w in sizes}), [5])
+        self.assertEqual(out["semantic"]["cards"]["questions"], 50)
 
     def test_no_label_no_scoreboard(self):
         out = drive(self.fa.scoreboard_run, Ctx({"client": "client-s", "sb_id": "s"},

@@ -3,6 +3,10 @@
 # person clicks "Importer les questions du dépôt" in /labels/<client>/refs -- create-only: a question
 # already there keeps the label a person gave it, and one whose fiche is not in the current map is
 # left out. The scoreboard then measures them with the labeled tickets (non-regression section).
+# A fiche may be named by its number ("KB0233"): on client-s a fiche id is the document's name
+# ("KB0233 -  Associate a phone line"), so the import resolves the number against the catalog and stores
+# the full id -- only when exactly one fiche carries that number; otherwise the question is listed as
+# "non importable" with the reason on the /labels/<client>/refs page, never imported half-right.
 # Question text stays French (it is what technicians type); see CLAUDE.md's language rule.
 client-s:
   - text: "comment attribuer une ligne teams"

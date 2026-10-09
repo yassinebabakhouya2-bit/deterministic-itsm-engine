@@ -51,6 +51,10 @@ DICTIONARY_DECISIONS = "dictionary-decisions.json"
 EXCLUSION_CONFIG = "exclusion-config.json"
 DEFAULT_BATCH = 10
 MAX_BATCH = 50
+# Batches that call the model run this many at a time in a "record" run (all at once in "replay"): the
+# shared gpt-4o quota throttled 21 of 180 fiches when 4 ran together (runbook 19.18 #10).
+DEFAULT_LLM_PARALLELISM = 2
+MAX_LLM_PARALLELISM = 8
 _PREFIX_RE = re.compile(r"^[\w\-. /]{0,200}$")
 _RUN_ID_RE = re.compile(r"^[0-9A-Za-z-]{1,64}$")
 _FICHE_FIELDS = ("fiche_id", "client", "title", "text", "source", "meta")
@@ -122,6 +126,10 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
     enrich = body.get("enrich", True)
     if not isinstance(enrich, bool):
         raise ValueError("enrich must be true or false")
+    llm_parallelism = body.get("llm_parallelism", DEFAULT_LLM_PARALLELISM)
+    if isinstance(llm_parallelism, bool) or not isinstance(llm_parallelism, int) \
+            or not 1 <= llm_parallelism <= MAX_LLM_PARALLELISM:
+        raise ValueError(f"llm_parallelism must be an integer between 1 and {MAX_LLM_PARALLELISM}")
     if not _RUN_ID_RE.match(run_id):
         raise ValueError("invalid run id")
     return {
@@ -133,6 +141,7 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
         "with_dictionary": with_dictionary,
         "semantic": semantic,
         "enrich": enrich,
+        "llm_parallelism": llm_parallelism,
         "run_id": run_id,
     }
 

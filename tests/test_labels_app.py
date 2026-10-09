@@ -48,14 +48,19 @@ class MemoryTable:
 
 
 SEEDS = {CLIENT: [("comment attribuer une ligne teams", ["KB0233"]), ("Mon compte est bloqué", ["KB0120"]),
-                  ("une fiche absente de la carte", ["KB9999"])]}
+                  ("une fiche absente de la carte", ["KB9999"]), ("une facture à valider", ["KB0400"]),
+                  ("le vpn coupe", ["KB0200"]), ("la machine à café fuit", []),
+                  ("vpn et compte bloqué", ["KB0200", "KB0120"])]}
+PHONE_LINE = "KB0233 -  Associate a phone line"   # a real client-s id: the document's name, two spaces
 
 
 def make_app(access=True, clients=(CLIENT,), me="alice", ref_seeds=SEEDS):
     tables = {name: MemoryTable() for name in ("tickets", "fiches", "labels", "scores", "refs")}
     for fiche_id, label, searchable in (("KB0120", "KB0120- LOCKED ACCOUNT", True), ("KB0200", "KB0200- VPN", True),
                                         ("KB0300", "KB0300- INFO", False),
-                                        ("KB0233", "KB0233 -  Associate a phone line", True)):
+                                        (PHONE_LINE, PHONE_LINE, True),
+                                        ("KB0400 - Valider une facture", "KB0400 - Valider une facture", True),
+                                        ("KB0400 - Ancienne facture", "KB0400 - Ancienne facture", True)):
         tables["fiches"].upsert({"PartitionKey": CLIENT, "RowKey": fiche_id.lower(), "fiche_id": fiche_id,
                                  "label": label, "searchable": searchable})
     seeds = [("I1", "fiche", "KB0120"), ("I2", "fiche", "KB0120"), ("I3", "fiche", "KB0200"),
@@ -248,7 +253,8 @@ def test_a_reference_question_is_saved_with_its_fiche_or_none():
     post(c, f"/labels/{CLIENT}/refs", {"text": "la machine à café fuit", "decision": "none"})
     refs = refs_of(tables)
     expected, row = refs["comment attribuer une ligne teams"]
-    assert expected == ["KB0233"] and row["RowKey"] == labels_tab.ref_id("Comment attribuer une ligne TEAMS")
+    assert expected == [PHONE_LINE]                       # typed as "KB0233", stored as the real fiche id
+    assert row["RowKey"] == labels_tab.ref_id("Comment attribuer une ligne TEAMS")
     assert row["RowKey"].startswith("ref-") and row["labeled_by_name"] == "Alice" and row["source"] == "form"
     assert refs["la machine à café fuit"][0] == []
     page = c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)
@@ -315,23 +321,84 @@ def test_a_reference_question_is_escaped_and_can_be_deleted():
     assert tables["refs"].rows == {}
 
 
+def seed_states(page):
+    import re
+    return [re.sub(r"<[^>]+>.*", "", cell).strip() for cell in re.findall(r'<td class="seed-state">(.*?)</td>', page, re.S)]
+
+
 def test_the_repository_questions_are_imported_on_a_click_create_only():
     app, tables = make_app()
     c = app.test_client()
     page = c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)
-    assert "3 questions livrées avec le dépôt" in page and tables["refs"].rows == {}   # a page view writes nothing
+    assert "7 questions livrées avec le dépôt" in page and tables["refs"].rows == {}   # a page view writes nothing
+    assert seed_states(page) == ["à importer", "à importer", "non importable", "non importable", "à importer",
+                                 "à importer", "à importer"]
+    assert "KB9999 : absente de la carte" in page and "KB0400 : ambiguë" in page
+    assert "KB0200- VPN, KB0120- LOCKED ACCOUNT" in page                              # several fiches, separated
     post(c, f"/labels/{CLIENT}/refs", {"text": "Mon compte est bloqué", "fiche": "KB0200", "decision": "fiche"})
-    assert "msg=ref_seeded" in post(c, f"/labels/{CLIENT}/refs/seed", {}).headers["Location"]
+    assert "msg=ref_seeded_partial" in post(c, f"/labels/{CLIENT}/refs/seed", {}).headers["Location"]
     refs = refs_of(tables)
-    assert refs["comment attribuer une ligne teams"][0] == ["KB0233"]
+    assert refs["comment attribuer une ligne teams"][0] == [PHONE_LINE]               # a number, resolved
     assert refs["comment attribuer une ligne teams"][1]["source"] == "seed"
+    assert refs["le vpn coupe"][0] == ["KB0200"]                                      # an exact catalog id
+    assert refs["la machine à café fuit"][0] == []                                    # no fiche expected
+    assert refs["vpn et compte bloqué"][0] == ["KB0200", "KB0120"]
     assert refs["Mon compte est bloqué"][0] == ["KB0200"]       # a person's label is never overwritten
     assert "une fiche absente de la carte" not in refs           # its fiche is not in the map
+    assert "une facture à valider" not in refs                   # two fiches carry KB0400: never a guess
+    page = c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)
+    assert seed_states(page) == ["présente", "présente — fiche différente du dépôt", "non importable",
+                                 "non importable", "présente", "présente", "présente"]
     post(c, f"/labels/{CLIENT}/refs/seed", {})
-    assert len(tables["refs"].rows) == 2
+    assert len(tables["refs"].rows) == 5
+
+
+def test_a_question_added_by_hand_for_an_unimportable_seed_no_longer_counts_as_skipped():
+    app, tables = make_app(ref_seeds={CLIENT: [("une facture à valider", ["KB0400"])]})
+    c = app.test_client()
+    post(c, f"/labels/{CLIENT}/refs", {"text": "une facture à valider", "fiche": "KB0400 - Valider une facture",
+                                       "decision": "fiche"})
+    assert "msg=ref_seeded&" in post(c, f"/labels/{CLIENT}/refs/seed", {}).headers["Location"] + "&"
+    assert seed_states(c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)) == ["présente"]
+
+
+def test_a_stored_fiche_that_left_the_map_is_flagged():
+    app, tables = make_app(ref_seeds={CLIENT: [("comment attribuer une ligne teams", ["KB0233"])]})
+    c = app.test_client()
+    post(c, f"/labels/{CLIENT}/refs/seed", {})
+    tables["fiches"].rows.pop((CLIENT, PHONE_LINE.lower()))                 # the document was renamed
+    tables["fiches"].upsert({"PartitionKey": CLIENT, "RowKey": "kb0233-new", "fiche_id": "KB0233 - Associate a phone line",
+                             "label": "KB0233 - Associate a phone line", "searchable": True})
+    page = c.get(f"/labels/{CLIENT}/refs").get_data(as_text=True)
+    assert seed_states(page) == ["présente — fiche absente de la carte"]
+    assert "(absente de la carte)" in page
 
 
 def test_the_repository_file_holds_the_priority_case():
     seeds = labels_tab.load_ref_seeds()
     assert ("comment attribuer une ligne teams", ["KB0233"]) in seeds["client-s"]
     assert all(e for _, e in seeds["client-s"])
+
+
+def test_a_fiche_named_by_its_number_is_found_only_when_it_is_unique():
+    catalog = {f: {} for f in (PHONE_LINE, "KB0120- LOCKED ACCOUNT", "K0090 - VEEAM-Appel_Support1", "KB00308",
+                               "KB0032 – How to clear the TEAMS cache", "KB0400 - A", "KB0400 - B", "KB02330 - Autre")}
+    resolve = labels_tab.resolve_fiche
+    assert resolve(PHONE_LINE, catalog) == (PHONE_LINE, "")              # an exact id stays as it is
+    assert resolve("KB0233", catalog) == (PHONE_LINE, "")                # not KB02330: the number ends there
+    assert resolve(" kb 233 ", catalog) == (PHONE_LINE, "")
+    assert resolve("KB0120", catalog) == ("KB0120- LOCKED ACCOUNT", "")
+    assert resolve("K0090", catalog) == ("K0090 - VEEAM-Appel_Support1", "")
+    assert resolve("KB308", catalog) == ("KB00308", "")
+    assert resolve("KB32", catalog) == ("KB0032 – How to clear the TEAMS cache", "")
+    assert resolve("KB0400", catalog) == (None, "ambiguë : KB0400 - A | KB0400 - B")
+    assert resolve("KB9999", catalog) == (None, "absente de la carte")
+    assert resolve("Associate a phone line", catalog) == (None, "absente de la carte")   # no title guessing
+    assert resolve("", catalog) == (None, "absente de la carte")
+
+
+def test_a_technician_may_type_the_number_but_an_ambiguous_one_is_refused():
+    app, tables = make_app()
+    c = app.test_client()
+    r = post(c, f"/labels/{CLIENT}/refs", {"text": "valider une facture harmony", "fiche": "KB0400", "decision": "fiche"})
+    assert "msg=unknown_fiche" in r.headers["Location"] and tables["refs"].rows == {}

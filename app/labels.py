@@ -86,8 +86,9 @@ MESSAGES = {
     "ref_text": "La question doit faire entre 3 et 500 caractères.",
     "ref_exists": "Cette question existe déjà : modifiez sa fiche ci-dessous.",
     "ref_changed": "Cette question vient d'être modifiée par quelqu'un d'autre : vérifiez-la puis recommencez.",
-    "ref_seeded": "Questions du dépôt importées. Celles déjà présentes gardent leur étiquette ; celles dont la fiche "
-                  "n'est pas dans la carte actuelle sont laissées de côté.",
+    "ref_seeded": "Questions du dépôt importées. Celles déjà présentes gardent leur étiquette.",
+    "ref_seeded_partial": "Questions du dépôt importées, sauf celles marquées « non importable » ci-dessous : leur fiche "
+                          "est absente de la carte actuelle ou ambiguë. Celles déjà présentes gardent leur étiquette.",
 }
 
 
@@ -117,6 +118,29 @@ def _order(user_id: str, row_key: str) -> str:
     """A stable pseudo-random order of its own for each labeler (the export's order would cluster
     similar tickets, and one shared order would send two labelers to the same ticket)."""
     return hashlib.sha256(f"{user_id}\x00{row_key}".encode("utf-8")).hexdigest()
+
+
+# A fiche named by its number alone ("KB0233", "kb 233", "K0090"): on client-s a fiche id is the document's
+# name ("KB0233 -  Associate a phone line": kecore keeps the whole stem when the number has fewer than 5
+# digits), so the repository's seeds and a technician typing a number are resolved against the catalog.
+_NUMBER_ONLY_RE = re.compile(r"(?i)^\s*KB?\s*0*(\d{1,7})\s*$")
+_LEADING_NUMBER_RE = re.compile(r"(?i)^\s*KB?\s*0*(\d{1,7})(?!\d)")
+
+
+def resolve_fiche(token: str, catalog: dict) -> tuple[str | None, str]:
+    """(fiche id, "") when ``token`` is a catalog id, or a number exactly one catalog fiche starts with;
+    else (None, why): "absente de la carte" or "ambiguë : <ids>". Never a guess between two fiches."""
+    token = (token or "").strip()
+    if token in catalog:
+        return token, ""
+    match = _NUMBER_ONLY_RE.match(token)
+    if not match:
+        return None, "absente de la carte"
+    number = int(match.group(1))
+    hits = sorted(f for f in catalog if (m := _LEADING_NUMBER_RE.match(f)) and int(m.group(1)) == number)
+    if len(hits) == 1:
+        return hits[0], ""
+    return None, ("ambiguë : " + " | ".join(hits)) if hits else "absente de la carte"
 
 
 def ref_id(text: str) -> str:
@@ -395,6 +419,42 @@ def create_labels_blueprint(tables: dict, deps: dict):
                 r["expected_list"] = []
         return sorted(rows, key=lambda r: (r.get("text") or "").casefold())
 
+    def _seeds(client) -> list:
+        return (ref_seeds if ref_seeds is not None else load_ref_seeds()).get(client, [])
+
+    def _resolve_all(tokens, catalog) -> tuple[list, str]:
+        """Every expected fiche resolved, or ([], the first reason one is not)."""
+        out = []
+        for token in tokens:
+            fiche_id, why = resolve_fiche(token, catalog)
+            if fiche_id is None:
+                return [], f"{token} : {why}"
+            if fiche_id not in out:
+                out.append(fiche_id)
+        return out, ""
+
+    def _seed_status(client, catalog, stored) -> list:
+        """What the import would do with each repository question, computed on the page, written nowhere. A
+        question already stored shows the fiche stored (a person's label wins), flagged when it is no longer
+        in the map or differs from the repository's."""
+        status = []
+        for text, expected in _seeds(client):
+            resolved, why = _resolve_all(expected, catalog)
+            row = stored.get(ref_id(text))
+            if row is None:
+                status.append({"text": text, "expected": expected, "fiches": resolved, "why": why,
+                               "state": "à importer" if not why else "non importable"})
+                continue
+            kept = row.get("expected_list") or []
+            if any(f not in catalog for f in kept):
+                state = "présente — fiche absente de la carte"
+            elif not why and sorted(kept) != sorted(resolved):
+                state = "présente — fiche différente du dépôt"
+            else:
+                state = "présente"
+            status.append({"text": text, "expected": expected, "fiches": kept, "why": "", "state": state})
+        return status
+
     def _ref_entity(client, rid, text, expected, source) -> dict:
         return {"PartitionKey": client, "RowKey": rid, "text": text,
                 "expected": json.dumps(expected, ensure_ascii=False), "source": source,
@@ -415,10 +475,11 @@ def create_labels_blueprint(tables: dict, deps: dict):
                 abort(404)
             editing["expected_list"] = json.loads(editing.get("expected") or "[]")
         options = sorted(catalog.values(), key=lambda r: (r.get("label") or r["fiche_id"]).lower())
-        seeds = (ref_seeds if ref_seeds is not None else load_ref_seeds()).get(client, [])
+        rows = _refs(client)
         return render_template_string(
-            PAGE, view="refs", client=client, refs=_refs(client), catalog=catalog, options=options, editing=editing,
-            seeds=len(seeds), msg=MESSAGES.get(request.args.get("msg", "")), display_name=deps["display_name"]())
+            PAGE, view="refs", client=client, refs=rows, catalog=catalog, options=options, editing=editing,
+            seeds=_seed_status(client, catalog, {r["RowKey"]: r for r in rows}),
+            msg=MESSAGES.get(request.args.get("msg", "")), display_name=deps["display_name"]())
 
     @bp.route("/labels/<client>/refs", methods=["POST"])
     def save_ref(client):
@@ -451,8 +512,8 @@ def create_labels_blueprint(tables: dict, deps: dict):
             rid = ref_id(text)
         expected: list = []
         if decision == "fiche":
-            fiche_id = (request.form.get("fiche") or "").strip()
-            if fiche_id not in catalog:
+            fiche_id, _ = resolve_fiche(request.form.get("fiche") or "", catalog)
+            if fiche_id is None:
                 return back("unknown_fiche", rid if existing else "")
             expected = [fiche_id]
         entity = _ref_entity(client, rid, text, expected, (existing or {}).get("source") or "form")
@@ -482,14 +543,20 @@ def create_labels_blueprint(tables: dict, deps: dict):
         if not _same_origin():
             abort(403)
         catalog = _catalog(client)
-        for text, expected in (ref_seeds if ref_seeds is not None else load_ref_seeds()).get(client, []):
-            if any(f not in catalog for f in expected):
+        present = {r["RowKey"] for r in _refs(client)}
+        skipped = 0
+        for text, expected in _seeds(client):
+            if ref_id(text) in present:
+                continue                # create-only: a stored question keeps its label
+            resolved, why = _resolve_all(expected, catalog)
+            if why:
+                skipped += 1           # listed on the page with its reason, never imported half-right
                 continue
             try:
-                tables["refs"].create(_ref_entity(client, ref_id(text), text, expected, "seed"))
+                tables["refs"].create(_ref_entity(client, ref_id(text), text, resolved, "seed"))
             except Conflict:
                 continue
-        return redirect(url_for("labels.refs", client=client, msg="ref_seeded"))
+        return redirect(url_for("labels.refs", client=client, msg="ref_seeded_partial" if skipped else "ref_seeded"))
 
     return bp
 
@@ -638,8 +705,12 @@ PAGE = """
       <datalist id="all-fiches">{% for o in options %}<option value="{{ o.fiche_id }}">{{ o.label }}</option>{% endfor %}</datalist>
       {% if seeds %}
       <form method="post" action="/labels/{{ client }}/refs/seed" style="margin-top:16px">
-        <p class="muted">{{ seeds }} question{{ 's' if seeds > 1 }} livrée{{ 's' if seeds > 1 }} avec le dépôt (config/reference-questions.yaml). L'import n'écrase jamais une question déjà présente.</p>
-        <button class="b-soft">Importer les questions du dépôt</button>
+        <p class="muted">{{ seeds|length }} question{{ 's' if seeds|length > 1 }} livrée{{ 's' if seeds|length > 1 }} avec le dépôt (config/reference-questions.yaml). Une fiche peut y être nommée par son numéro (« KB0233 ») : elle est retrouvée dans le catalogue, jamais devinée entre deux. L'import n'écrase jamais une question déjà présente.</p>
+        <table><tr><th>Question</th><th>Fiche</th><th>État</th></tr>
+        {% for sd in seeds %}<tr><td>{{ sd.text }}</td>
+          <td>{% if sd.fiches %}{% for f in sd.fiches %}{{ catalog[f].label if f in catalog else f }}{{ ', ' if not loop.last }}{% endfor %}{% elif sd.why %}{{ sd.expected|join(', ') }}{% else %}<span class="muted">aucune fiche</span>{% endif %}</td>
+          <td class="seed-state">{{ sd.state }}{% if sd.why %}<div class="muted">{{ sd.why }}</div>{% endif %}</td></tr>{% endfor %}</table>
+        <div class="btns"><button class="b-soft">Importer les questions du dépôt</button></div>
       </form>
       {% endif %}
     </div>
@@ -647,7 +718,7 @@ PAGE = """
       <h2>Questions de référence ({{ refs|length }})</h2>
       <table><tr><th>Question</th><th>Fiche attendue</th><th></th></tr>
       {% for r in refs %}<tr><td>{{ r.text }}<div class="muted">{{ r.labeled_by_name }} — {{ (r.labeled_at or '')[:16].replace('T', ' ') }}{% if r.source == 'seed' %} · dépôt{% endif %}</div></td>
-        <td>{% if r.expected_list %}{% for f in r.expected_list %}{{ catalog[f].label if f in catalog else f }}{% if f not in catalog %} <span class="muted">(absente de la carte)</span>{% endif %}{% endfor %}{% else %}<span class="muted">aucune fiche</span>{% endif %}</td>
+        <td>{% if r.expected_list %}{% for f in r.expected_list %}{{ catalog[f].label if f in catalog else f }}{% if f not in catalog %} <span class="muted">(absente de la carte)</span>{% endif %}{{ ', ' if not loop.last }}{% endfor %}{% else %}<span class="muted">aucune fiche</span>{% endif %}</td>
         <td style="white-space:nowrap"><a href="/labels/{{ client }}/refs?id={{ r.RowKey }}">Modifier</a>
           <form method="post" action="/labels/{{ client }}/refs/{{ r.RowKey }}/delete" style="display:inline"><button class="b-soft" style="padding:3px 8px;font-size:.8rem">Supprimer</button></form></td></tr>
       {% else %}<tr><td colspan="3" class="muted">Aucune question de référence pour l'instant.</td></tr>{% endfor %}</table>

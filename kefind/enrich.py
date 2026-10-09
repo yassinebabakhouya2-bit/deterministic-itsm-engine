@@ -201,6 +201,9 @@ def make_enrichment(llm, kbmap, fiche_id: str) -> Enrichment:
     except LLMError as exc:
         out.error = str(exc)[:300]
         return out
+    except Exception as exc:  # anything else the call raises stays this fiche's error, never the batch's
+        out.error = f"{type(exc).__name__}: {exc}"[:300]
+        return out
     out.provenance["model"] = answer.model
     data = answer.data if isinstance(answer.data, dict) else {}
 

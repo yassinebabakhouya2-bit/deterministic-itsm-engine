@@ -186,6 +186,12 @@ class ProposalTest(unittest.TestCase):
         self.assertEqual((e.canonical_intent, e.primary_app, e.semantic_aliases_fr), (None, None, []))
         self.assertEqual(e.provenance["prompt_version"], 1)
 
+    def test_any_other_failure_of_the_call_stays_this_fiche_s_error(self):
+        e = make_enrichment(TitleLLM({"Associate a phone line": TimeoutError("The read operation timed out")}),
+                            kbmap(), PHONE_LINE)
+        self.assertEqual(e.error, "TimeoutError: The read operation timed out")
+        self.assertIsNone(e.canonical_intent)
+
     def test_a_malformed_answer_is_read_defensively(self):
         answer = {"canonical_intent": 42, "primary_app": ["teams"], "supported_apps": "teams",
                   "app_evidence": ["teams"], "semantic_aliases_fr": [None, 3, "attribuer une ligne teams"],

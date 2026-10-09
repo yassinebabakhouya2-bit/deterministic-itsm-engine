@@ -138,10 +138,21 @@ def model_id() -> str:
     return f"{config['deployment']}@{urllib.parse.urlparse(config['endpoint']).netloc}"
 
 
+# Two budgets for the model calls (kecore.azure.RestClient), runbook 19.18 #10 and the lot-1 review:
+# - an offline run or a measurement (kecore run, tickets run, scoreboard) waits its turn on the shared
+#   gpt-4o quota (30 kTPM, also serving the live Assistant): 12 new attempts after a 429, each waiting what
+#   the service asks (at most 60 s) -- the first real pass-A run lost 21 fiches out of 180 with 5;
+# - a live /kecore/find answers a Web App that stops waiting after 30 s (app/kecore_client.py): a short
+#   read timeout and 2 new attempts, so a hung service is given up quickly instead of holding a worker.
+BATCH_THROTTLE_RETRIES = 12
+BATCH_BUDGET = {"throttle_retries": BATCH_THROTTLE_RETRIES}
+LIVE_BUDGET = {"timeout_s": 25.0, "retries": 2, "throttle_retries": 2}
+
+
 def make_llm(payload: dict) -> RecordingLLM:
     # Built even in replay mode: the record key holds "<deployment>@<host>", taken from the client.
     # In replay mode RecordingLLM never calls it; a missing answer is an error, never a model call.
-    inner = AzureOpenAIChat.from_config(llm_config())
+    inner = AzureOpenAIChat.from_config({**llm_config(), **BATCH_BUDGET})
     return RecordingLLM(inner, mode=payload["mode"], store=pipeline.StorageRecordStore(storage(), payload["client"]))
 
 
@@ -185,6 +196,25 @@ async def kecore_start(req: func.HttpRequest, client) -> func.HttpResponse:
     return client.create_check_status_response(req, instance_id)
 
 
+def _fan_out(context, name: str, payload: dict, ranges: list[list[int]]):
+    """One activity per [start, end) range. In a "record" run the batches that may call the model go
+    ``llm_parallelism`` at a time (a shared quota, runbook 19.18 #10); in "replay" nothing is called, all
+    at once. Results come back in range order either way. Used with ``yield from``."""
+    # An orchestration started before llm_parallelism existed has no such key: it keeps the shape it was
+    # scheduled with (everything at once), or its replay after a redeploy would not match its history.
+    if payload.get("mode") == "replay" or "llm_parallelism" not in payload:
+        width = len(ranges)
+    else:
+        width = payload["llm_parallelism"]
+    width = max(1, width)
+    results: list = []
+    for i in range(0, len(ranges), width):
+        results += yield context.task_all(
+            [context.call_activity(name, {**payload, "start": start, "end": end}) for start, end in ranges[i:i + width]]
+        )
+    return results
+
+
 @app.orchestration_trigger(context_name="context")
 def kecore_run(context: df.DurableOrchestrationContext):
     payload = context.get_input()
@@ -193,9 +223,7 @@ def kecore_run(context: df.DurableOrchestrationContext):
         return {"run_id": payload["run_id"], "error": "no readable fiche under this prefix", "extract": extracted}
     profiled = yield context.call_activity("kecore_profile", payload)
     ranges = pipeline.batches(extracted["fiches"], payload["batch_size"])
-    stats = yield context.task_all(
-        [context.call_activity("kecore_decompose", {**payload, "start": start, "end": end}) for start, end in ranges]
-    )
+    stats = yield from _fan_out(context, "kecore_decompose", payload, ranges)
     summary = yield context.call_activity(
         "kecore_report",
         {**payload, "ranges": ranges, "profile_stats": profiled, "batch_stats": stats, "warnings": extracted["warnings"]},
@@ -205,12 +233,8 @@ def kecore_run(context: df.DurableOrchestrationContext):
         try:
             planned = yield context.call_activity("kecore_semantic_plan", payload)
             fiches = pipeline.batches(planned["fiches"], payload["batch_size"])
-            cards = yield context.task_all(
-                [context.call_activity("kecore_cards", {**payload, "start": start, "end": end}) for start, end in fiches]
-            )
-            exams = yield context.task_all(
-                [context.call_activity("kecore_heldout", {**payload, "start": start, "end": end}) for start, end in fiches]
-            )
+            cards = yield from _fan_out(context, "kecore_cards", payload, fiches)
+            exams = yield from _fan_out(context, "kecore_heldout", payload, fiches)
             built = yield context.call_activity("kecore_semantic_index", payload)
             calibrated = yield context.call_activity("kecore_calibrate", payload)
             semantic = {
@@ -227,9 +251,7 @@ def kecore_run(context: df.DurableOrchestrationContext):
         try:
             planned = yield context.call_activity("kecore_semantic_plan", payload)
             fiches = pipeline.batches(planned["fiches"], payload["batch_size"])
-            parts = yield context.task_all(
-                [context.call_activity("kecore_enrich", {**payload, "start": start, "end": end}) for start, end in fiches]
-            )
+            parts = yield from _fan_out(context, "kecore_enrich", payload, fiches)
             enrichment = yield context.call_activity("kecore_enrich_summary", payload)
             enrichment["llm"] = {k: sum(part[k] for part in parts) for k in ("calls", "cached")}
         except Exception as exc:  # the run is still published, and says why
@@ -307,25 +329,25 @@ def kecore_publish(payload: dict) -> dict:
     return pipeline.publish(storage(), payload, payload["summary"], payload.get("semantic"))
 
 
-_chat = None
+_chat: dict = {}
 
 
-def find_llm(client: str) -> RecordingLLM:
-    """The model that interprets tickets, behind the client's record (kecore-<client>/find-cache/)."""
-    global _chat
-    if _chat is None:
-        _chat = AzureOpenAIChat.from_config(llm_config())
-    return RecordingLLM(_chat, mode="record", store=pipeline.StorageRecordStore(storage(), client, prefix="find-cache/"))
+def find_llm(client: str, live: bool = True) -> RecordingLLM:
+    """The model that interprets tickets, behind the client's record (kecore-<client>/find-cache/). ``live``:
+    the short budget of a /kecore/find answer; False for the tickets run and the scoreboard (the batch budget).
+    The record key is the same either way ("<deployment>@<host>"): one question, one recorded answer."""
+    if live not in _chat:
+        _chat[live] = AzureOpenAIChat.from_config({**llm_config(), **(LIVE_BUDGET if live else BATCH_BUDGET)})
+    return RecordingLLM(_chat[live], mode="record", store=pipeline.StorageRecordStore(storage(), client, prefix="find-cache/"))
 
 
-_embeddings = None
+_embeddings: dict = {}
 
 
-def _embedding_client() -> AzureOpenAIEmbeddings:
-    global _embeddings
-    if _embeddings is None:
-        _embeddings = AzureOpenAIEmbeddings.from_config(embedding_config())
-    return _embeddings
+def _embedding_client(live: bool = False) -> AzureOpenAIEmbeddings:
+    if live not in _embeddings:
+        _embeddings[live] = AzureOpenAIEmbeddings.from_config({**embedding_config(), **(LIVE_BUDGET if live else BATCH_BUDGET)})
+    return _embeddings[live]
 
 
 def make_build_embedder(payload: dict) -> RecordingEmbeddings:
@@ -336,12 +358,12 @@ def make_build_embedder(payload: dict) -> RecordingEmbeddings:
                                                                  prefix=semantic_svc.EMBED_RECORD_PREFIX))
 
 
-def query_embedder(client: str, dimensions: int):
+def query_embedder(client: str, dimensions: int, live: bool = True):
     """A question's vector, behind the client's record (kecore-<client>/find-cache/): the first vector
     recorded for a text is the one every later call gets. None when the deployment is not configured
     or its client cannot be built: /find then decides by words and says so (mode "degraded")."""
     try:
-        return RecordingEmbeddings(_embedding_client(), mode="record", dimensions=dimensions,
+        return RecordingEmbeddings(_embedding_client(live), mode="record", dimensions=dimensions,
                                    store=pipeline.StorageRecordStore(storage(), client, prefix="find-cache/"))
     except Exception:
         return None
@@ -351,7 +373,7 @@ def _query_embedder_for_run(payload: dict):
     """The tickets run and the scoreboard decide each ticket exactly as /kecore/find does: by meaning
     when the map has an index (same record, find-cache/, so a ticket asked live and replayed in a
     measurement gets one vector)."""
-    return query_embedder(payload["client"], semantic_svc.DIMENSIONS)
+    return query_embedder(payload["client"], semantic_svc.DIMENSIONS, live=False)
 
 
 @functools.lru_cache(maxsize=4)
@@ -548,7 +570,7 @@ def tickets_catalog(payload: dict) -> dict:
 def tickets_run_batch(payload: dict) -> dict:
     # the ticket text is neither logged nor stored elsewhere; only the model's search terms are
     # recorded, in the same per-client cache kecore/find already uses (find-cache/)
-    llm = find_llm(payload["client"]) if payload["interpret"] else None
+    llm = find_llm(payload["client"], live=False) if payload["interpret"] else None
     return tickets_svc.run_batch(storage(), table(), payload, payload["start"], payload["end"], llm=llm,
                                  embedder=_query_embedder_for_run(payload))
 
@@ -596,7 +618,7 @@ def scoreboard_prepare(payload: dict) -> dict:
 
 @app.activity_trigger(input_name="payload")
 def scoreboard_batch(payload: dict) -> dict:
-    llm = find_llm(payload["client"]) if payload["interpret"] else None
+    llm = find_llm(payload["client"], live=False) if payload["interpret"] else None
     return sb_svc.batch(storage(), payload, payload["start"], payload["end"], llm=llm,
                         embedder=_query_embedder_for_run(payload))
 
@@ -607,6 +629,22 @@ def scoreboard_report(payload: dict) -> dict:
 
     return sb_svc.report(storage(), table(SCORES), payload, payload["ranges"], payload["prepared"],
                          payload.get("batches"))
+
+
+BUILD_COMMIT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BUILD_COMMIT")
+
+
+@app.route(route="kecore/version", methods=["GET"])
+def kecore_version(req: func.HttpRequest) -> func.HttpResponse:
+    """The git commit this code was packaged from (BUILD_COMMIT, written by scripts/deploy-kecore-function.ps1):
+    the deploy script waits until the host answers with the commit it just shipped, never the previous host's
+    list of functions (runbook 19.17-19.18)."""
+    try:
+        with open(BUILD_COMMIT, encoding="utf-8") as f:
+            commit = f.read().strip() or "unknown"
+    except OSError:
+        commit = "unknown"
+    return _json({"commit": commit})
 
 
 @app.route(route="kecore/scoreboard/latest", methods=["GET"])

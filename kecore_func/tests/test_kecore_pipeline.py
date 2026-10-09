@@ -64,6 +64,7 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(payload["batch_size"], pipeline.DEFAULT_BATCH)
         self.assertTrue(payload["with_dictionary"])
         self.assertTrue(payload["enrich"])
+        self.assertEqual(payload["llm_parallelism"], pipeline.DEFAULT_LLM_PARALLELISM)
 
     def test_unknown_client_is_refused_without_listing_the_others(self):
         with self.assertRaises(ValueError) as caught:
@@ -75,6 +76,8 @@ class ValidateTest(unittest.TestCase):
                      {"client": "clienta", "mode": "refresh"}, {"client": "clienta", "batch_size": 0},
                      {"client": "clienta", "batch_size": True}, {"client": "clienta", "limit": -1},
                      {"client": "clienta", "with_dictionary": "yes"}, {"client": "clienta", "enrich": "yes"},
+                     {"client": "clienta", "llm_parallelism": 0}, {"client": "clienta", "llm_parallelism": 9},
+                     {"client": "clienta", "llm_parallelism": True}, {"client": "clienta", "llm_parallelism": "2"},
                      ["clienta"]):
             with self.assertRaises(ValueError, msg=str(body)):
                 pipeline.validate_request(body, ["clienta"], "r1")

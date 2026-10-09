@@ -115,6 +115,138 @@ class TransportRetryTest(unittest.TestCase):
             self.client(transport, retries=2).request("POST", "/x")
 
 
+class ReadSideFailureTest(unittest.TestCase):
+    """urllib wraps only the sending side in URLError: a timeout or a dropped connection while reading
+    the answer comes out bare. The transport turns it into AzureError, so RestClient retries it and the
+    caller finally sees its own error class (runbook 19.18 #3)."""
+
+    def urlopen_raising(self, exc):
+        from unittest import mock
+        return mock.patch("urllib.request.urlopen", side_effect=exc)
+
+    def test_read_side_failures_become_azure_errors(self):
+        import http.client
+        from kecore.azure import urllib_transport
+        for exc in (TimeoutError("The read operation timed out"), ConnectionResetError(104, "reset"),
+                    http.client.RemoteDisconnected("Remote end closed connection without response"),
+                    http.client.IncompleteRead(b"partial")):
+            with self.urlopen_raising(exc), self.assertRaises(AzureError, msg=type(exc).__name__) as caught:
+                urllib_transport("POST", "https://acct.openai.azure.com/x?api-version=1", {}, {"a": 1}, 1.0)
+            self.assertIn(type(exc).__name__, str(caught.exception))
+            self.assertNotIn("api-version", str(caught.exception))
+
+    def test_a_2xx_whose_body_is_not_json_is_an_azure_error(self):
+        from unittest import mock
+        from kecore.azure import urllib_transport
+
+        class Response:
+            status, headers = 200, {}
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        for body in (b"<html>gateway</html>", b"\xff\xfe not utf-8", b'{"cut": '):
+            with mock.patch("urllib.request.urlopen", return_value=Response(body)), self.assertRaises(AzureError):
+                urllib_transport("POST", "https://acct.openai.azure.com/x", {}, None, 1.0)
+        with mock.patch("urllib.request.urlopen", return_value=Response(b'{"ok": true}')):
+            self.assertEqual(urllib_transport("GET", "https://a/x", {}, None, 1.0), (200, {"ok": True}, {}))
+
+    def test_an_error_status_whose_body_is_cut_is_still_decided_by_its_status(self):
+        import http.client
+        import io
+        import urllib.error
+        from unittest import mock
+        from kecore.azure import urllib_transport
+
+        class CutBody(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b"{\"error\"")
+
+        def http_error(code):
+            return urllib.error.HTTPError("https://a/x", code, "busy", {"retry-after": "3"}, CutBody())
+
+        with mock.patch("urllib.request.urlopen", side_effect=http_error(503)):
+            status, payload, headers = urllib_transport("POST", "https://a/x", {}, {}, 1.0)
+        self.assertEqual((status, headers.get("retry-after")), (503, "3"))
+        self.assertIsInstance(payload, dict)
+        tokens = TokenProvider("entra", scope="https://cognitiveservices.azure.com/.default",
+                               credential=FakeCredential(), clock=lambda: 0)
+        sleeps = []
+        client = RestClient("https://acct.openai.azure.com", "2024-10-21", tokens, sleep=sleeps.append, retries=1,
+                            throttle_retries=2, error_class=LLMError)
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(429), http_error(429), http_error(429)]):
+            with self.assertRaisesRegex(LLMError, "HTTP 429"):
+                client.request("POST", "/x", {})
+        self.assertEqual(sleeps, [3.0, 3.0])                       # retried on its status, as a 429
+
+    def test_a_timeout_reading_the_answer_is_retried_then_raised_as_llm_error(self):
+        from unittest import mock
+        tokens = TokenProvider("entra", scope="https://cognitiveservices.azure.com/.default",
+                               credential=FakeCredential(), clock=lambda: 0)
+        sleeps = []
+        client = RestClient("https://acct.openai.azure.com", "2024-10-21", tokens, sleep=sleeps.append, retries=2,
+                            error_class=LLMError)
+        with mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(LLMError):
+                client.request("POST", "/x", {})
+        self.assertEqual(len(sleeps), 2)
+
+
+class ThrottleBudgetTest(unittest.TestCase):
+    """A 429 has its own budget of new attempts (throttle_retries), each waiting what the service asks;
+    5xx and transport failures keep ``retries``; both default to the same number. The Function gives offline
+    runs a longer 429 budget and the live /find a short one (kecore_func/function_app.py)."""
+
+    def client(self, statuses, retries=5, throttle_retries=None):
+        tokens = TokenProvider("entra", scope="https://cognitiveservices.azure.com/.default",
+                               credential=FakeCredential(), clock=lambda: 0)
+        self.sleeps, calls = [], []
+
+        def transport(method, url, headers, body, timeout):
+            calls.append(1)
+            status, headers = statuses.pop(0) if statuses else (200, {})
+            return status, ({"error": {"message": "slow down"}} if status >= 400 else {"ok": True}), headers
+
+        self.calls = calls
+        return RestClient("https://acct.openai.azure.com", "2024-10-21", tokens, transport=transport,
+                          sleep=self.sleeps.append, retries=retries, throttle_retries=throttle_retries,
+                          error_class=LLMError)
+
+    def test_a_long_throttle_waits_its_turn_when_the_budget_allows_it(self):
+        client = self.client([(429, {"retry-after": "45"})] * 9, retries=5, throttle_retries=12)
+        self.assertEqual(client.request("POST", "/x"), {"ok": True})
+        self.assertEqual(self.sleeps, [45.0] * 9)
+
+    def test_the_default_budget_is_unchanged_and_the_wait_is_capped(self):
+        client = self.client([(429, {"retry-after": "300"})] * 6, retries=5)
+        with self.assertRaisesRegex(LLMError, "HTTP 429"):
+            client.request("POST", "/x")
+        self.assertEqual(self.sleeps, [60.0] * 5)
+
+    def test_without_retry_after_the_wait_doubles_up_to_a_minute_and_5xx_keep_their_own_budget(self):
+        client = self.client([(429, {})] * 8 + [(503, {})] * 2, retries=2, throttle_retries=8)
+        self.assertEqual(client.request("POST", "/x"), {"ok": True})
+        self.assertEqual(self.sleeps, [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 1.0, 2.0])
+
+    def test_the_chat_and_embedding_clients_take_the_budget_from_their_config(self):
+        base = {"endpoint": "https://acct.openai.azure.com"}
+        self.assertEqual(AzureOpenAIChat(AzureOpenAIConfig.from_dict(base))._client.throttle_retries, 5)
+        live = AzureOpenAIChat(AzureOpenAIConfig.from_dict({**base, "timeout_s": 25, "retries": 2, "throttle_retries": 2}))
+        self.assertEqual((live._client.timeout, live._client.retries, live._client.throttle_retries), (25, 2, 2))
+        self.assertEqual(AzureOpenAIChat(AzureOpenAIConfig.from_dict({**base, "throttle_retries": 12}))
+                         ._client.throttle_retries, 12)
+        self.assertEqual(AzureOpenAIEmbeddings(AzureOpenAIConfig.from_dict(base))._client.throttle_retries, 5)
+
+
 class RecordingTest(TempDirTestCase):
     def test_record_replay_refresh(self):
         inner = FakeLLM({"T": {"sections": [], "steps": [step("Fermez Outlook.")]}})
