@@ -74,6 +74,7 @@ import azure.durable_functions as df
 import azure.functions as func
 
 import dictionary_service as dictionary_svc
+import enrichment_service as enrichment_svc
 import kecore_pipeline as pipeline
 import kefind_service as finder
 import scoreboard_service as sb_svc
@@ -199,7 +200,7 @@ def kecore_run(context: df.DurableOrchestrationContext):
         "kecore_report",
         {**payload, "ranges": ranges, "profile_stats": profiled, "batch_stats": stats, "warnings": extracted["warnings"]},
     )
-    semantic = None
+    semantic = enrichment = None
     if payload.get("semantic", True):
         try:
             planned = yield context.call_activity("kecore_semantic_plan", payload)
@@ -221,7 +222,20 @@ def kecore_run(context: df.DurableOrchestrationContext):
             }
         except Exception as exc:  # the run is still published: /find then decides by words, and says why
             semantic = {"error": str(exc)[:500]}
-    summary = yield context.call_activity("kecore_publish", {**payload, "summary": summary, "semantic": semantic})
+    if payload.get("enrich", True):
+        # pass A of the enrichment (enrichment_service.py): proposals only, nothing routes on them yet
+        try:
+            planned = yield context.call_activity("kecore_semantic_plan", payload)
+            fiches = pipeline.batches(planned["fiches"], payload["batch_size"])
+            parts = yield context.task_all(
+                [context.call_activity("kecore_enrich", {**payload, "start": start, "end": end}) for start, end in fiches]
+            )
+            enrichment = yield context.call_activity("kecore_enrich_summary", payload)
+            enrichment["llm"] = {k: sum(part[k] for part in parts) for k in ("calls", "cached")}
+        except Exception as exc:  # the run is still published, and says why
+            enrichment = {"error": str(exc)[:500]}
+    summary = yield context.call_activity(
+        "kecore_publish", {**payload, "summary": {**summary, "enrichment": enrichment}, "semantic": semantic})
     return summary
 
 
@@ -266,6 +280,16 @@ def kecore_cards(payload: dict) -> dict:
 @app.activity_trigger(input_name="payload")
 def kecore_heldout(payload: dict) -> dict:
     return semantic_svc.heldout(storage(), payload, payload["start"], payload["end"], llm=make_llm(payload))
+
+
+@app.activity_trigger(input_name="payload")
+def kecore_enrich(payload: dict) -> dict:
+    return enrichment_svc.enrich(storage(), payload, payload["start"], payload["end"], llm=make_llm(payload))
+
+
+@app.activity_trigger(input_name="payload")
+def kecore_enrich_summary(payload: dict) -> dict:
+    return enrichment_svc.summarize(storage(), payload)
 
 
 @app.activity_trigger(input_name="payload")

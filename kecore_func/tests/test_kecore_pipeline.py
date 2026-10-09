@@ -63,6 +63,7 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(payload["mode"], "record")
         self.assertEqual(payload["batch_size"], pipeline.DEFAULT_BATCH)
         self.assertTrue(payload["with_dictionary"])
+        self.assertTrue(payload["enrich"])
 
     def test_unknown_client_is_refused_without_listing_the_others(self):
         with self.assertRaises(ValueError) as caught:
@@ -73,7 +74,8 @@ class ValidateTest(unittest.TestCase):
         for body in ({"client": "clienta", "source_prefix": "../x"}, {"client": "clienta", "source_prefix": "/abs"},
                      {"client": "clienta", "mode": "refresh"}, {"client": "clienta", "batch_size": 0},
                      {"client": "clienta", "batch_size": True}, {"client": "clienta", "limit": -1},
-                     {"client": "clienta", "with_dictionary": "yes"}, ["clienta"]):
+                     {"client": "clienta", "with_dictionary": "yes"}, {"client": "clienta", "enrich": "yes"},
+                     ["clienta"]):
             with self.assertRaises(ValueError, msg=str(body)):
                 pipeline.validate_request(body, ["clienta"], "r1")
 

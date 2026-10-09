@@ -3031,9 +3031,40 @@ mot-clé présent dans un alias gardé ou dans la fiche. Tout est `status: "prop
 contient ni horodatage ni drapeau de cache : un rejeu (`replay`) réécrit les mêmes octets sans appel
 (testé).
 
-**Pas encore branché** sur le run kecore ni déployé : aucune opération Azure. Prochaine tranche :
-activité `enrich` du run (comme `cards`), écriture `runs/<run>/enrichment/<i>.json` + résumé, puis
-passes B/C et l'onglet de revue.
+**Branchée sur le run kecore** (même jour, `kecore_func/enrichment_service.py`) : après le dossier
+sémantique et avant `publish`, l'activité `kecore_enrich` (par lots, comme `kecore_cards`) écrit
+`runs/<run>/enrichment/<i>.json` (une proposition par fiche classée, JSON trié), puis
+`kecore_enrich_summary` écrit `enrichment/summary.json` (fiches, erreurs, avec intention, avec
+application principale, `app_inferred`, alias, retraits) ; le résumé du run (`latest.json`, sortie de
+l'orchestration) gagne un bloc `enrichment` (+ appels/cache du modèle). Option `enrich` de
+`POST /kecore/runs` (vrai par défaut). Un échec n'empêche pas la publication : `enrichment.error` dit
+pourquoi. Rien ne lit encore ce dossier pour router. Coût : un appel gpt-4o par fiche classée
+(~180 pour client-s), enregistré ; un rejeu ne coûte rien.
+
+**Déployer et regarder ce que la passe A propose** (Function seule) :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+git checkout main; git pull
+.\scripts\deploy-kecore-function.ps1
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$body = @{ client = 'client-s'; source_prefix = 'Kbs/'; mode = 'record' } | ConvertTo-Json
+$run  = Invoke-RestMethod -Method Post -Uri "$base/kecore/runs?code=$key" -Body $body -ContentType 'application/json'
+do { Start-Sleep -Seconds 30; $s = Invoke-RestMethod $run.statusQueryGetUri; $s.runtimeStatus } while ($s.runtimeStatus -in 'Pending', 'Running')
+$s.output.exclusion | ConvertTo-Json -Depth 4
+$s.output.enrichment | ConvertTo-Json -Depth 4
+# La proposition de KB0233 :
+$runId = $s.output.run_id
+az storage blob list --account-name stknowledgeengine3v9 --auth-mode login -c kecore-client-s --prefix "runs/$runId/enrichment/" --query "[].name" -o tsv |
+  ForEach-Object { az storage blob download --account-name stknowledgeengine3v9 --auth-mode login -c kecore-client-s -n $_ -f ("enr-" + ($_ -split '/')[-1]) -o none }
+Get-ChildItem enr-0*.json | ForEach-Object { Get-Content $_ -Raw | ConvertFrom-Json } | Where-Object { $_.fiche_id -like 'KB0233*' } | ConvertTo-Json -Depth 5
+```
+
+(Nom du compte de stockage repris des autres sections ; à corriger s'il diffère pour kecore.) Pas
+encore déployé à la date de cette entrée.
 
 Tests : kefind 159 (+18, `kefind/tests/test_enrich.py` ; deux contrôles volontairement cassés font
-échouer la suite, vérifié), kecore 141, kecore_func 107, scoreboard 69, app 113.
+échouer la suite, vérifié), kecore_func 113 (+6 : `test_enrichment_service.py` -- un fichier par fiche,
+résumé, rejeu octet pour octet sans appel ; orchestration : avant `publish`, échec isolé, option
+`enrich`), kecore 141, scoreboard 69, app 113.

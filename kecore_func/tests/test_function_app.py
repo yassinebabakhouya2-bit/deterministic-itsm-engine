@@ -356,6 +356,8 @@ class OrchestratorsTest(unittest.TestCase):
             "kecore_heldout": lambda p: {"queries": 4, "dropped": 0, "errors": 0, "calls": 2, "cached": 0},
             "kecore_semantic_index": {"sha256": "abc", "entries": 30},
             "kecore_calibrate": {"feasible": True},
+            "kecore_enrich": lambda p: {"errors": 0, "aliases": 6, "dropped": 1, "calls": 3, "cached": 1},
+            "kecore_enrich_summary": {"fiches": 5, "errors": 0, "app_inferred": ["KB2"]},
             "kecore_publish": lambda p: {**p["summary"], "semantic": p["semantic"]},
         }
         return {name: activity(name, result) for name, result in names.items()}
@@ -382,6 +384,36 @@ class OrchestratorsTest(unittest.TestCase):
         out = drive_throwing(self.fa.kecore_run, ctx)
         self.assertNotIn("kecore_cards", [c[0] for c in ctx.calls])
         self.assertIsNone(out["semantic"])
+
+    def test_the_enrichment_runs_before_publish_and_lands_in_the_run_summary(self):
+        ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": True, "enrich": True},
+                  self.kecore_activities())
+        out = drive_throwing(self.fa.kecore_run, ctx)
+        order = [c[0] for c in ctx.calls]
+        self.assertEqual(order[-1], "kecore_publish")
+        self.assertLess(order.index("kecore_calibrate"), order.index("kecore_enrich"))
+        self.assertLess(order.index("kecore_enrich"), order.index("kecore_enrich_summary"))
+        self.assertEqual(order.count("kecore_enrich"), 2)                     # two batches of fiches
+        self.assertEqual(out["enrichment"]["app_inferred"], ["KB2"])
+        self.assertEqual(out["enrichment"]["llm"], {"calls": 6, "cached": 2})
+
+    def test_a_failed_enrichment_still_publishes_the_run_with_its_semantic_folder(self):
+        ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": True, "enrich": True},
+                  self.kecore_activities(fail="kecore_enrich"))
+        out = drive_throwing(self.fa.kecore_run, ctx)
+        self.assertEqual([c[0] for c in ctx.calls][-1], "kecore_publish")
+        self.assertIn("kecore_enrich failed", out["enrichment"]["error"])
+        self.assertEqual(out["semantic"]["index"]["sha256"], "abc")
+
+    def test_a_run_without_enrichment_skips_it_and_its_semantic_folder_does_not_need_it(self):
+        ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": False, "enrich": False},
+                  self.kecore_activities())
+        out = drive_throwing(self.fa.kecore_run, ctx)
+        self.assertFalse({"kecore_enrich", "kecore_enrich_summary", "kecore_semantic_plan"} & {c[0] for c in ctx.calls})
+        self.assertIsNone(out["enrichment"])
+        ctx = Ctx({"client": "client-s", "run_id": "r1", "batch_size": 4, "semantic": False, "enrich": True},
+                  self.kecore_activities())
+        self.assertEqual(drive_throwing(self.fa.kecore_run, ctx)["enrichment"]["fiches"], 5)
 
     def test_no_label_no_scoreboard(self):
         out = drive(self.fa.scoreboard_run, Ctx({"client": "client-s", "sb_id": "s"},

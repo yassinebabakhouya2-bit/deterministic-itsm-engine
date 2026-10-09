@@ -9,6 +9,7 @@ separate, retryable Durable Functions activity and nothing lives on an operator'
   report     decomposed/*                         -> runs/<run>/{fiches.decomposed.jsonl, report.md,
                                                      summary.json, graph.json, excluded.json}
   (semantic) the run's map                        -> runs/<run>/semantic/ (semantic_service.py)
+  (enrich)   the run's map                        -> runs/<run>/enrichment/ (enrichment_service.py)
   publish    the run's summary                    -> latest.json, last: a published run never changes
 
 Every run keeps its own folder: the map of a client's KB is versioned, never overwritten. The map
@@ -118,6 +119,9 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
     semantic = body.get("semantic", True)
     if not isinstance(semantic, bool):
         raise ValueError("semantic must be true or false")
+    enrich = body.get("enrich", True)
+    if not isinstance(enrich, bool):
+        raise ValueError("enrich must be true or false")
     if not _RUN_ID_RE.match(run_id):
         raise ValueError("invalid run id")
     return {
@@ -128,6 +132,7 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
         "limit": limit,
         "with_dictionary": with_dictionary,
         "semantic": semantic,
+        "enrich": enrich,
         "run_id": run_id,
     }
 
