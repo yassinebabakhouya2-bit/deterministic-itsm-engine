@@ -3077,8 +3077,10 @@ résumé, rejeu octet pour octet sans appel ; orchestration : avant `publish`, �
 s'exécutent quand même (15:22, 15:41, 15:52, 15:54 UTC) et réussissent. La Function déployée ne sert ni
 `kecore_enrich` ni `kecore_enrich_summary` : ce n'est pas le code de la branche (`b05de4f`).
 
-**Cause.** Le clone de l'opérateur était resté au milieu d'une fusion (conflit sur ce runbook, non
-résolu) ; PowerShell continue un bloc collé après l'échec d'une commande native (`git` rend un code de
+**Cause.** Le clone de l'opérateur était resté au milieu d'un `git revert 3ba23b2` (le nettoyage de
+§19.13, lancé à la main alors que le même nettoyage était déjà poussé sur `main` en `16d709b`), arrêté
+sur un conflit dans ce runbook ; `git status` : « You are currently reverting commit 3ba23b2 », aucun
+commit local en avance sur `origin/main`, `CLAUDE.md` modifié localement, `code_export.txt` non suivi ; PowerShell continue un bloc collé après l'échec d'une commande native (`git` rend un code de
 sortie, pas une exception) ; les scripts de déploiement zippent l'arbre de travail tel qu'il est. Les
 deux applications tournent donc sur un état local inconnu (au mieux `main` d'avant `16d709b`).
 
