@@ -161,7 +161,8 @@ metadata written at ingestion, checked by code and **validated by a person**; at
 through tables, not scores. The semantic mode is frozen (no more tuning) until the benchmark below
 decides whether it stays as the L3 fallback.
 
-**Per-fiche metadata** (`kecore-<client>/runs/<run>/enrichment/<fiche_id>.json`):
+**Per-fiche metadata** (`kecore-<client>/runs/<run>/enrichment/<nnnnn>.json`, one file per classified
+fiche, `fiche_id` inside):
 `canonical_intent` (a value of the client's closed taxonomy), `primary_app` / `supported_apps`
 (values of the client's application dictionary), `app_evidence` (verbatim quotes, checked with
 `NormalizedText`) and `app_inferred` (no quote: allowed, but validation is mandatory),
@@ -183,8 +184,9 @@ whose application fields are an enum of the closed vocabulary). Applications are
 application ids (`teams`, not "Microsoft Teams"), the ids runtime entity extraction reads. An
 application is proven by a verbatim quote naming it, or by kecore's own reading of the fiche;
 otherwise it is kept as `apps_inferred` and the proposal needs a person. `confusable_with` is not
-written by pass A (the model sees one fiche): it comes from the collision checks of passes B/C. Not
-yet wired into the kecore run (runbook §19.16).
+written by pass A (the model sees one fiche): it comes from the collision checks of passes B/C. Run by
+every kecore run since 2026-10-09, before `publish` (runbook §19.16); nothing reads the proposals for
+routing yet.
 
 **Runtime routing**, first level that decides wins; every answer carries `route`, the rule, the
 alias or key that decided, and the routing tables' sha256:
