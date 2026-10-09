@@ -9,7 +9,7 @@ from kefind import semantic as sem
 from kefind.cards import Card, anchors_for, entries_for, label_text, make_card, same_label_groups
 from kefind.funnel import FunnelConfig, KBMap, find
 
-from .semantic_helpers import DIMS, ConceptEmbedder, TitleLLM
+from .semantic_helpers import BIASED_DIMS, DIMS, ConceptEmbedder, LanguageBiasedEmbedder, TitleLLM
 from .test_funnel import filler, make
 
 CARDS = {
@@ -181,6 +181,23 @@ class IndexTest(unittest.TestCase):
         self.assertTrue(all(d["closer_to"] == "KB0120 - LOCKED ACCOUNT" for d in wrong))
         kept = [e.kind for e in kbmap.semantic.entries if e.fiche_id == "KB0233 - Associate a phone line"]
         self.assertEqual(kept, ["label"])
+
+    def test_the_balanced_rule_keeps_french_lines_of_an_english_fiche_the_code_rule_loses(self):
+        # production, 2026-10-09: the code-only yardstick dropped 29% of the questions -- a French line of an
+        # English fiche reads closer to ANY French fiche to the embedding model than to its own English text
+        plain = KBMap("clienta", kb_fiches())
+        entries, anchors = entries_for(plain, CARDS), anchors_for(plain)
+        embedder = LanguageBiasedEmbedder()
+        vectors = sem.embed_entries(entries, anchors, embedder, BIASED_DIMS)
+        built = {rule: sem.build(entries, embedder, embedder.model_id, BIASED_DIMS, anchors=anchors, rule=rule,
+                                 vectors=vectors)[1] for rule in sem.DROP_RULES}
+        lost = {d["text"]: d["closer_to"] for d in built["code"]["dropped"] if d["fiche_id"] == "KB0120 - LOCKED ACCOUNT"}
+        self.assertIn("mon compte est bloqué", lost)
+        self.assertTrue(lost["mon compte est bloqué"].startswith("KB09"))  # an unrelated French filler fiche
+        self.assertEqual(built["balanced"]["dropped"], [])
+        self.assertEqual(built["none"]["dropped"], [])
+        with self.assertRaises(ValueError):
+            sem.build(entries, embedder, embedder.model_id, BIASED_DIMS, anchors=anchors, rule="loose", vectors=vectors)
 
     def test_blobs_round_trip_and_refuse_damage_or_another_index_s_calibration(self):
         kbmap, _ = build_map(calibrated=False)

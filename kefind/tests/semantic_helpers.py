@@ -62,6 +62,22 @@ class ConceptEmbedder:
         return [self.vector(t) for t in texts]
 
 
+FRENCH_WORDS = {"le", "la", "les", "une", "des", "du", "de", "comment", "est", "un", "pour", "mon", "ma", "mes",
+                "dans", "vers", "doit", "etre", "ouvrez", "configurez", "autre", "pas"}
+BIASED_DIMS = DIMS + 2
+
+
+class LanguageBiasedEmbedder(ConceptEmbedder):
+    """The same concepts plus a pull between texts of the same language -- what real embeddings do: a
+    French question and a French fiche look closer than the French question and its English fiche."""
+
+    model_id = "biased-embed@test"
+
+    def vector(self, text: str) -> list[float]:
+        french = any(token in FRENCH_WORDS for token in fold(text))
+        return super().vector(text) + ([2.0, 0.0] if french else [0.0, 2.0])
+
+
 class BrokenEmbedder:
     model_id = "broken@test"
 

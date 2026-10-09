@@ -2749,4 +2749,27 @@ voisines encore en cours peuvent écrire dans le dossier après la publication (
 lues à la décision) ; des fiches remplacées (aucune sur client-s) reçoivent des cartes mais sont écartées
 à la décision, ce qui rend la calibration un peu plus prudente.
 
-Tests : kecore 132, kefind 139, kecore_func 102, scoreboard 71, app 102 (546).
+**Premier run réel (commit `c4a7104`, 2026-10-09).** 174 fiches, 1 691 questions de cartes gardées par
+les contrôles du code, 635 questions d'examen. Calibration faisable, rien de retenu par le verrou, mais
+moitié test : bonne fiche montrée 7 % (cible 70 %), mauvaise fiche 0,3 %, questions 88 % (cible 25 %),
+bonne fiche parmi les proposées 56 % (cible 95 %), fiche montrée sans bonne réponse 0,9 %. Sûr, mais
+inutilisable : « comment attribuer une ligne teams » classait KB0233 4e, hors des 3 fiches proposées.
+Cause : le contrôle « plus proche d'une autre fiche » jugé sur le seul texte réel des fiches avait retiré
+485 questions et 61 résumés (29 % des questions). Les embeddings jugent deux textes de même langue plus
+proches qu'une traduction : une question française d'une fiche anglaise semblait « plus proche » de
+n'importe quelle fiche française voisine que de sa propre fiche, et partait -- précisément le cas
+français→anglais à résoudre.
+
+**Variantes, choisies par la calibration.** Le build écrit désormais trois index à partir d'un seul
+passage d'embeddings, sous `semantic/variants/<règle>/` (`kefind.semantic.DROP_RULES`) :
+`code` (étalon : nom et texte propre des fiches ; résumés et questions contrôlés), `balanced` (étalon :
+aussi les résumés FR et EN de chaque fiche ; seules les questions sont contrôlées -- une question
+française rencontre le résumé français de sa propre fiche) et `none` (aucun retrait pour proximité ; les
+contrôles d'entités de `kefind/cards.py` restent). La calibration donne à chacune ses seuils sur la
+moitié calibration ; celle qui y montre le plus souvent la bonne fiche dans les mêmes limites de sécurité
+gagne (à égalité : la plus stricte) ; seule la gagnante passe la moitié test. Elle devient l'index du run
+(`semantic/vectors.f32`, puis `index.json`, puis `calibration.json`). `calibration.json` → `variant`,
+`variants` (par variante : seuils, rappel@1/3/5 du classement avant tout seuil, taux sur la moitié
+calibration) et `recall_test`. Grille des marges élargie à 0,30.
+
+Tests : kecore 132, kefind 141, kecore_func 102, scoreboard 71, app 102 (548).

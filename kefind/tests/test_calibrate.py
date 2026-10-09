@@ -8,7 +8,7 @@ from kecore.llm import LLMError
 from kefind import calibrate as cal
 from kefind import semantic as sem
 
-from .semantic_helpers import ConceptEmbedder, TitleLLM
+from .semantic_helpers import DIMS, ConceptEmbedder, TitleLLM
 from .test_semantic import build_map
 
 
@@ -124,6 +124,29 @@ class CalibrateTest(unittest.TestCase):
         llm = TitleLLM({}, exam=self.exam())
         heldouts = [cal.heldout_for(llm, kbmap, f) for f in kbmap.ranked]
         return kbmap, cal.calibrate(kbmap.semantic, kbmap, heldouts, ConceptEmbedder())
+
+    def test_the_variant_whose_ranking_holds_the_right_fiche_wins_and_only_it_meets_the_test_half(self):
+        from kefind.cards import entries_for
+        from kefind.funnel import KBMap
+
+        from .test_semantic import CARDS, kb_fiches
+
+        plain = KBMap("clienta", kb_fiches())
+        with_cards, _ = sem.build(entries_for(plain, CARDS), ConceptEmbedder(), "concept-embed@test", DIMS, rule="none")
+        labels_only, _ = sem.build(entries_for(plain, {}), ConceptEmbedder(), "concept-embed@test", DIMS, rule="none")
+        variants = {"code": (labels_only, KBMap("clienta", kb_fiches(), semantic=labels_only)),
+                    "none": (with_cards, KBMap("clienta", kb_fiches(), semantic=with_cards))}
+        heldouts = [cal.heldout_for(TitleLLM({}, exam=self.exam()), plain, f) for f in plain.ranked]
+        result = cal.calibrate_variants(variants, heldouts, ConceptEmbedder())
+        self.assertEqual(set(result["variants"]), {"code", "none"})
+        better = max(result["variants"], key=lambda n: (result["variants"][n]["feasible"],
+                                                         result["variants"][n]["right_shown"] or 0,
+                                                         result["variants"][n]["source_offered"] or 0))
+        self.assertEqual(result["variant"], better)
+        self.assertEqual(result["index_sha256"], variants[result["variant"]][0].sha256)
+        self.assertGreaterEqual(result["variants"]["none"]["recall"]["@3"], result["variants"]["code"]["recall"]["@3"])
+        again = cal.calibrate_variants(variants, heldouts, ConceptEmbedder())
+        self.assertEqual(json.dumps(result, sort_keys=True), json.dumps(again, sort_keys=True))
 
     def test_the_calibration_names_its_index_and_replays_byte_for_byte(self):
         kbmap, first = self.run_once()

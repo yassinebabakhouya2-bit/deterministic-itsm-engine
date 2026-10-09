@@ -6,8 +6,11 @@ add the run's semantic folder, kecore-<client>/runs/<run>/semantic/:
   plan       the run's map                        -> how many fiches are ranked
   cards      ranked fiches [start:end] + the model -> cards/<index>.json   (kefind.cards)
   heldout    ranked fiches [start:end] + the model -> heldout/<index>.json (kefind.calibrate: the exam)
-  index      cards + the embedding model           -> index.json, vectors.f32, built.json (kefind.semantic)
-  calibrate  index + exam + the embedding model    -> calibration.json
+  index      cards + the embedding model           -> variants/<rule>/{vectors.f32,index.json}, built.json
+                                                     (kefind.semantic: one embedding pass, one index per
+                                                     DROP_RULES rule)
+  calibrate  variants + exam + the embedding model -> the winner's vectors.f32 then index.json, then
+                                                     calibration.json (kefind.calibrate.calibrate_variants)
 
 The model's answers are recorded in llm-cache/ (like the decomposition) and every vector in
 embed-cache/ (kecore.llm.RecordingEmbeddings): a run in mode "replay" rebuilds the same folder
@@ -29,7 +32,7 @@ import json
 import kecore_pipeline as pipeline
 import kefind_service as finder
 from kefind import semantic as sem
-from kefind.calibrate import Heldout, calibrate, heldout_for
+from kefind.calibrate import Heldout, calibrate_variants, heldout_for
 from kefind.cards import Card, anchors_for, entries_for, make_card, same_label_groups
 
 EMBED_RECORD_PREFIX = "embed-cache/"
@@ -45,6 +48,7 @@ def paths(run_id: str) -> dict[str, str]:
         "vectors": base + sem.VECTORS_BLOB,
         "calibration": base + sem.CALIBRATION_BLOB,
         "built": base + "semantic/built.json",
+        "variants_dir": base + "semantic/variants/",
     }
 
 
@@ -93,35 +97,55 @@ def _read_all(storage: pipeline.Storage, payload: dict, directory: str, count: i
 
 
 def build_index(storage: pipeline.Storage, payload: dict, embedder) -> dict:
+    """One embedding pass, one index per rule of kefind.semantic.DROP_RULES, each under variants/<rule>/
+    (vectors first). Nothing is served from here: the calibration picks one and publishes it."""
     kbmap = _map(storage, payload)
     p = paths(payload["run_id"])
     by_id = {c["fiche_id"]: Card.from_dict(c) for c in _read_all(storage, payload, p["cards_dir"], len(kbmap.ranked))}
-    index, built = sem.build(entries_for(kbmap, by_id), embedder, embedder.model_id, embedder.dimensions,
-                             anchors=anchors_for(kbmap))
-    same_label = same_label_groups(kbmap)
+    entries, anchors = entries_for(kbmap, by_id), anchors_for(kbmap)
+    vectors = sem.embed_entries(entries, anchors, embedder, embedder.dimensions)
     container = pipeline.kecore_container(payload["client"])
-    blobs = index.to_blobs()
-    # vectors first, index.json last: an index.json on storage always has its vectors next to it
-    storage.write(container, p["vectors"], blobs[sem.VECTORS_BLOB])
-    storage.write(container, p["built"], pipeline._json({"sha256": index.sha256, **built, "same_label": same_label}))
-    storage.write(container, p["index"], blobs[sem.INDEX_BLOB])
-    return {"sha256": index.sha256, **index.stats, "same_label_groups": len(same_label),
+    same_label = same_label_groups(kbmap)
+    built_all: dict = {"same_label": same_label}
+    summary: dict = {}
+    for rule in sem.DROP_RULES:
+        index, built = sem.build(entries, embedder, embedder.model_id, embedder.dimensions, anchors=anchors,
+                                 rule=rule, vectors=vectors)
+        blobs = index.to_blobs()
+        storage.write(container, f"{p['variants_dir']}{rule}/vectors.f32", blobs[sem.VECTORS_BLOB])
+        storage.write(container, f"{p['variants_dir']}{rule}/index.json", blobs[sem.INDEX_BLOB])
+        built_all[rule] = {"sha256": index.sha256, **built}
+        summary[rule] = {"sha256": index.sha256, "entries": index.stats["entries"], "by_kind": index.stats["by_kind"],
+                         "dropped": index.stats["dropped_closer_to_another_fiche"]}
+    storage.write(container, p["built"], pipeline._json(built_all))
+    return {"fiches": len(kbmap.ranked), "entries_before_checks": len(entries), "anchors": len(anchors),
+            "variants": summary, "same_label_groups": len(same_label),
             "embeddings": {"calls": embedder.calls, "cached": embedder.hits, "embedded": embedder.embedded}}
 
 
 def calibrate_run(storage: pipeline.Storage, payload: dict, embedder) -> dict:
+    """Calibrates every variant on the run's exam, publishes the winner as the run's index (vectors.f32,
+    then index.json) and writes calibration.json last: the map only ever loads a complete index."""
     kbmap = _map(storage, payload)
     p = paths(payload["run_id"])
     container = pipeline.kecore_container(payload["client"])
-    index = sem.SemanticIndex.from_blobs(pipeline._require(storage, container, p["index"]),
-                                         pipeline._require(storage, container, p["vectors"]))
-    kbmap = finder.with_index(kbmap, index)
+    variants = {}
+    for rule in sem.DROP_RULES:
+        index = sem.SemanticIndex.from_blobs(
+            pipeline._require(storage, container, f"{p['variants_dir']}{rule}/index.json"),
+            pipeline._require(storage, container, f"{p['variants_dir']}{rule}/vectors.f32"))
+        variants[rule] = (index, finder.with_index(kbmap, index))
     exams = [Heldout.from_dict(h) for h in _read_all(storage, payload, p["heldout_dir"], len(kbmap.ranked))]
-    result = calibrate(index, kbmap, exams, embedder)
+    result = calibrate_variants(variants, exams, embedder)
+    winner = variants[result["variant"]][0]
+    blobs = winner.to_blobs()
+    storage.write(container, p["vectors"], blobs[sem.VECTORS_BLOB])
+    storage.write(container, p["index"], blobs[sem.INDEX_BLOB])
     storage.write(container, p["calibration"], (json.dumps(result, ensure_ascii=False, indent=1, sort_keys=True) + "\n").encode("utf-8"))
-    return {"thresholds": result["thresholds"], "withheld": result["withheld"], "chosen": result["chosen"],
-            "feasible": result["feasible"], "acceptance": result["acceptance"],
+    return {"variant": result["variant"], "thresholds": result["thresholds"], "withheld": result["withheld"],
+            "chosen": result["chosen"], "feasible": result["feasible"], "acceptance": result["acceptance"],
             "test": {k: result["test"][k] for k in ("right_shown", "wrong_shown", "questions", "abstain", "source_offered", "loo_shown")},
+            "recall_test": result["recall_test"], "variants": result["variants"],
             "exam": {k: result["exam"][k] for k in ("fiches", "questions", "model_errors")},
             "embeddings": {"calls": embedder.calls, "cached": embedder.hits, "embedded": embedder.embedded}}
 

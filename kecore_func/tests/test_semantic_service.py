@@ -79,7 +79,12 @@ class SemanticRunTest(unittest.TestCase):
         self.assertEqual(planned["fiches"], 5)
         first = self.blobs()
         self.assertTrue(all(first.values()))
-        self.assertEqual(json.loads(first["calibration"])["index_sha256"], built["sha256"])
+        calibration = json.loads(first["calibration"])
+        # the published index is the winning variant, and the calibration names it
+        self.assertIn(calibration["variant"], ("code", "balanced", "none"))
+        self.assertEqual(calibration["index_sha256"], built["variants"][calibration["variant"]]["sha256"])
+        self.assertEqual(set(calibration["variants"]), {"code", "balanced", "none"})
+        self.assertEqual(set(calibrated["recall_test"]), {"@1", "@3", "@5"})
         self.assertIn("feasible", calibrated)
 
         _, _, _, llm, embedder = self.build("replay")  # nothing recorded is missing: zero calls
@@ -144,8 +149,13 @@ class SemanticRunTest(unittest.TestCase):
         self.storage.write = lambda c, name, data: written.append(name) or real(c, name, data)
         self.build("record")
         p = svc.paths(RUN)
-        order = [n for n in written if n in (p["vectors"], p["built"], p["index"], p["calibration"])]
-        self.assertEqual(order, [p["vectors"], p["built"], p["index"], p["calibration"]])
+        served = [n for n in written if n in (p["vectors"], p["index"], p["calibration"])]
+        self.assertEqual(served, [p["vectors"], p["index"], p["calibration"]])  # what /find loads: complete or nothing
+        variants = [n for n in written if n.startswith(p["variants_dir"])]
+        self.assertEqual(len(variants), 6)  # 3 rules x (vectors, index), each vectors first
+        self.assertTrue(all(variants[i].endswith("vectors.f32") and variants[i + 1].endswith("index.json")
+                            for i in range(0, 6, 2)))
+        self.assertLess(written.index(variants[-1]), written.index(p["vectors"]))
 
     def test_a_run_without_semantic_folder_decides_by_words(self):
         kbmap = finder.load_map(self.storage, "clienta", RUN)

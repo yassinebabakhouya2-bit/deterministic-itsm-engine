@@ -16,6 +16,8 @@ limit is 4.1%: the headroom keeps a regression to the mean from withholding ever
 with the expected fiche removed (leave-one-out: the question has no right answer left), a fiche is
 shown at most 10% of the time. ``offer`` is set so that 95% of
 the questions whose fiche is among the three closest still get an offer instead of an abstention.
+Several indexes of the same run (kefind.semantic.DROP_RULES) can be calibrated together: each gets
+its thresholds on the calibration half, the best there wins, and only the winner meets the test half.
 The test half then measures the chosen thresholds against acceptance targets set in advance. If it
 fails a SAFETY check (wrong fiche shown, upper bound; a fiche shown when the right one is absent),
 the chosen thresholds are withheld: the engine never shows a fiche alone, it only offers -- a
@@ -53,9 +55,10 @@ MAX_QUERIES = 6
 MIN_WORDS = 2
 MAX_WORDS = 40
 MAX_TITLE_WORDS_REUSED = 1
-MARGINS = tuple(round(0.005 * k, 3) for k in range(1, 31))  # 0.005 to 0.15: never 0, a tie is no lead
+MARGINS = tuple(round(0.005 * k, 3) for k in range(1, 61))  # 0.005 to 0.30: never 0, a tie is no lead
 NEVER = 1.01  # a floor above any cosine: the fiche is never shown on its own
 MAX_CHOICES = 3
+TOP = 5  # ranked fiches kept per exam question: enough for the offer (3) and recall@5
 
 # Targets, fixed BEFORE any number was measured (plan of 2026-10-09). Wrong fiche shown is bounded at
 # the top of its interval, so a small sample cannot pass by luck.
@@ -204,7 +207,7 @@ def heldout_for(llm, kbmap, fiche_id: str) -> Heldout:
 class Sample:
     fiche_id: str  # the expected fiche
     split: str
-    scored: list  # [(score, fiche_id)] best first, at most MAX_CHOICES + 1
+    scored: list  # [(score, fiche_id)] best first, at most TOP
     strong: bool
     designated: bool
     loo: list  # the same ranking without the expected fiche
@@ -214,7 +217,7 @@ def sample(kbmap, fiche_id: str, split: str, text: str, vector) -> Sample:
     scored, strong, designated = semantic_scored(kbmap, text, vector)
     pairs = [(s, f) for s, f, _ in scored]
     loo = [p for p in pairs if p[1] != fiche_id]
-    return Sample(fiche_id, split, pairs[: MAX_CHOICES + 1], strong, designated, loo[: MAX_CHOICES + 1])
+    return Sample(fiche_id, split, pairs[:TOP], strong, designated, loo[:TOP])
 
 
 def _verdict(pairs, th: sem.Thresholds, strong: bool, designated: bool) -> str:
@@ -264,19 +267,22 @@ def choose(samples: list[Sample]) -> tuple[sem.Thresholds, dict]:
     n = len(samples)
     best = None
     tried = 0
+    # the same decide() as live, on rankings shaped once (several million verdicts per variant)
+    prepared = [([(score, f, 0) for score, f in s.scored], [(score, f, 0) for score, f in s.loo], s,
+                 bool(s.scored) and s.scored[0][1] == s.fiche_id) for s in samples]
+    loo_n = sum(1 for s in samples if s.loo)
     for floor in floors:
         for margin in MARGINS:
             th = sem.Thresholds(floor, margin, offer)
-            right = wrong = loo_n = loo_shown = 0
-            for s in samples:
-                if _verdict(s.scored, th, s.strong, s.designated) == "show":
-                    if s.scored[0][1] == s.fiche_id:
+            right = wrong = loo_shown = 0
+            for scored, loo, s, top_is_right in prepared:
+                if sem.decide(scored, th, s.strong, s.designated) == "show":
+                    if top_is_right:
                         right += 1
                     else:
                         wrong += 1
-                if s.loo:
-                    loo_n += 1
-                    loo_shown += _verdict(s.loo, th, s.strong, s.designated) == "show"
+                if loo:
+                    loo_shown += sem.decide(loo, th, s.strong, s.designated) == "show"
             tried += 1
             if wilson(wrong, n)[1] > MAX_WRONG_UPPER or (loo_n and loo_shown / loo_n > MAX_LOO_SHOWN):
                 continue
@@ -290,19 +296,14 @@ def choose(samples: list[Sample]) -> tuple[sem.Thresholds, dict]:
     return sem.Thresholds(th.floor, th.margin, th.offer, f"calibrated on {n} KB questions"), search
 
 
-def calibrate(index: sem.SemanticIndex, kbmap, heldouts: list[Heldout], embedder) -> dict:
-    """calibration.json for ``index``: thresholds, how they were chosen, the test half's measures and
-    the acceptance checks. ``embedder`` is recorded: a replay rewrites this file byte for byte."""
-    exam = [(h.fiche_id, h.split, q) for h in sorted(heldouts, key=lambda h: h.fiche_id)
-            for q in h.queries if h.fiche_id in index.fiche_ids]
-    texts = [sem.query_text(q) for _, _, q in exam]
-    vectors = embedder.embed(texts) if texts else []
-    samples = [sample(kbmap, fiche_id, split, q, v) for (fiche_id, split, q), v in zip(exam, vectors)]
-    calibration_half = [s for s in samples if s.split == "calibration"]
-    test_half = [s for s in samples if s.split == "test"]
-    thresholds, search = choose(calibration_half)
-    test = measure(test_half, thresholds)
-    checks = {
+def recall(samples: list[Sample], k: int) -> float | None:
+    """Share of the questions whose expected fiche is among the first ``k`` ranked: the ranking's own
+    quality, before any threshold."""
+    return round(sum(s.fiche_id in [f for _, f in s.scored[:k]] for s in samples) / len(samples), 4) if samples else None
+
+
+def _checks(test: dict) -> dict:
+    return {
         "wrong_shown_max": test["wrong_shown"]["rate"] is not None and test["wrong_shown"]["rate"] <= TARGETS["wrong_shown_max"],
         "wrong_shown_upper_max": test["wrong_shown"]["high"] <= TARGETS["wrong_shown_upper_max"],
         "right_shown_min": (test["right_shown"]["rate"] or 0) >= TARGETS["right_shown_min"],
@@ -310,6 +311,37 @@ def calibrate(index: sem.SemanticIndex, kbmap, heldouts: list[Heldout], embedder
         "source_offered_min": test["source_offered"]["n"] == 0 or (test["source_offered"]["rate"] or 0) >= TARGETS["source_offered_min"],
         "loo_shown_max": test["loo_shown"]["n"] == 0 or (test["loo_shown"]["rate"] or 0) <= TARGETS["loo_shown_max"],
     }
+
+
+def calibrate_variants(variants: dict, heldouts: list[Heldout], embedder) -> dict:
+    """calibration.json for the best of several indexes of the same run (``variants``: name -> (index,
+    map with that index), in order of preference). The exam is embedded once; each variant gets its own
+    thresholds on the calibration half; the one that shows the right fiche most often there, within the
+    same safety limits, wins (then: the one whose offers hold the right fiche most often; then the earlier
+    one). Only the winner meets the test half, so the test half stays a fair measure. ``embedder`` is
+    recorded: a replay rewrites this file byte for byte."""
+    if not variants:
+        raise ValueError("no index to calibrate")
+    fiche_ids = frozenset.intersection(*(index.fiche_ids for index, _ in variants.values()))
+    exam = [(h.fiche_id, h.split, q) for h in sorted(heldouts, key=lambda h: h.fiche_id)
+            for q in h.queries if h.fiche_id in fiche_ids]
+    texts = [sem.query_text(q) for _, _, q in exam]
+    vectors = embedder.embed(texts) if texts else []
+    tried: dict[str, dict] = {}
+    for order, (name, (index, kbmap)) in enumerate(variants.items()):
+        samples = [sample(kbmap, fiche_id, split, q, v) for (fiche_id, split, q), v in zip(exam, vectors)]
+        calibration_half = [s for s in samples if s.split == "calibration"]
+        thresholds, search = choose(calibration_half)
+        measured = measure(calibration_half, thresholds)
+        tried[name] = {"order": order, "index": index, "samples": samples, "thresholds": thresholds,
+                       "search": search, "calibration": measured,
+                       "key": (search["feasible"], measured["right_shown"]["k"], measured["source_offered"]["k"], -order)}
+    winner = max(tried, key=lambda name: tried[name]["key"])
+    best = tried[winner]
+    index, thresholds = best["index"], best["thresholds"]
+    test_half = [s for s in best["samples"] if s.split == "test"]
+    test = measure(test_half, thresholds)
+    checks = _checks(test)
     dropped: dict[str, int] = {}
     for h in heldouts:
         for d in h.dropped:
@@ -318,19 +350,32 @@ def calibrate(index: sem.SemanticIndex, kbmap, heldouts: list[Heldout], embedder
     exam_sha = hashlib.sha256(json.dumps(texts, ensure_ascii=False).encode("utf-8")).hexdigest()
     effective = withhold(thresholds, checks)
     extra = {"test_effective": measure(test_half, effective)} if effective != thresholds else {}
+    compared = {}
+    for name, t in tried.items():
+        half = [s for s in t["samples"] if s.split == "calibration"]
+        compared[name] = {
+            "index_sha256": t["index"].sha256, "entries": len(t["index"].entries), "feasible": t["search"]["feasible"],
+            "thresholds": t["thresholds"].to_dict(),
+            "recall": {f"@{k}": recall(half, k) for k in (1, 3, 5)},
+            "right_shown": t["calibration"]["right_shown"]["rate"], "wrong_shown": t["calibration"]["wrong_shown"]["rate"],
+            "questions": t["calibration"]["questions"]["rate"], "source_offered": t["calibration"]["source_offered"]["rate"],
+        }
     return {
         "version": CALIBRATION_VERSION,
         "index_sha256": index.sha256,
+        "variant": winner,
         "model": index.model,
         "dimensions": index.dimensions,
         "thresholds": effective.to_dict(),
         "chosen": thresholds.to_dict(),
         "withheld": effective != thresholds,
-        "feasible": search["feasible"],
-        "search": search,
+        "feasible": best["search"]["feasible"],
+        "search": best["search"],
         "limits": {"max_wrong_upper": MAX_WRONG_UPPER, "max_loo_shown": MAX_LOO_SHOWN, "offer_recall": OFFER_RECALL},
-        "calibration": measure(calibration_half, thresholds),
+        "calibration": best["calibration"],
         "test": test,
+        "recall_test": {f"@{k}": recall(test_half, k) for k in (1, 3, 5)},
+        "variants": compared,
         "acceptance": {"targets": TARGETS, "checks": checks, "passed": all(checks.values())},
         "exam": {"fiches": len({f for f, _, _ in exam}), "questions": len(exam),
                  "fiches_without_question": sorted(f for f in index.fiche_ids if f not in {e[0] for e in exam}),
@@ -343,5 +388,10 @@ def calibrate(index: sem.SemanticIndex, kbmap, heldouts: list[Heldout], embedder
     }
 
 
-__all__ = ["Heldout", "heldout_for", "calibrate", "choose", "measure", "sample", "split_of", "noise", "check",
-           "schema", "withhold", "SYSTEM_PROMPT", "SCHEMA_NAME", "TARGETS", "SAFETY_CHECKS"]
+def calibrate(index: sem.SemanticIndex, kbmap, heldouts: list[Heldout], embedder) -> dict:
+    """calibration.json for one index (``calibrate_variants`` with a single variant)."""
+    return calibrate_variants({index.stats.get("rule") or "single": (index, kbmap)}, heldouts, embedder)
+
+
+__all__ = ["Heldout", "heldout_for", "calibrate", "calibrate_variants", "choose", "measure", "recall", "sample",
+           "split_of", "noise", "check", "schema", "withhold", "SYSTEM_PROMPT", "SCHEMA_NAME", "TARGETS", "SAFETY_CHECKS"]

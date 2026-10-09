@@ -230,31 +230,53 @@ def pack(vectors: Sequence[Sequence[float]]) -> array:
     return flat
 
 
-def build(entries: list[Entry], embedder, model: str, dimensions: int,
-          anchors: list[Entry] | None = None) -> tuple[SemanticIndex, dict]:
-    """Embeds every entry (``embedder.embed``: recorded, so a rebuild is free and identical), then drops
-    each line the model wrote (what a fiche solves, its questions) that is closer to another fiche than
-    to its own: a question written for fiche A that reads like fiche B would pull B's tickets to A.
-    The yardstick is code-derived text only -- each fiche's label and ``anchors`` (its own description
-    and verified steps, embedded but never indexed) -- so a card the model got wrong cannot vouch for
-    itself. A line is kept when its closest anchor belongs to its own fiche."""
-    if not entries:
-        raise ValueError("no entry to index")
-    anchors = list(anchors or [])
+def embed_entries(entries: list[Entry], anchors: list[Entry], embedder, dimensions: int):
+    """(entry vectors, anchor vectors), unit length, from ONE embedding pass (``embedder.embed``:
+    recorded, so a rebuild is free and identical) -- several rules can then be built from them."""
     vectors = [unit(v) for v in embedder.embed([e.text for e in entries] + [a.text for a in anchors])]
     if any(len(v) != dimensions for v in vectors):
         raise ValueError("the embedder answered vectors of another size")
-    yardstick = [(e.fiche_id, vectors[i]) for i, e in enumerate(entries) if e.kind not in CHECKED_KINDS]
-    yardstick += [(a.fiche_id, vectors[len(entries) + j]) for j, a in enumerate(anchors)]
+    return vectors[:len(entries)], vectors[len(entries):]
+
+
+# Which lines may vouch for a fiche when a line the model wrote is checked, and which lines are checked:
+#   "code"      the fiche's label and own text only; what it solves and its questions are checked.
+#   "balanced"  also every fiche's "solves" lines (one French, one English); questions are checked.
+#               Embeddings rate two texts in the same language closer than a translation: against code
+#               text alone, a French question of an English fiche loses to any French fiche nearby.
+#   "none"      nothing is dropped for closeness (the code checks of kefind.cards still apply).
+# The calibration builds all three from the same vectors and keeps the one the KB's own exam supports
+# (kefind.calibrate.calibrate_variants); on a tie the stricter one, in this order.
+DROP_RULES = ("code", "balanced", "none")
+_RULES = {"code": (("label",), CHECKED_KINDS), "balanced": (("label", "solves"), ("question",)), "none": ((), ())}
+
+
+def build(entries: list[Entry], embedder, model: str, dimensions: int, anchors: list[Entry] | None = None,
+          rule: str = "code", vectors=None) -> tuple[SemanticIndex, dict]:
+    """The index of ``entries`` under ``rule`` (``DROP_RULES``): each line the model wrote that the rule
+    checks is dropped when it is closer to another fiche than to its own -- a question written for
+    fiche A that reads like fiche B would pull B's tickets to A. ``anchors``: each fiche's own text
+    (description, verified steps), part of every yardstick but never indexed. ``vectors``: the
+    (entries, anchors) vectors of ``embed_entries``; embedded here when None."""
+    if rule not in _RULES:
+        raise ValueError(f"unknown rule {rule!r}: one of {', '.join(DROP_RULES)}")
+    if not entries:
+        raise ValueError("no entry to index")
+    anchors = list(anchors or [])
+    entry_vecs, anchor_vecs = vectors if vectors is not None else embed_entries(entries, anchors, embedder, dimensions)
+    vouching, checked = _RULES[rule]
+    yardstick = [(e.fiche_id, entry_vecs[i]) for i, e in enumerate(entries) if e.kind in vouching]
+    if checked:
+        yardstick += [(a.fiche_id, anchor_vecs[j]) for j, a in enumerate(anchors)]
     kept: list[int] = []
     dropped: list[dict] = []
     for i, entry in enumerate(entries):
-        if entry.kind not in CHECKED_KINDS:
+        if entry.kind not in checked:
             kept.append(i)
             continue
         best_own, best_other, other_fiche = -2.0, -2.0, None
         for fiche_id, anchor in yardstick:
-            score = dot(vectors[i], anchor)
+            score = dot(entry_vecs[i], anchor)
             if fiche_id == entry.fiche_id:
                 best_own = max(best_own, score)
             elif score > best_other:
@@ -265,9 +287,10 @@ def build(entries: list[Entry], embedder, model: str, dimensions: int,
         else:
             kept.append(i)
     final = [entries[i] for i in kept]
-    index = SemanticIndex(model=model, dimensions=dimensions, entries=final, vectors=pack([vectors[i] for i in kept]))
+    index = SemanticIndex(model=model, dimensions=dimensions, entries=final, vectors=pack([entry_vecs[i] for i in kept]))
     by_kind = {kind: sum(1 for e in final if e.kind == kind) for kind in ENTRY_KINDS}
-    stats = {"fiches": len(index.fiche_ids), "entries": len(final), "by_kind": by_kind, "anchors": len(anchors),
+    stats = {"rule": rule, "fiches": len(index.fiche_ids), "entries": len(final), "by_kind": by_kind,
+             "anchors": len(anchors),
              "dropped_closer_to_another_fiche": {kind: sum(1 for d in dropped if d["kind"] == kind)
                                                  for kind in CHECKED_KINDS}}
     index.stats = stats
@@ -276,4 +299,4 @@ def build(entries: list[Entry], embedder, model: str, dimensions: int,
 
 __all__ = ["Entry", "SemanticIndex", "Thresholds", "UNCALIBRATED", "decide", "build", "pack", "unit", "dot",
            "normalize_text", "query_text", "INDEX_BLOB", "VECTORS_BLOB", "CALIBRATION_BLOB", "MAX_ENTRY_CHARS",
-           "MAX_QUERY_CHARS", "MAX_ANCHOR_CHARS", "CHECKED_KINDS"]
+           "MAX_QUERY_CHARS", "MAX_ANCHOR_CHARS", "CHECKED_KINDS", "DROP_RULES", "embed_entries"]
