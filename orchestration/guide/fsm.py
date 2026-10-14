@@ -17,7 +17,13 @@ SOLVED  -> the user confirmed. A fiche that does not solve it, or a wrong fiche,
            Nothing is ever handed off automatically.
 
 Termination: every event triggers a bounded amount of work (<= 5 fiche attempts,
-2 guide drafts each); the session itself only advances on user events."""
+2 guide drafts each); the session itself only advances on user events.
+
+Routing (the deterministic engine's route levels, orchestration/guide/kefind_ports.py) is
+decided in the Function, never here: the FSM only carries a candidate's ``route_level`` /
+``route_key`` onto the choices it offers and onto a guide it takes as exact -- a fiche the
+person picked or the FSM took as the closest was not identified by a route, so its guide
+carries none and is never labelled by one."""
 from __future__ import annotations
 
 import hashlib
@@ -184,15 +190,29 @@ def _make_guide(st: GuideState, cand: KbCandidate, chunks: Dict[str, str], p: Po
                 "steps": [{"order": 1, "title": "Consulter la fiche", "instruction": f"Ouvrez la fiche « {cand.title} » et suivez-la.",
                            "source_chunk_id": cid, "verbatim_from_kb": False}]}
     g = {"parent_id": cand.parent_id, "title": cand.title, "source_system": cand.source_system,
-         "source_url": cand.source_url, "origin": origin, "approximate": approximate, **body}
+         "source_url": cand.source_url, "origin": origin, "approximate": approximate, **body,
+         **_route_of(cand, forced, approximate)}
     g["guide_sha256"] = guide_sha256(g)
     return Guide.model_validate(g)
+
+
+def _route_of(cand: KbCandidate, forced: bool, approximate: bool) -> dict:
+    """The route a guide carries: the candidate's, only when the guide is taken as exact (neither the
+    person's pick nor the closest fiche after the clarification rounds) -- "identified by a validated
+    phrasing" must never be said of a fiche the engine only offered. Empty fields are left out so an
+    unrouted guide (and its guide_sha256) stays byte-identical to what it was before routing existed."""
+    if forced or approximate or not cand.route_level:
+        return {}
+    return {"route_level": cand.route_level, **({"route_key": cand.route_key} if cand.route_key else {})}
 
 
 # ------------------------------------------------------------------- locate
 
 def _choices(cands: List[KbCandidate]) -> List[Choice]:
-    return [Choice(parent_id=c.parent_id, title=c.title[:120], score=c.reranker_score) for c in cands[:3]]
+    """The <= 3 fiches offered; each keeps its route level so the page can say why they are offered
+    (validated fiches of one intent, or fiches close by meaning to confirm)."""
+    return [Choice(parent_id=c.parent_id, title=c.title[:120], score=c.reranker_score, route_level=c.route_level)
+            for c in cands[:3]]
 
 
 def _emit_step(st: GuideState, out: List[dict]) -> None:

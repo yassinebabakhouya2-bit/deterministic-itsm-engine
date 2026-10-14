@@ -9,11 +9,15 @@ One partition per client (``PartitionKey``) in every table:
                 the labeling tab, read by the scoreboard next to the labeled tickets
   kecorescores  one row per scoreboard run (the headline numbers)
   kefindpending the dictionary's candidate names seen in live questions (dictionary_service.py)
+  kefindreview  the routing review: one row per (fiche, source text) a person decided on -- validated
+                (intent, application, aliases, codes) or rejected (kefind.review.ReviewDecision.to_row,
+                written only by routing_service.decide / carry_forward)
 
 Writes MERGE by default: a property this code does not write (a label, a finding) is never
 erased by a write that does not carry it. Where two writers may meet on one row (the dictionary's
-candidates and decisions), ``read`` / ``create`` / ``merge_if`` give optimistic concurrency: an
-atomic insert, then merges that only apply to the row as it was read (ETag, If-Match).
+candidates and decisions, two reviewers on one fiche), ``read`` / ``create`` / ``merge_if`` give
+optimistic concurrency: an atomic insert, then merges that only apply to the row as it was read
+(ETag, If-Match).
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ LABELS = "ticketlabels"
 REFERENCES = "refquestions"
 SCORES = "kecorescores"
 PENDING = "kefindpending"
+REVIEW = "kefindreview"
 
 
 def _endpoint() -> str:

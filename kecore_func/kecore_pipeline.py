@@ -130,6 +130,11 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
     if isinstance(llm_parallelism, bool) or not isinstance(llm_parallelism, int) \
             or not 1 <= llm_parallelism <= MAX_LLM_PARALLELISM:
         raise ValueError(f"llm_parallelism must be an integer between 1 and {MAX_LLM_PARALLELISM}")
+    # the routing tables rebuilt for the new run before it is published (kecore_func/routing_service.py):
+    # strictly a bool -- PowerShell callers send "false" as a string, which bool() would read as true
+    routing = body.get("routing", True)
+    if not isinstance(routing, bool):
+        raise ValueError("routing must be true or false")
     if not _RUN_ID_RE.match(run_id):
         raise ValueError("invalid run id")
     return {
@@ -143,6 +148,11 @@ def validate_request(body, allowed_clients, run_id: str) -> dict:
         "enrich": enrich,
         "llm_parallelism": llm_parallelism,
         "run_id": run_id,
+        # keys an older run's input lacks: the orchestrator runs these steps only when they are True, so a
+        # run started before they existed replays with the shape its history holds
+        "routing": routing,
+        "routing_build_id": run_id,
+        "catalog": True,
     }
 
 
@@ -352,26 +362,95 @@ def report(storage: Storage, payload: dict, ranges: list[list[int]], profile_sta
 
 def exclusion_rules(storage: Storage, client: str) -> ExclusionRules:
     """kecore-<client>/exclusion-config.json, else the defaults. A malformed file fails the run with a
-    clear error rather than excluding fiches by rules nobody wrote."""
+    clear error rather than excluding fiches by rules nobody wrote.
+
+    The file is written by hand, often from PowerShell 5.1 (runbook 9.1): ``Out-File -Encoding utf8``
+    puts a UTF-8 BOM in front, which is accepted (read as "utf-8-sig", like dictionary-decisions.json);
+    ``Out-File`` and ``>`` write UTF-16 and ``Set-Content`` the ANSI code page. Those are refused rather
+    than guessed (a code page cannot be told from bytes alone, and one encoding for every hand-written
+    file keeps every reader of it simple), with an error that says what to do instead of quoting a JSON
+    position: "unexpected character at line 1 column 1" tells nobody the file is UTF-16."""
+    name = f"{kecore_container(client)}/{EXCLUSION_CONFIG}"
     data = storage.read(kecore_container(client), EXCLUSION_CONFIG)
     if data is None:
         return ExclusionRules()
+    wide = _wide_unicode(data)
+    if wide:
+        raise ValueError(f"{name} is {wide}: save it as UTF-8")
     try:
-        return ExclusionRules.from_dict(json.loads(data.decode("utf-8")))
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{name} is not UTF-8 ({exc}): save it as UTF-8") from exc
+    try:
+        return ExclusionRules.from_dict(json.loads(text))
     except (ValueError, AttributeError) as exc:
-        raise ValueError(f"{kecore_container(client)}/{EXCLUSION_CONFIG} is invalid: {exc}") from exc
+        raise ValueError(f"{name} is invalid: {exc}") from exc
+
+
+def _wide_unicode(data: bytes) -> str | None:
+    """The wide encoding ("UTF-16" or "UTF-32") ``data`` is a JSON text saved in, else None. By the
+    byte-order mark first (UTF-32's little-endian mark starts with UTF-16's, so it is tried first);
+    without a mark, by the NUL bytes the first character gets: a JSON text starts with an ASCII
+    character, which UTF-16 writes as two bytes, one of them NUL, and UTF-32 as four, three of them NUL
+    (RFC 4627 section 3), while UTF-8 never writes a NUL byte for anything but U+0000 itself."""
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "UTF-32"
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "UTF-16"
+    head = data[:4]
+    if len(head) >= 2 and 0 in head[:2]:
+        return "UTF-32" if head.count(0) == 3 else "UTF-16"
+    return None
+
+
+def _md_code(text: str) -> str:
+    """``text`` as a Markdown code span that renders it exactly, so an id copied from report.md is the
+    id: interior spaces are kept (a code span never collapses them), a backtick inside gets a longer
+    fence, and the padding a span strips is added back when the text starts or ends with a backtick or
+    with a space at both ends (CommonMark 6.1). A line break cannot live in a span (nor a table row) and
+    is shown as the space a span renders it as; a fiche id, a document name, never holds one."""
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    if not text:
+        return "*(empty)*"
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    pad = " " if text[0] == "`" or text[-1] == "`" or (text[0] == text[-1] == " " and text.strip(" ")) else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _md_cell(text: str) -> str:
+    """Free text in a table cell: on one line, its pipes escaped (GFM splits cells before anything else)."""
+    return " ".join(str(text).split()).replace("|", "\\|")
 
 
 def _exclusion_section(exclusion) -> str:
-    """The fiches kept out of the map, for a person to check (a wrong exclusion is undone by force_include)."""
+    """The fiches kept out of the map, for a person to check (a wrong exclusion is undone by force_include),
+    and what each force_include entry did. Fiche ids are written exactly, in code spans: force_include
+    matches an id as it is, and an id whose double space report.md once collapsed rescued nothing
+    (runbook 19.18 #5). Titles and details stay collapsed: nobody copies them into the config."""
     lines = ["", "## Fiches excluded from the map", ""]
     if not exclusion.excluded:
-        return "\n".join(lines + ["None.", ""])
-    lines += ["| Fiche | Title | Rule | Detail |", "|---|---|---|---|"]
-    for e in exclusion.excluded:
-        lines.append("| " + " | ".join(" ".join(str(x).split()).replace("|", "\\|")
-                                       for x in (e.fiche_id, e.title, e.rule, e.detail)) + " |")
-    return "\n".join(lines + [""])
+        lines += ["None.", ""]
+    else:
+        lines += ["| Fiche | Title | Rule | Detail |", "|---|---|---|---|"]
+        for e in exclusion.excluded:
+            cells = [_md_code(e.fiche_id).replace("|", "\\|")] + [_md_cell(x) for x in (e.title, e.rule, e.detail)]
+            lines.append("| " + " | ".join(cells) + " |")
+        lines += ["", "Fiche ids are exact: copy one into force_include as it is, spaces included.", ""]
+    if exclusion.forced:
+        lines += ["### Forced back in by force_include", "",
+                  "Kept in the map although the rules exclude them:", ""]
+        lines += [f"- {_md_code(fiche_id)}" for fiche_id in exclusion.forced] + [""]
+    if exclusion.matched_loosely:
+        lines += ["### force_include entries matched loosely", "",
+                  "Each one names a fiche only once spaces and case are ignored: write the exact id instead.", ""]
+        lines += [f"- {_md_code(m['entry'])} names {_md_code(m['fiche_id'])}" for m in exclusion.matched_loosely] + [""]
+    if exclusion.force_include_unmatched:
+        lines += ["### force_include entries matching no fiche", "",
+                  "Each one rescues nothing: no fiche of this run has this id, nor exactly one once spaces and case "
+                  "are ignored." + (" The exact ids of the excluded fiches are in the table above." if exclusion.excluded
+                                    else ""), ""]
+        lines += [f"- {_md_code(entry)}" for entry in exclusion.force_include_unmatched] + [""]
+    return "\n".join(lines)
 
 
 def publish(storage: Storage, payload: dict, short: dict, semantic: dict | None = None) -> dict:

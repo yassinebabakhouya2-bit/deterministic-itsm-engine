@@ -294,6 +294,15 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(engine.decide(Ticket("T-9", "other", "x")).error, "no KB map for client 'other'")
         self.assertEqual(engine.candidates(Ticket("T-2", "clienta", "Caméra noire dans Teams"), 2)[0][0], "KB0030003")
 
+    def test_the_application_filter_never_changes_the_words_path(self):
+        # app_filter is the routed L3's semantic-path restriction: the words path already filters by application
+        maps = {"clienta": example_map("clienta"), "clientb": example_map("clientb")}
+        for line in (EXAMPLES / "tickets.jsonl").read_text(encoding="utf-8").splitlines():
+            ticket = json.loads(line)
+            kbmap = maps[ticket["client"]]
+            self.assertEqual(json.dumps(find(kbmap, ticket["text"], app_filter=True).to_dict(), sort_keys=True),
+                             json.dumps(find(kbmap, ticket["text"]).to_dict(), sort_keys=True), ticket["ticket_id"])
+
     def test_scoreboard_engine_with_interpretation_counts_its_tokens(self):
         llm = StubLLM({"terms": ["Outlook does not start"], "application": "Outlook"})
         engine = FunnelEngine({"clienta": example_map()}, llm=llm)

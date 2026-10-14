@@ -14,6 +14,13 @@ Definitions (on the first run, the one a technician would see):
 * recall@5: an expected fiche is among the first 5 candidates, whatever the
   decision (the ceiling for a better decision step);
 * stability: same kind and same fiche shown in every run, over all tickets.
+
+For a routing engine (records carrying a ``route``, see ``routing_gate``):
+
+* right fiche first: the first fiche a technician meets, shown or offered by a
+  question, is an expected one (an abstention offers nothing);
+* wrong exact fiche: a fiche shown as exact at L0-L2 (validated by a person)
+  that is not an expected one, over every run and every question.
 """
 
 from __future__ import annotations
@@ -304,3 +311,181 @@ def calibrate(records: list[dict], max_wrong: float) -> Calibration | None:
         )
     recommended = next((row for row in rows if row.wrong_shown.high is not None and row.wrong_shown.high <= max_wrong), None)
     return Calibration(max_wrong=max_wrong, rows=rows, recommended=recommended)
+
+
+# Routing (kefind.route): the decisions by level, and the gate a set of routing tables must pass before
+# a person may activate them. Spec (docs/v10-deterministic-engine.md): "deploy only if a wrong fiche
+# shown as exact (L0-L2) is 0 and right-fiche-first is at least today's engine's", on the same questions.
+
+EXACT_LEVELS = ("L0", "L1", "L2")
+MIN_GATE_QUESTIONS = 30  # = kefind.routing.MIN_GATE_QUESTIONS (scoreboard does not import kefind)
+GATE_STATUSES = ("invalid", "failed", "insufficient", "passed")
+_SAMPLE_IDS = 5
+
+
+def first_fiche(record: dict) -> str | None:
+    """The fiche a technician meets first: the one shown, or the first one a question offers. Routing
+    turns a fiche the base engine would show into an offer (L3), so right-first, not exact @1, is the
+    measure both engines can be held to. An abstention offers nothing, whatever it ranked."""
+    if record.get("kind") in ("fiche", "question") and record.get("fiches"):
+        return record["fiches"][0]
+    return None
+
+
+def right_first(record: dict) -> bool:
+    """The first fiche met is an expected one; never true on a question no fiche covers."""
+    return bool(record["expected"]) and first_fiche(record) in record["expected"]
+
+
+def route_level(record: dict) -> str | None:
+    """None for a record no router decided (any engine before routing, and every record written then)."""
+    return (record.get("route") or {}).get("level")
+
+
+def is_routed_exact(record: dict) -> bool:
+    """A fiche shown as exact because a person validated it into the tables (L0-L2)."""
+    return route_level(record) in EXACT_LEVELS and record.get("kind") == "fiche"
+
+
+def is_wrong_exact(record: dict) -> bool:
+    """A routed exact fiche that is not an expected one; showing any fiche when none is expected is wrong."""
+    return is_routed_exact(record) and shown(record) not in record["expected"]
+
+
+def _level_counts(records: list[dict]) -> dict:
+    return {
+        "n": len(records),
+        "with_fiche": sum(1 for r in records if r["expected"]),
+        "shown": sum(1 for r in records if shown(r) is not None),
+        "exact": sum(1 for r in records if is_exact(r)),
+        "wrong_exact": sum(1 for r in records if is_wrong_exact(r)),
+        "right_first": sum(1 for r in records if right_first(r)),
+        "questions": sum(1 for r in records if r["kind"] == "question"),
+        "abstain": sum(1 for r in records if r["kind"] == "abstain"),
+    }
+
+
+def by_route(records: list[dict]) -> dict[str, dict]:
+    """Counts per decision level on the first run: {"L0".."L4" | "none": {n, with_fiche, shown, exact,
+    wrong_exact, right_first, questions, abstain}}, levels in order, "none" (not routed) last; a level
+    no question reached is absent."""
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for record in canonical(records):
+        groups[route_level(record) or "none"].append(record)
+    return {level: _level_counts(groups[level]) for level in sorted(groups, key=lambda lv: (lv == "none", lv))}
+
+
+def _sample(ids: list[str]) -> str:
+    more = len(ids) - _SAMPLE_IDS
+    return ", ".join(ids[:_SAMPLE_IDS]) + (f" and {more} more" if more > 0 else "")
+
+
+def _later_runs_problem(name: str, records: list[dict], keys: set[str]) -> list[str]:
+    """Runs after the first that answered other questions (an interrupted repeat): the first run is the
+    one every number reads, but a wrong exact fiche in a later run still counts, so every run must be whole."""
+    uneven = [str(run) for run, by_key in list(by_run(records).items())[1:] if set(by_key) != keys]
+    if not uneven:
+        return []
+    return [f"the {name} engine's run(s) {', '.join(uneven)} did not answer the same questions as the base "
+            "engine's first run: the measure is incomplete"]
+
+
+def routing_gate(base: list[dict], routed: list[dict], exclude_ids=(), *, failures: int = 0, degraded: int = 0,
+                 min_questions: int = MIN_GATE_QUESTIONS) -> dict:
+    """May these routing tables be activated? ``base``: today's engine's records; ``routed``: the routing
+    engine's, on the same frozen questions; ``exclude_ids``: questions a reviewer saw while writing the
+    tables (``kefind.review.seen_reference_ids``), as ticket ids or client/ticket_id keys.
+
+    Status, the first that applies:
+    - "invalid": the measure cannot be trusted either way (the engines did not answer the same
+      questions or against the same labels, a decision failed, a model or embedding call failed
+      transiently, a decision was degraded): run it again;
+    - "failed": a fiche shown as exact at L0-L2 is wrong, on ANY routed question, excluded ones
+      included (a seen question is exactly where an alias written from it can lose to another fiche's);
+      or the right fiche comes first less often than without routing on the compared questions;
+    - "insufficient": fewer compared questions than ``min_questions`` (never fewer than 1), or no
+      question decided at L0-L2 at all: nothing proves the tables right, though nothing proves them
+      wrong (a person may still activate them, with a recorded reason);
+    - "passed".
+    The comparison (right-first and McNemar) is on the base engine's questions that expect a fiche,
+    minus the excluded ones: a reviewer's phrasings would otherwise score the tables written from them.
+    Wrong exact fiches are counted over every run; ids are ticket ids, sorted."""
+    base_canon = {ticket_key(r): r for r in canonical(base)}
+    route_canon = {ticket_key(r): r for r in canonical(routed)}
+    keys = sorted(base_canon)
+    invalid: list[str] = []
+    failed: list[str] = []
+    insufficient: list[str] = []
+
+    missing = sorted(set(base_canon) - set(route_canon))
+    extra = sorted(set(route_canon) - set(base_canon))
+    if missing or extra:
+        invalid.append(f"the routed engine did not answer the same questions as the base engine ({len(missing)} "
+                       f"missing, {len(extra)} extra, e.g. {_sample(missing + extra)})")
+    invalid += _later_runs_problem("base", base, set(base_canon))
+    invalid += _later_runs_problem("routed", routed, set(base_canon))
+    relabeled = sorted(base_canon[k]["ticket_id"] for k in keys
+                       if k in route_canon and sorted(base_canon[k]["expected"]) != sorted(route_canon[k]["expected"]))
+    if relabeled:
+        invalid.append(f"{len(relabeled)} question(s) carry different expected fiches in the two results "
+                       f"(e.g. {_sample(relabeled)}): the engines were not measured on the same labels")
+    for name, records in (("base", base), ("routed", routed)):
+        errors = sorted({r["ticket_id"] for r in records if r.get("error")})
+        if errors:
+            invalid.append(f"{len(errors)} {name} decision(s) failed (e.g. {_sample(errors)}): a failed decision "
+                           "measures nothing")
+    if int(failures or 0) > 0:
+        invalid.append(f"{int(failures)} transient model or embedding failure(s) (throttling, server, network): "
+                       "run the measure again")
+    marked = sorted({r["ticket_id"] for r in list(base) + list(routed) if r.get("degraded")})
+    if int(degraded or 0) > 0:
+        invalid.append(f"{int(degraded)} degraded decision(s): they were not made the way /find makes them; "
+                       "run the measure again")
+    elif marked:
+        invalid.append(f"{len(marked)} question(s) carry a degraded decision (e.g. {_sample(marked)}): they were "
+                       "not made the way /find makes them; run the measure again")
+
+    exact_keys = {ticket_key(r) for r in routed if is_routed_exact(r)}
+    wrong = {ticket_key(r): r["ticket_id"] for r in routed if is_wrong_exact(r)}
+    wrong_ids = sorted(set(wrong.values()))
+    if wrong:
+        failed.append(f"{len(wrong)} fiche(s) shown as exact at L0-L2 are wrong ({_sample(wrong_ids)}): "
+                      "fix or reject the decisions that route them")
+
+    # one id passed as a bare string would otherwise exclude its characters, and nothing it names
+    excluded_ids = {exclude_ids} if isinstance(exclude_ids, str) else {str(x) for x in exclude_ids or ()}
+
+    def is_excluded(record: dict) -> bool:
+        return record["ticket_id"] in excluded_ids or ticket_key(record) in excluded_ids
+
+    excluded = sorted({base_canon[k]["ticket_id"] for k in keys if is_excluded(base_canon[k])})
+    compared = [k for k in keys if k in route_canon and base_canon[k]["expected"] and not is_excluded(base_canon[k])]
+    base_k = sum(1 for k in compared if right_first(base_canon[k]))
+    route_k = sum(1 for k in compared if right_first(route_canon[k]))
+    base_only = sum(1 for k in compared if right_first(base_canon[k]) and not right_first(route_canon[k]))
+    route_only = sum(1 for k in compared if right_first(route_canon[k]) and not right_first(base_canon[k]))
+    if route_k < base_k:
+        failed.append(f"the right fiche comes first less often with routing ({route_k} of {len(compared)}) than "
+                      f"without ({base_k} of {len(compared)})")
+
+    floor = max(1, int(min_questions))
+    if len(compared) < floor:
+        insufficient.append(f"only {len(compared)} question(s) with an expected fiche can be compared "
+                            f"({len(excluded)} excluded as seen by a reviewer); at least {floor} are needed")
+    if not exact_keys:
+        insufficient.append("no question was decided at L0-L2: the measure says nothing about the validated tables")
+
+    status = "invalid" if invalid else "failed" if failed else "insufficient" if insufficient else "passed"
+    return {
+        "status": status,
+        "passed": status == "passed",
+        "tickets": len(keys),
+        "compared": len(compared),
+        "excluded": excluded,
+        "wrong_exact": {"k": len(wrong), "n": len(exact_keys), "ids": wrong_ids},
+        "routed_exact": len(exact_keys),
+        "right_first": {"base": Rate(base_k, len(compared)).to_dict(), "route": Rate(route_k, len(compared)).to_dict()},
+        "mcnemar": {"base_only": base_only, "route_only": route_only, "p_value": mcnemar_exact(base_only, route_only)},
+        "by_level": by_route(routed),
+        "reasons": invalid + failed + insufficient,
+    }

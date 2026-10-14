@@ -46,19 +46,22 @@ class FakeAoai:
 
 
 def make_app(me="alice", clients=("client-s",), itsm=False, strong=True, engine=None, writeback=None, aoai=None,
-            no_candidates=False):
+            no_candidates=False, labels_nav=False, diagnostic=None):
     hit = lambda pid, score: {"parent_id": pid, "title": pid, "chunk_id": pid + "_0", "chunk": CHUNK, "@search.rerankerScore": score}
     docs = [] if no_candidates else ([hit("K1", 3.8), hit("K2", 1.0)] if strong else [hit("K1", 2.0), hit("K2", 1.9)])
     deps = dict(
         allowed_clients=lambda: list(clients), user_id=lambda: me, display_name=lambda: me.title(),
         itsm_access=itsm if callable(itsm) else (lambda: itsm), search_token=lambda: "tok", aoai=aoai or FakeAoai(),
-        load_engine_config=lambda c: {"knowledge": {"index": "idx"}, "generation": {"model": "m", "seed": 1}},
+        load_engine_config=lambda c: {"knowledge": {"index": "idx"}, "generation": {"model": "m", "seed": 1},
+                                      **({"diagnostic": diagnostic} if diagnostic else {})},
         retrieve_hierarchy=lambda q, index, n, a, h, client_id=None: (docs, []),
         fetch_document_chunks=lambda pids, index, h, client_id=None: {
             pids[0]: [{"chunk_id": "k_0", "chunk": CHUNK}]}, engine=engine)
     app = Flask(__name__)
     store = MemoryStore()
     app.register_blueprint(diag_bp.create_diagnostic_blueprint(None, deps, store=store, writeback=writeback))
+    if labels_nav:  # what the labels blueprint's context processor gives a member of the labelling group
+        app.context_processor(lambda: {"labels_nav": True})
     return app, store
 
 
@@ -188,18 +191,25 @@ def test_kb_text_strips_markup():
 class FakeEngine:
     """fn-kecore as the Diagnostic sees it (app/kecore_client.EngineClient)."""
 
-    def __init__(self, kind="fiche", fail=False):
+    def __init__(self, kind="fiche", fail=False, route=None, mode=None):
         self.kind, self.fail, self.calls = kind, fail, []
+        self.route, self.mode = route, mode  # route None: an answer without one (routing off, older Function)
 
     def find(self, client, text, observe=None):
         self.calls.append("find")
         if self.fail:
             raise RuntimeError("engine down")
         decision = ({"kind": "fiche", "fiche_id": "KB0120"} if self.kind == "fiche"
+                    else {"kind": "abstain", "reason": "nothing", "fiches": []} if self.kind == "abstain"
                     else {"kind": "question", "options": [{"fiche_id": "KB0120"}, {"fiche_id": "KB0200"}]})
-        return {"run_id": "20261007T204049Z-215423", "decision": decision,
-                "candidates": [{"fiche_id": "KB0120", "label": "Réinitialiser son mot de passe Windows"},
-                               {"fiche_id": "KB0200", "label": "Configurer Outlook"}]}
+        answer = {"run_id": "20261007T204049Z-215423", "decision": decision,
+                  "candidates": [{"fiche_id": "KB0120", "label": "Réinitialiser son mot de passe Windows"},
+                                 {"fiche_id": "KB0200", "label": "Configurer Outlook"}]}
+        if self.route is not None:
+            answer["route"] = self.route
+        if self.mode is not None:
+            answer["mode"] = self.mode
+        return answer
 
     def fiche(self, client, fiche_id, run_id=None):
         self.calls.append(("fiche", fiche_id))
@@ -489,3 +499,132 @@ def test_resolving_from_the_open_answer_closes_the_session(monkeypatch):
     post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "solved_yes"})
     page = page_of(c, sid)
     assert "Problème résolu" in page
+
+
+# ------------------------------------------------------------- routing chantier: route levels on the page
+ROUTE_LABELS = {"L0": "Fiche identifiée par son numéro",
+                "L1": "Fiche identifiée par une formulation validée « attribuer ligne teams »",
+                "L2": "Fiche identifiée par l'intention et l'application validées"}
+ROUTE_KEYS = {"L0": "120", "L1": "attribuer ligne teams", "L2": "REINITIALISER_MOT_DE_PASSE|windows"}
+
+
+def test_the_route_that_identified_the_fiche_is_named_on_the_page_even_during_an_outage():
+    for level, label in ROUTE_LABELS.items():
+        engine = FakeEngine(route={"level": level, "key": ROUTE_KEYS[level], "fiche_id": "KB0120"}, mode="degraded")
+        app, _ = make_app(engine=engine)
+        c = app.test_client()
+        sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "mot de passe expiré"}))
+        page = page_of(c, sid)
+        assert f"{label} · par le moteur déterministe" in page, level        # the preview card, before the start
+        assert page.count(label) == 2 and "Fiche sélectionnée" not in page, level   # and the fiche's summary
+        start_steps(c, sid)
+        page = page_of(c, sid)
+        assert f"{label} · par le moteur déterministe" in page and "Étape 1 sur 2" in page, level
+        for other, text in ROUTE_LABELS.items():
+            assert other == level or text not in page
+
+
+def test_a_route_key_is_shown_escaped_never_as_markup():
+    key = '<img src=x onerror="alert(1)"> & « co »'
+    app, _ = make_app(engine=FakeEngine(route={"level": "L1", "key": key, "fiche_id": "KB0120"}))
+    c = app.test_client()
+    page = page_of(c, sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "x"})))
+    assert "<img src=x" not in page and "onerror=\"alert" not in page
+    assert "« &lt;img src=x onerror=&#34;alert(1)&#34;&gt; &amp; « co » »" in page
+
+
+def test_an_l2_choice_says_several_validated_fiches_match():
+    app, _ = make_app(engine=FakeEngine(kind="question", route={"level": "L2", "key": "X|y"}))
+    c = app.test_client()
+    page = page_of(c, sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "attribuer une ligne"})))
+    assert "Plusieurs fiches validées correspondent : laquelle ?" in page and 'value="pick:2"' in page
+    assert "Quelle fiche correspond" not in page and "correspondance" not in page   # no score label for a route
+    assert "Configurer Outlook" in page
+
+
+def test_an_l3_choice_says_the_fiches_are_close_by_meaning_to_confirm():
+    app, _ = make_app(engine=FakeEngine(kind="question", route={"level": "L3"}, mode="semantic"))
+    c = app.test_client()
+    page = page_of(c, sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "probleme"})))
+    assert "Fiches proches par le sens — à confirmer" in page and "Quelle fiche correspond" not in page
+    assert "Fiche identifiée" not in page and "correspondance" not in page
+
+
+def test_an_l3_fiche_is_never_presented_as_identified_picked_or_not():
+    app, _ = make_app(engine=FakeEngine(kind="fiche", route={"level": "L3"}, mode="semantic"))
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "probleme"}))
+    page = page_of(c, sid)
+    assert "Fiches proches par le sens — à confirmer" in page and 'value="start"' not in page
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "text": "toujours"})
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "text": "encore"})   # rounds over: the closest
+    page = page_of(c, sid)
+    assert "Fiche la plus proche" in page and "Fiche identifiée" not in page and 'value="start"' in page
+
+
+def test_a_fiche_picked_from_a_routed_choice_is_not_labelled_by_the_route():
+    app, _ = make_app(engine=FakeEngine(kind="question", route={"level": "L2", "key": "X|y"}))
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "attribuer une ligne"}))
+    post(c, f"/diag/s/{sid}/reply", {"client_id": "client-s", "action": "pick:1"})
+    page = page_of(c, sid)
+    assert 'value="start"' in page and "Fiche sélectionnée par le moteur déterministe" in page
+    assert "validées" not in page and "par son numéro" not in page and "formulation validée" not in page
+
+
+def test_l4_answers_in_the_open_and_never_guides_an_index_fiche(monkeypatch):
+    import guide.ports as ports_mod
+    monkeypatch.setattr(ports_mod, "diagnostic_query_core_keyless", fake_diagnostic_query_core_keyless)
+    app, _ = make_app(engine=FakeEngine(kind="abstain", route={"level": "L4"}, mode="degraded"))  # index: K1 strong
+    c = app.test_client()
+    page = page_of(c, sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "reset mdp"})))
+    assert "Diagnostic ouvert" in page and "Essayez de redémarrer le poste" in page
+    assert "Cette fiche explique la reinitialisation." not in page and "Fiche identifiée" not in page
+    # the same abstention without a route: the search index answers, as before
+    app, _ = make_app(engine=FakeEngine(kind="abstain"))
+    c = app.test_client()
+    assert "Cette fiche explique la reinitialisation." in page_of(c, sid_of(post(c, "/diag/new", {
+        "client_id": "client-s", "text": "reset mdp"})))
+
+
+def test_an_unrouted_engine_fiche_keeps_its_label():
+    app, _ = make_app(engine=FakeEngine())
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "mot de passe expiré"}))
+    assert "Fiche sélectionnée par le moteur déterministe" in page_of(c, sid)
+    start_steps(c, sid)
+    page = page_of(c, sid)
+    assert "Fiche identifiée par le moteur déterministe" in page and "formulation validée" not in page
+
+
+def test_the_review_tab_is_in_the_nav_for_the_labelling_group_only():
+    for nav in (True, False):
+        app, _ = make_app(labels_nav=nav)
+        page = app.test_client().get("/diag?client_id=client-s").get_data(as_text=True)
+        assert ('<a href="/review">Revue</a>' in page) is nav
+        assert ('<a href="/dictionary">Dictionnaire</a>' in page) is nav
+
+
+def test_an_l3_fiche_taken_without_a_pick_is_never_called_identified_whatever_the_thresholds():
+    # a client whose thresholds let an offered fiche (score 1.5) count as strong: the FSM takes it as exact,
+    # the page still says it is to be confirmed
+    app, _ = make_app(engine=FakeEngine(kind="fiche", route={"level": "L3"}, mode="semantic"),
+                      diagnostic={"exact_score": 1.0})
+    c = app.test_client()
+    page = page_of(c, sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "probleme"})))
+    assert 'value="start"' in page and "Fiche proche par le sens — à confirmer" in page
+    assert "Fiche identifiée" not in page and "Fiche sélectionnée" not in page
+
+
+def test_a_stored_approximate_guide_is_never_labelled_by_a_route():
+    from guide.service import _pack, _unpack
+    app, store = make_app(engine=FakeEngine(route={"level": "L1", "key": "attribuer ligne teams", "fiche_id": "KB0120"}))
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "x"}))
+    assert "formulation validée" in page_of(c, sid)
+    row = store.rows[("client-s", sid)]
+    state = json.loads(_unpack(row, "stateJson"))
+    state["guide"]["approximate"] = True
+    _pack(row, "stateJson", json.dumps(state))
+    page = page_of(c, sid)
+    assert "Fiche la plus proche" in page and "formulation validée" not in page and "Fiche identifiée" not in page

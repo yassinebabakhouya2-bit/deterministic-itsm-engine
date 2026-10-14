@@ -121,7 +121,7 @@ PAGE = """
   .strike{text-decoration:line-through;color:var(--muted)}
 </style></head><body>
 <header><h1>KnowledgeEngine — Dictionnaire</h1>
-  <nav><a href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a><a href="/labels">Labellisation</a><a class="on" href="/dictionary">Dictionnaire</a></nav>
+  <nav><a href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a><a href="/labels">Labellisation</a><a class="on" href="/dictionary">Dictionnaire</a><a href="/review">Revue</a></nav>
   <span class="who">{{ display_name }}</span></header>
 <main>
 {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}

@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 from guide.contracts import Event, GuideState, KbCandidate, Phase  # noqa: E402
 from guide.fsm import Ports, Thresholds, advance  # noqa: E402
-from guide.kefind_ports import KefindPorts, observe_key, split_parent, step_title, with_engine  # noqa: E402
+from guide.kefind_ports import (OFFERED_SCORE, OTHER_SCORE, SHOWN_SCORE, KefindPorts, observe_key,  # noqa: E402
+                                route_level, route_of, shown_fiche, split_parent, step_title, with_engine)
 
 T0 = datetime(2026, 10, 8, tzinfo=timezone.utc)
 STEPS = [{"n": 1, "text": "Ouvrez la console Active Directory."},
@@ -19,16 +20,26 @@ FICHES = {
                "text": "Compte verrouillé.\n" + "\n".join(s["text"] for s in STEPS), "prerequisites": []},
     "KB0200": {"fiche_id": "KB0200", "label": "KB0200- VPN", "steps": [{"n": 1, "text": "Relancez le client VPN."}],
                "text": "Relancez le client VPN.", "prerequisites": []},
+    "KB0233": {"fiche_id": "KB0233", "label": "KB0233 -  Associate a phone line",
+               "steps": [{"n": 1, "text": "Ouvrez le centre d'administration Teams."}],
+               "text": "Ouvrez le centre d'administration Teams.", "prerequisites": []},
+    "KB0300": {"fiche_id": "KB0300", "label": "KB0300- Transfert d'appels", "steps": [{"n": 1, "text": "Ouvrez Teams."}],
+               "text": "Ouvrez Teams.", "prerequisites": []},
 }
 
 
+_NO_ROUTE = object()
+
+
 class Engine:
-    def __init__(self, decision=None, down=False, no_map=False, run_id="r1", interpreted=True, mode=None):
+    def __init__(self, decision=None, down=False, no_map=False, run_id="r1", interpreted=True, mode=None,
+                 route=_NO_ROUTE):
         self.decision = decision
         self.down, self.no_map = down, no_map
         self.run_id = run_id
         self.interpreted = interpreted
         self.mode = mode
+        self.route = route  # _NO_ROUTE: an answer of a Function that knows nothing of routing
         self.calls = []
 
     def find(self, client, text, answers=(), interpret=True, observe=None):
@@ -41,6 +52,8 @@ class Engine:
                   "candidates": [{"fiche_id": f, "label": FICHES[f]["label"]} for f in self.decision.get("fiches", [])]}
         if self.mode is not None:
             answer["mode"] = self.mode
+        if self.route is not _NO_ROUTE:
+            answer["route"] = self.route
         return answer
 
     def fiche(self, client, fiche_id, run_id=None):
@@ -57,11 +70,14 @@ def question_decision():
             "options": [{"fiche_id": "KB0120"}, {"fiche_id": "KB0200"}], "fiches": ["KB0120", "KB0200"]}
 
 
-def fallback(cands=None):
+def fallback(cands=None, asked=None):
+    """The search index ports; ``asked`` (a list) records every call to its retrieve and judge."""
     cands = cands if cands is not None else [KbCandidate(parent_id="IDX-1", title="Index fiche", reranker_score=3.5)]
+    asked = asked if asked is not None else []
     return Ports(
-        extract_variables=lambda t: [], detect_risks=lambda st: [], retrieve=lambda st: list(cands),
-        ocr=lambda refs: ([], False), judge=lambda st, c: None,
+        extract_variables=lambda t: [], detect_risks=lambda st: [],
+        retrieve=lambda st: asked.append("retrieve") or list(cands),
+        ocr=lambda refs: ([], False), judge=lambda st, c: asked.append("judge") or None,
         load_chunks=lambda pid: {"k1": "1. Ouvrez Paramètres.\n2. Cliquez sur Comptes."},
         build_guide=lambda st, c, ch: {"applicable": True, "summary": "Index", "preconditions": [], "verification": [],
                                        "steps": [{"title": "Ouvrir", "instruction": "Ouvrez Paramètres.",
@@ -235,3 +251,235 @@ def test_open_answer_always_delegates_to_the_fallback_never_the_engine():
 def test_step_titles_are_short_and_whole():
     assert step_title("Ouvrez la console. Puis cliquez.") == "Ouvrez la console."
     assert len(step_title("x" * 300)) <= 90
+
+
+# ------------------------------------------------------------- routing chantier: the engine's route levels
+KEYS = {"L0": "233", "L1": "attribuer ligne teams", "L2": "ATTRIBUER_LIGNE|teams"}
+RULES = {"L0": "fiche_number", "L1": "alias", "L2": "intent_app", "L3": "semantic", "L4": "none"}
+
+
+def route(level, fiche_id=None, key=None):
+    """The ``route`` object of a /find answer (DESIGN §6), as kefind.route.answer builds it."""
+    return {"version": 1, "level": level, "rule": RULES[level], "key": key, "fiche_id": fiche_id,
+            "tables_sha256": "t" * 64, "content_sha256": "c" * 64, "build_id": "b1", "run_id": "r1",
+            "l0": None, "l1": None, "l2": None}
+
+
+def exact_decision(fiche_id="KB0233", level="L1"):
+    """An exact L0/L1/L2 route: the fiche alone, designated, no embedding and no interpretation."""
+    reason = {"L0": "route_l0_fiche_number", "L1": "route_l1_alias", "L2": "route_l2_intent_app"}[level]
+    return {"kind": "fiche", "reason": reason, "fiche_id": fiche_id, "fiches": [fiche_id], "designated": True}
+
+
+def choice_decision(offered, fiches, reason):
+    """An L2 choice or an L3 downgrade: a question between fiches (funnel._choice), every candidate in fiches."""
+    return {"kind": "question", "reason": reason, "fiche_id": None, "asks": "fiche",
+            "options": [{"fiche_id": f, "label": FICHES[f]["label"]} for f in offered], "fiches": fiches}
+
+
+def asked_state(text="x"):
+    st = new()
+    st.conversation_text = text
+    return st
+
+
+def test_an_exact_route_guides_its_fiche_in_every_mode_even_during_an_embedding_outage():
+    for level in ("L0", "L1", "L2"):
+        for mode in ("degraded", "semantic", "words", None):
+            engine = Engine(exact_decision(level=level), mode=mode, interpreted=None,
+                            route=route(level, "KB0233", KEYS[level]))
+            r = advance(new(), ev("comment attribuer une ligne teams", kind="created"),
+                        with_engine(fallback(), engine, "client-s"), T0)
+            g = r.state.guide
+            assert r.state.phase == Phase.GUIDING and g.parent_id == "kefind:r1:KB0233", (level, mode)
+            assert not g.approximate and (g.route_level, g.route_key) == (level, KEYS[level]), (level, mode)
+            assert [s.instruction for s in g.steps] == ["Ouvrez le centre d'administration Teams."]
+
+
+def test_the_fiche_of_an_exact_route_carries_its_level_and_key_and_the_judge_confirms_it():
+    decision = {**exact_decision(level="L1"), "fiches": ["KB0233", "KB0300"]}
+    kp = KefindPorts(Engine(decision, mode="degraded", route=route("L1", "KB0233", KEYS["L1"])), "client-s",
+                     fallback())
+    st = asked_state()
+    cands = kp.retrieve(st)
+    assert [(c.parent_id, c.reranker_score, c.route_level, c.route_key) for c in cands] == [
+        ("kefind:r1:KB0233", SHOWN_SCORE, "L1", KEYS["L1"]),
+        ("kefind:r1:KB0300", OTHER_SCORE, "", "")]  # another fiche of an exact answer came by no route
+    assert kp.judge(st, cands) == "kefind:r1:KB0233"
+
+
+def test_an_l3_fiche_is_offered_never_shown_and_the_judge_never_picks_it():
+    downgraded = choice_decision(["KB0120", "KB0200"], ["KB0120", "KB0200", "KB0300"], "route_l3_semantic_clear_lead")
+    as_fiche = {"kind": "fiche", "reason": "semantic_clear_lead", "fiche_id": "KB0120",  # never sent: still not shown
+                "fiches": ["KB0120", "KB0200"]}
+    for decision in (downgraded, as_fiche):
+        for mode in ("semantic", "degraded", "words"):
+            kp = KefindPorts(Engine(decision, mode=mode, interpreted=None, route=route("L3")), "client-s", fallback())
+            st = asked_state()
+            cands = kp.retrieve(st)
+            assert split_parent(cands[0].parent_id)[1] == "KB0120", (decision["reason"], mode)
+            assert all((c.reranker_score, c.route_level, c.route_key) == (OFFERED_SCORE, "L3", "") for c in cands)
+            assert kp.judge(st, cands) is None and kp.judge(st, cands[:1]) is None
+
+
+def test_an_l3_route_never_guides_as_identified_a_fiche_the_person_did_not_pick():
+    decision = choice_decision(["KB0120", "KB0200"], ["KB0120", "KB0200"], "route_l3_semantic_close_choice")
+    engine = Engine(decision, mode="semantic", interpreted=None, route=route("L3"))
+    r = advance(new(), ev("problème de compte", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
+    assert r.state.phase == Phase.LOCATE and r.state.guide is None
+    assert [(c.score, c.route_level) for c in r.state.choices] == [(OFFERED_SCORE, "L3"), (OFFERED_SCORE, "L3")]
+    # one offered fiche alone is not "strong" either: the person confirms it
+    one = Engine(choice_decision(["KB0120"], ["KB0120"], "route_l3_semantic_clear_lead"), mode="semantic",
+                 route=route("L3"))
+    alone = advance(new(), ev("x", kind="created"), with_engine(fallback(), one, "client-s"), T0).state
+    assert alone.phase == Phase.LOCATE and alone.guide is None and len(alone.choices) == 1
+    # the clarification rounds end on the closest fiche: marked approximate, carrying no route
+    st = advance(r.state, ev("toujours bloqué"), with_engine(fallback(), engine, "client-s"), T0).state
+    last = advance(st, ev("encore"), with_engine(fallback(), engine, "client-s"), T0).state
+    assert last.phase == Phase.GUIDING and last.guide.approximate and last.guide.route_level == ""
+    # a pick is the person's: guided, never labelled by a route
+    picked = advance(r.state, ev(action="pick:2"), with_engine(fallback(), engine, "client-s"), T0).state.guide
+    assert picked.parent_id == "kefind:r1:KB0200" and not picked.approximate
+    assert (picked.route_level, picked.route_key) == ("", "")
+
+
+def test_an_l2_choice_offers_every_validated_fiche_alike_and_a_pick_carries_no_route():
+    decision = choice_decision(["KB0233", "KB0300"], ["KB0233", "KB0300"], "route_l2_choice")
+    engine = Engine(decision, mode="degraded", interpreted=None, route=route("L2", key=KEYS["L2"]))
+    r = advance(new(), ev("attribuer une ligne", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
+    assert r.state.phase == Phase.LOCATE and r.state.guide is None
+    assert [(c.parent_id, c.score, c.route_level) for c in r.state.choices] == [
+        ("kefind:r1:KB0233", OFFERED_SCORE, "L2"), ("kefind:r1:KB0300", OFFERED_SCORE, "L2")]
+    assert all(c.route_key == "" for c in r.state.candidates)  # only THE fiche carries the key that decided
+    assert KefindPorts(engine, "client-s", fallback()).judge(r.state, r.state.candidates) is None
+    g = advance(r.state, ev(action="pick:1"), with_engine(fallback(), engine, "client-s"), T0).state.guide
+    assert g.parent_id == "kefind:r1:KB0233" and (g.route_level, g.route_key) == ("", "")
+
+
+def test_every_fiche_of_a_routed_choice_is_offered_not_only_its_options():
+    decision = choice_decision(["KB0120"], ["KB0120", "KB0200", "KB0300"], "route_l2_choice")
+    engine = Engine(decision, route=route("L2"))
+    cands = KefindPorts(engine, "client-s", fallback()).candidates(engine.find("client-s", "x"), new())
+    assert [(split_parent(c.parent_id)[1], c.reranker_score) for c in cands] == [
+        ("KB0120", OFFERED_SCORE), ("KB0200", OFFERED_SCORE), ("KB0300", OFFERED_SCORE)]
+    plain = Engine(decision)  # unrouted, the same question keeps its other fiches below its option, as before
+    assert [c.reranker_score for c in KefindPorts(plain, "client-s", fallback()).candidates(
+        plain.find("client-s", "x"), new())] == [OFFERED_SCORE, OTHER_SCORE, OTHER_SCORE]
+
+
+def test_l4_opens_the_free_answer_without_ever_asking_the_search_index():
+    for mode in (None, "words", "degraded", "semantic"):
+        asked = []
+        engine = Engine({"kind": "abstain", "reason": "text_only_weak", "fiches": []}, mode=mode, interpreted=False,
+                        route=route("L4"))
+        r = advance(new(), ev("la machine à café fuit", kind="created"),
+                    with_engine(fallback(asked=asked), engine, "client-s"), T0)
+        assert r.state.phase == Phase.OPEN and r.state.guide is None and r.state.candidates == [], mode
+        assert asked == [] and r.outbox[-1]["kind"] == "answer", mode
+
+
+def test_a_routed_answer_with_nothing_left_to_offer_opens_the_free_answer_not_the_index():
+    asked = []
+    engine = Engine(exact_decision(level="L1"), mode="words", route=route("L1", "KB0233", KEYS["L1"]))
+    st = advance(new(), ev("attribuer ligne teams", kind="created"),
+                 with_engine(fallback(asked=asked), engine, "client-s"), T0).state
+    assert st.phase == Phase.GUIDING
+    r = advance(st, ev(action="wrong_fiche"), with_engine(fallback(asked=asked), engine, "client-s"), T0)
+    assert r.state.phase == Phase.OPEN and "kefind:r1:KB0233" in r.state.rejected_parent_ids and asked == []
+    # a routed answer whose run cannot be pinned has no candidate either: still never the index
+    no_run = KefindPorts(Engine(exact_decision(level="L0"), run_id=None, route=route("L0", "KB0233", "233")),
+                         "client-s", fallback(asked=asked))
+    assert no_run.retrieve(asked_state("KB0233")) == [] and asked == []
+
+
+def test_a_route_naming_another_fiche_than_the_decision_is_offered_not_shown():
+    engine = Engine({**exact_decision("KB0233", "L1"), "fiches": ["KB0233", "KB0300"]},
+                    route=route("L1", "KB0300", KEYS["L1"]))
+    kp = KefindPorts(engine, "client-s", fallback())
+    st = asked_state()
+    cands = kp.retrieve(st)
+    assert [(split_parent(c.parent_id)[1], c.reranker_score, c.route_key) for c in cands] == [
+        ("KB0233", OFFERED_SCORE, ""), ("KB0300", OFFERED_SCORE, "")]
+    assert kp.judge(st, cands) is None
+    r = advance(new(), ev("x", kind="created"), with_engine(fallback(), engine, "client-s"), T0)
+    assert r.state.phase == Phase.LOCATE and r.state.guide is None
+
+
+def test_an_unknown_or_malformed_route_is_never_exact_and_never_the_index():
+    asked = []
+    for bad in ({"level": "L9", "fiche_id": "KB0233"}, {"level": 1}, {"level": "l1", "fiche_id": "KB0233"}, {},
+                "L1", ["L1"], 0):
+        kp = KefindPorts(Engine(exact_decision(level="L1"), route=bad), "client-s", fallback(asked=asked))
+        st = asked_state()
+        cands = kp.retrieve(st)
+        assert [(c.reranker_score, c.route_level, c.route_key) for c in cands] == [(OFFERED_SCORE, "", "")], bad
+        assert kp.judge(st, cands) is None, bad
+        abstain = KefindPorts(Engine({"kind": "abstain", "reason": "x", "fiches": []}, route=bad), "client-s",
+                              fallback(asked=asked))
+        assert abstain.retrieve(st) == [], bad
+    assert asked == []
+
+
+def test_a_null_route_is_exactly_an_answer_without_one():
+    decisions = [fiche_decision(), question_decision(),
+                 {"kind": "fiche", "reason": "text_only_close_title_match", "fiche_id": "KB0120", "fiches": ["KB0120"]},
+                 {"kind": "abstain", "reason": "text_only_weak", "fiches": []}]
+    for decision in decisions:
+        for mode in (None, "semantic", "degraded", "words"):
+            for interpreted in (None, True, False):
+                seen = []
+                for r in (_NO_ROUTE, None):
+                    kp = KefindPorts(Engine(decision, mode=mode, interpreted=interpreted, route=r), "client-s",
+                                     fallback())
+                    st = asked_state()
+                    cands = kp.retrieve(st)
+                    assert all((c.route_level, c.route_key) == ("", "") for c in cands)
+                    seen.append(([c.model_dump() for c in cands], kp.judge(st, cands)))
+                assert seen[0] == seen[1], (decision["reason"], mode, interpreted)
+
+
+def test_a_routed_choice_made_by_words_after_a_failed_interpretation_is_offered_not_sent_to_the_index():
+    asked = []
+    decision = {"kind": "question", "reason": "text_only_close_choice", "fiche_id": None, "asks": "fiche",
+                "options": [{"fiche_id": "KB0120"}, {"fiche_id": "KB0200"}], "fiches": ["KB0120", "KB0200"]}
+    engine = Engine(decision, interpreted=False, mode="degraded", route=route("L3"))
+    r = advance(new(), ev("mot de passe expiré", kind="created"),
+                with_engine(fallback(asked=asked), engine, "client-s"), T0)
+    assert r.state.phase == Phase.LOCATE and [c.route_level for c in r.state.choices] == ["L3", "L3"]
+    assert asked == []
+
+
+def test_the_route_key_is_collapsed_capped_and_always_text():
+    for key, want in (("  attribuer \n ligne\tteams ", "attribuer ligne teams"), (233, "233"), (None, ""),
+                      ("x" * 500, "x" * 200), ("<b>« ligne »</b>", "<b>« ligne »</b>")):
+        engine = Engine(exact_decision(level="L1"), route=route("L1", "KB0233", key))
+        cands = KefindPorts(engine, "client-s", fallback()).candidates(engine.find("client-s", "x"), new())
+        assert cands[0].route_key == want, key
+
+
+def test_routed_candidates_are_deterministic_and_keep_the_engine_order():
+    decision = choice_decision(["KB0300", "KB0120"], ["KB0120", "KB0200", "KB0300"], "route_l2_choice")
+
+    def once():
+        engine = Engine(decision, route=route("L2"))
+        return [c.model_dump_json() for c in
+                KefindPorts(engine, "client-s", fallback()).candidates(engine.find("client-s", "x"), new())]
+    assert once() == once()
+    assert [KbCandidate.model_validate_json(c).parent_id for c in once()] == [
+        "kefind:r1:KB0300", "kefind:r1:KB0120", "kefind:r1:KB0200"]
+
+
+def test_route_helpers():
+    assert route_of({}) is None and route_of({"route": None}) is None and route_of(None) is None
+    assert route_of({"route": "L1"}) == {} and route_of({"route": {"level": "L0"}}) == {"level": "L0"}
+    assert route_level({"level": "L2"}) == "L2" and route_level({"level": "L5"}) == "" and route_level(None) == ""
+    exact = {"decision": {"kind": "fiche", "fiche_id": "F"}, "mode": "degraded"}
+    assert shown_fiche(exact) is None                                  # unrouted: an outage demotes the fiche
+    assert shown_fiche({**exact, "mode": "semantic"}) == "F"
+    assert shown_fiche({**exact, "route": {"level": "L0"}}) == "F"     # a route naming no fiche: the decision's
+    assert shown_fiche({**exact, "route": {"level": "L0", "fiche_id": None}}) is None
+    assert shown_fiche({**exact, "route": {"level": "L3", "fiche_id": "F"}}) is None
+    assert shown_fiche({**exact, "route": {"level": "L4", "fiche_id": "F"}}) is None
+    assert shown_fiche({"decision": {"kind": "question", "fiche_id": "F"}, "route": {"level": "L1", "fiche_id": "F"}}) is None
+    assert shown_fiche({"decision": {"kind": "fiche", "fiche_id": ""}, "route": {"level": "L1"}}) is None
+    assert shown_fiche(None) is None and shown_fiche({"route": {"level": "L1"}}) is None

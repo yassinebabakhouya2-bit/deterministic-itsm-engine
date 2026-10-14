@@ -2,6 +2,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestration"))
 
 from guide.contracts import Event, GuideState, KbCandidate, Phase
@@ -288,3 +290,80 @@ def test_invalid_action_is_rejected():
     import pytest
     with pytest.raises(Exception):
         Event(event_id="1", kind="reply", action="escalate")
+
+
+# ------------------------------------------------------------- routing chantier: route fields
+def routed(pid, score, level, key=""):
+    return KbCandidate(parent_id=pid, title=pid, reranker_score=score, route_level=level, route_key=key)
+
+
+def test_a_guide_taken_as_exact_carries_the_route_of_its_candidate():
+    p = ports([routed("A", 4.0, "L1", "attribuer ligne teams")])
+    g = advance(new(), ev("attribuer ligne teams", kind="created"), p, T0).state.guide
+    assert (g.route_level, g.route_key, g.approximate) == ("L1", "attribuer ligne teams", False)
+    j = ports([routed("A", 2.2, "L0", "233"), routed("B", 2.1, "L0")], judge=lambda st, c: "A")  # the judge's pick
+    assert advance(new(), ev("x", kind="created"), j, T0).state.guide.route_level == "L0"
+
+
+def test_a_picked_or_approximate_guide_never_carries_a_route():
+    p = ports([routed("A", 1.5, "L2"), routed("B", 1.5, "L2")])
+    r = advance(new(), ev("x", kind="created"), p, T0)
+    assert r.state.guide is None and [c.route_level for c in r.state.choices] == ["L2", "L2"]
+    assert r.outbox[-1]["kind"] == "choose" and [c["route_level"] for c in r.outbox[-1]["choices"]] == ["L2", "L2"]
+    picked = advance(r.state, ev(action="pick:2"), p, T0).state.guide
+    assert picked.parent_id == "B" and (picked.route_level, picked.route_key) == ("", "")
+    st = advance(r.state, ev("b"), p, T0).state
+    approx = advance(st, ev("c"), p, T0).state.guide
+    assert approx.approximate and (approx.route_level, approx.route_key) == ("", "")
+
+
+def test_choices_keep_the_route_level_of_their_candidates_and_unrouted_ones_stay_empty():
+    p = ports([routed("A", 1.5, "L3"), cand("B", 1.4)])
+    choices = advance(new(), ev("x", kind="created"), p, T0).state.choices
+    assert [(c.parent_id, c.route_level) for c in choices] == [("A", "L3"), ("B", "")]
+
+
+def test_an_unrouted_guide_is_byte_identical_to_the_one_built_before_routing():
+    # pinned from the code before the route fields existed: same scenario, same guide_sha256
+    g = advance(new(), ev("reset mot de passe", kind="created"), ports(), T0).state.guide
+    assert g.guide_sha256 == "7369006844004b81e87e9a41fab63b5ab504c8a541c61ff89eb329ae4889c11e"
+    assert (g.route_level, g.route_key) == ("", "")
+
+
+def test_the_route_is_part_of_the_guide_hash_when_there_is_one():
+    plain = advance(new(), ev("x", kind="created"), ports([cand("A", 4.0)]), T0).state.guide
+    l0 = advance(new(), ev("x", kind="created"), ports([routed("A", 4.0, "L0", "233")]), T0).state.guide
+    l1 = advance(new(), ev("x", kind="created"), ports([routed("A", 4.0, "L1", "233")]), T0).state.guide
+    assert len({plain.guide_sha256, l0.guide_sha256, l1.guide_sha256}) == 3
+
+
+def test_a_session_stored_before_the_route_fields_existed_stays_readable():
+    from guide.contracts import Choice, GuideState as State
+    p = ports([routed("A", 2.2, "L2"), routed("B", 2.1, "L2")])
+    st = advance(new(), ev("x", kind="created"), p, T0).state
+    st.guide = advance(new(), ev("x", kind="created"), ports([routed("A", 4.0, "L1", "k")]), T0).state.guide
+    stored = st.model_dump(mode="json")
+
+    def strip(obj):
+        if isinstance(obj, dict):
+            return {k: strip(v) for k, v in obj.items() if k not in ("route_level", "route_key")}
+        return [strip(v) for v in obj] if isinstance(obj, list) else obj
+    old = State.model_validate(strip(stored))
+    assert [c.route_level for c in old.candidates] == ["", ""] and [c.route_level for c in old.choices] == ["", ""]
+    assert (old.guide.route_level, old.guide.route_key) == ("", "")
+    assert State.model_validate_json(st.model_dump_json()) == st     # and a routed session round-trips
+    with pytest.raises(Exception):                                     # still strict: no unknown field
+        Choice.model_validate({"parent_id": "A", "title": "A", "score": 1.0, "route": "L1"})
+    with pytest.raises(Exception):                                     # and bounded
+        Choice.model_validate({"parent_id": "A", "title": "A", "score": 1.0, "route_level": "L" * 9})
+
+
+def test_routed_replay_is_deterministic():
+    def run():
+        p = ports([routed("A", 1.5, "L2"), routed("B", 1.5, "L2")])
+        st = new()
+        for e in [Event(event_id="1", kind="created", text="x"), Event(event_id="2", kind="reply", action="pick:1"),
+                  Event(event_id="3", kind="reply", action="start")]:
+            st = advance(st, e, p, T0).state
+        return st.model_dump_json()
+    assert run() == run()

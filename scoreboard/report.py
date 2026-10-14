@@ -6,13 +6,17 @@ import datetime as dt
 from itertools import combinations
 
 from .metrics import (
+    EXACT_LEVELS,
     Calibration,
     EngineSummary,
     Rate,
+    by_route,
     calibrate,
     canonical,
     compare,
     is_exact,
+    is_wrong_exact,
+    route_level,
     shown,
     summarize,
     ticket_key,
@@ -91,6 +95,36 @@ def _sweep_rows(calibration: Calibration) -> list:
     return [rows[i] for i in sorted(picked)]
 
 
+def _route_section(results: dict[str, list[dict]], routes: dict[str, dict]) -> list[str]:
+    """Per decision level, for each engine that routed at least one question (first run)."""
+    lines = [
+        "## By route",
+        "",
+        "How each question was decided on the first run: L0-L2 show a fiche a person validated, as exact; "
+        "L3 offers fiches close in meaning; L4 abstains; none: not routed. Right fiche first counts the "
+        "first fiche shown or offered.",
+        "",
+    ]
+    for name, levels in routes.items():
+        lines += [
+            f"### {cell(name)}",
+            "",
+            "| Level | Tickets | With a fiche | Fiche shown | Exact fiche @1 | Wrong exact | Right fiche first | Asked | Abstained |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for level, c in levels.items():
+            wrong = str(c["wrong_exact"]) if level in EXACT_LEVELS else "–"
+            lines.append(
+                f"| {cell(level)} | {c['n']} | {c['with_fiche']} | {c['shown']} | {fmt_rate(Rate(c['exact'], c['with_fiche']))} | "
+                f"{wrong} | {fmt_rate(Rate(c['right_first'], c['with_fiche']))} | {c['questions']} | {c['abstain']} |"
+            )
+        lines.append("")
+        wrong_ids = sorted({r["ticket_id"] for r in canonical(results[name]) if is_wrong_exact(r)})
+        if wrong_ids:
+            lines += [f"**{len(wrong_ids)} fiche(s) shown as exact at L0-L2 are wrong:** {cell(', '.join(wrong_ids))}.", ""]
+    return lines
+
+
 def build_report(results: dict[str, list[dict]], prices, max_wrong: float, manifests: dict[str, dict] | None = None,
                  misses_per_engine: int = 30, tickets_text: dict[str, str] | None = None) -> tuple[str, dict]:
     manifests = manifests or {}
@@ -100,6 +134,8 @@ def build_report(results: dict[str, list[dict]], prices, max_wrong: float, manif
     calibrations = {name: calibrate(results[name], max_wrong) for name in names}
     comparisons = [compare(a, results[a], b, results[b]) for a, b in combinations(names, 2)]
     warnings = _warnings(results, manifests)
+    # only engines that routed something: without a route anywhere, the report stays what it was
+    routes = {name: by_route(results[name]) for name in names if any(r.get("route") for r in results[name])}
 
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     first = summaries[names[0]]
@@ -176,6 +212,9 @@ def build_report(results: dict[str, list[dict]], prices, max_wrong: float, manif
             )
         lines += ["", "Only the tickets where the two engines disagree count in the test.", ""]
 
+    if routes:
+        lines += _route_section(results, routes)
+
     calibrated = [(name, cal) for name, cal in calibrations.items() if cal is not None]
     if calibrated:
         lines += ["## Abstention threshold", ""]
@@ -234,6 +273,8 @@ def build_report(results: dict[str, list[dict]], prices, max_wrong: float, manif
             expected = " | ".join(record["expected"]) if record["expected"] else "none"
             fiche = shown(record)
             decision = f"fiche {fiche}" if fiche else record["kind"]
+            if route_level(record):
+                decision += f" · {route_level(record)}"
             if record.get("error"):
                 decision = f"error: {short(record['error'], 60)}"
             score = "" if record.get("score") is None else f"{float(record['score']):.4g}"
@@ -264,4 +305,6 @@ def build_report(results: dict[str, list[dict]], prices, max_wrong: float, manif
         "warnings": warnings,
         "manifests": manifests,
     }
+    if routes:
+        summary["by_route"] = routes
     return "\n".join(lines).rstrip() + "\n", summary
