@@ -185,8 +185,8 @@ application ids (`teams`, not "Microsoft Teams"), the ids runtime entity extract
 application is proven by a verbatim quote naming it, or by kecore's own reading of the fiche;
 otherwise it is kept as `apps_inferred` and the proposal needs a person. `confusable_with` is not
 written by pass A (the model sees one fiche): it comes from the collision checks of passes B/C. Run by
-every kecore run since 2026-10-09, before `publish` (runbook §19.16); nothing reads the proposals for
-routing yet.
+every kecore run since 2026-10-09, before `publish` (runbook §19.16); since 2026-10-14 its proposals
+feed the review (prefilled forms) and block what they propose until a person decides (below).
 
 **Runtime routing**, first level that decides wins; every answer carries `route`, the rule, the
 alias or key that decided, and the routing tables' sha256:
@@ -211,6 +211,43 @@ a human decision can force a fiche back in. Implemented in `kecore/exclusion.py`
 `report` phase (runbook §19.14). The defaults narrowed from the first draft (`LIBRE`, `A REUTILISER`,
 `OBSOLETE`, `NE PAS UTILISER`, 200 characters) once measured: a bare `LIBRE` or `OBSOLETE` matches real
 titles, and 200 characters excluded a real two-line policy fiche of the demo KB.
+
+**What is built (2026-10-14, runbook §19.20; code map in `kecore_func/README.md`).**
+
+- Two phases. Phase 1 (L0 + L1) needs neither a taxonomy nor pass C: a person validates a fiche's
+  aliases (a reference question promoted word for word, pass A/C proposals ticked, or typed) and the
+  error codes it alone carries. Phase 2 adds L2: pass B (`kefind/taxonomy.py`) proposes a closed taxonomy
+  from the pass-A intents, a person edits and freezes it (versioned, sha256), pass C (`kefind/assign.py`)
+  assigns each fiche one intent of it plus 2-4-word core aliases, a person validates (intent, application).
+- Decisions (`kefind/review.py`, table `kefindreview`) are keyed by (fiche, sha256 of the fiche's
+  EXTRACTED text, before boilerplate removal -- adding other documents never sends a fiche back to
+  review). A decision whose fiche changed is "stale": it stops routing until a person decides again or
+  carries it forward (re-checked in full).
+- Tables (`kefind/routing.py`) are built from every stored decision by a routing run (or a kecore run's
+  routing step, before publish), with these rules beyond the table above: only routable fiches (ranked,
+  not a duplicate, not superseded); a rejected fiche never routes, even by its number; L0 codes only when
+  a person validated them; L1 takes the alias's application into account, allows at most one question
+  word beyond the alias (`L1_MAX_UNCOVERED`), and must agree with any identifier the question cites; an
+  alias or (intent, application) a fiche still under review proposes -- or validated before its text
+  changed -- blocks instead of letting another fiche look unique, and a fiche with no pass-C answer blocks
+  every L2 key; an intent whose meaning changed at a refreeze (fingerprint) is skipped; at L2 only an
+  exact (intent, application) key is exact, everything else is offered. Every table carries the code and
+  normalization versions, `content_sha256` (what routes) and `kb_sha256` (the map it routes on).
+- Runtime (`kefind/route.py`): one router for `/find`, the scoreboard and the tickets run. Without active
+  tables it answers exactly as before (`route: null`). With them: L0 -> L1 -> L2 (one recorded mapping
+  call; the question's own application read by code wins over the model's) -> L3 today's engine, its
+  fiche downgraded to a proposal -> L4. The Diagnostic shows L0-L2 as identified, L2/L3 choices as
+  proposals, L4 as the open answer.
+- Gate: the scoreboard measures today's engine and the routed one on the same frozen questions; the
+  verdict is `passed` only with no wrong fiche shown at L0-L2 (over every question, reference questions a
+  reviewer had on screen included), the right fiche first at least as often as today's engine on the
+  questions not seen in review (McNemar reported), at least 30 such questions, and no degraded decision
+  or transient model failure; else `failed`, `insufficient` or `invalid`.
+- Activation: by a person, only on tables built for the run `/find` serves and whose gate passed (or was
+  `insufficient` and explicitly accepted with a reason, recorded). A sticky kill switch turns routing off
+  everywhere within a minute. A later kecore run whose tables have the same `content_sha256` and
+  `kb_sha256` carries the activation over; otherwise it is served without routing until measured and
+  activated again.
 
 **Order and gate**: ground truth first (30-50 real technician questions with their fiche in
 `/labels`, including "comment attribuer une ligne teams" -> KB0233 and questions no fiche answers --
