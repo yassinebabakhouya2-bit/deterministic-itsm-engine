@@ -1,6 +1,6 @@
 import unittest
 
-from kefind.routing import NORMALIZATION_VERSION, STOP_WORDS, fold_token, route_tokens, token_key
+from kefind.routing import NORMALIZATION_VERSION, STOP_WORDS, alias_problem, fold_token, ignored_characters, route_tokens, token_key
 
 
 class RouteTokensTest(unittest.TestCase):
@@ -30,6 +30,15 @@ class RouteTokensTest(unittest.TestCase):
     def test_fold_rule(self):
         self.assertEqual([fold_token(t) for t in ("comptes", "acces", "access", "virus", "bloquee", "bus")],
                          ["compte", "acce", "access", "virus", "bloque", "bus"])
+
+    def test_an_alias_never_relies_on_a_character_routing_ignores(self):
+        self.assertEqual(token_key("imprimante étage 3"), token_key("imprimante étage 4"))
+        self.assertEqual(ignored_characters("imprimante étage 3 à l'accueil"), ["3"])
+        self.assertIn("« 3 »", alias_problem("imprimante étage 3"))
+        self.assertIn("« h »", alias_problem("mapper lecteur H"))
+        self.assertEqual(alias_problem("mot de passe"), "moins de 2 mots utiles au routage" if len(route_tokens("mot de passe")) < 2 else None)
+        self.assertEqual(alias_problem("comment bloquer"), "moins de 2 mots utiles au routage")
+        self.assertIsNone(alias_problem("attribuer une ligne Teams"))
 
     def test_frozen(self):
         # changing the stop words or the rule changes what a person validated: bump the version instead
