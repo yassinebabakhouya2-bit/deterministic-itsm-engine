@@ -3461,6 +3461,19 @@ Non activé ici.
 **1. Déployer** : fusionner la branche dans `main` puis le bloc 1 de §19.19 (Web App ET Function) ;
 aucun run ne doit tourner. Attendu : « Commit to deploy: … », la Function répond le commit.
 
+```powershell
+git fetch origin; git checkout main; git pull --ff-only
+git merge --no-ff --no-edit origin/claude/kecore-variantes-selection-wpu4ro
+git push origin main
+```
+
+`--no-edit` est nécessaire : sans lui, Git ouvre le message de fusion dans l'éditeur Windows, et le
+2026-10-15 cet éditeur l'a enregistré sur une seule ligne. Les lignes « # Please enter a commit
+message… » n'ont alors pas pu être retirées et sont restées dans le titre du commit de fusion
+`9b91a20`. C'est sans effet sur le code ; ce commit n'a pas été réécrit, car `main` est déjà poussé. Si
+la fusion reste en suspens (« You have not concluded your merge (MERGE_HEAD exists) »), la conclure avec
+`git commit --no-edit`.
+
 **2. Premier run de routage sur le run publié** (phase 1 : proposition de taxonomie + tables L0 ; rien
 n'est encore validé, donc rien ne route ; sans mesure) :
 
@@ -3552,3 +3565,90 @@ report : nouvelle mesure et nouvelle activation après un tel run kecore ; un re
 revue fait perdre les alias tapés dans le formulaire ; la reprise d'un bail périmé compare les octets mais
 n'utilise pas d'ETag (deux reprises exactement simultanées d'un bail périmé pourraient encore lancer deux
 runs de routage à la fois).
+
+### 19.21 Déploiement de §19.20 refusé : abonnement Azure désactivé, en lecture seule (2026-10-15, non résolu)
+
+**Symptôme.** Le bloc 1 de §19.19 a été lancé le 2026-10-15 vers 01:40, heure locale, sur `main` `9b91a20`
+(fusion de §19.20). `deploy-webapp.ps1` a fabriqué le paquet (`deploy-2026-10-15-013948.zip`), puis
+`az webapp deploy` a été refusé dès la requête de déploiement :
+
+```
+(ReadOnlyDisabledSubscription) The subscription '441a343e-65c0-4271-a882-b5d6654c7a96' is disabled and
+therefore marked as read only. You cannot perform any write actions on this subscription until it is re-enabled.
+```
+
+Le script a levé son erreur habituelle (« it can be a real failure or a failed status poll… »). Ici, c'est
+un vrai refus : Azure a rejeté l'écriture avant tout déploiement. Les conséquences :
+
+- **Rien n'a été déployé.** La Web App garde le commit qu'elle servait déjà.
+- **`deploy-kecore-function.ps1` n'a pas tourné** : le `throw` a arrêté le bloc. La Function n'a donc pas
+  reçu les routes de routage de §19.20.
+- **Aucune étape de §19.20 au-delà du point 1 n'est faite** : pas de run de routage, de revue, de mesure
+  ni d'activation.
+
+**Cause.** C'est l'abonnement de §12 (tenant KnowledgeEngineV9655, créé le 2026-09-26) qui est désactivé.
+Ce n'est pas un défaut du code ni des scripts. La raison exacte n'est pas encore connue : elle s'affiche
+dans le bandeau de la page « Vue d'ensemble » de l'abonnement, dans le Portail. Raisons possibles, d'après
+la documentation Microsoft :
+
+- crédit gratuit épuisé, ou fin des 30 jours d'essai ;
+- limite de dépense atteinte (l'abonnement reste alors désactivé jusqu'à la période de facturation
+  suivante) ;
+- facture impayée ou plafond de la carte bancaire atteint ;
+- annulation par l'administrateur du compte ;
+- blocage pour activité suspecte, comme pour l'ancien abonnement le 2026-09-26 (§10.10, §12).
+
+**État de l'abonnement** (lecture seule ; `--refresh` relit l'état chez Azure au lieu du cache du dernier
+`az login`) :
+
+```powershell
+$sub = '441a343e-65c0-4271-a882-b5d6654c7a96'
+az account list --refresh --query "[?id=='$sub'].{nom:name, etat:state, tenant:tenantId}" -o table
+```
+
+`Disabled` : toujours bloqué. `Enabled` : réactivé.
+
+**Correction : étape manuelle dans le Portail Azure, par le propriétaire ou l'administrateur du compte.**
+Pas de commande CLI fiable pour la faire. Dans « Abonnements », ouvrir l'abonnement et lire le bandeau,
+puis agir selon la raison :
+
+- « Réactiver » quand le bouton est proposé ;
+- passer au paiement à l'utilisation, ou retirer la limite de dépense (fin d'essai, crédit épuisé, limite
+  atteinte) ;
+- régler la facture ou changer de moyen de paiement ;
+- ouvrir une demande au support Azure (activité suspecte).
+
+Tant que l'abonnement est désactivé :
+
+- Azure refuse toute écriture ;
+- les services peuvent être arrêtés (en 2026-09, la Web App de l'ancien abonnement répondait « 403 - This
+  web app is stopped ») ;
+- le stockage passe en lecture seule ;
+- les données ne sont gardées qu'un temps limité avant suppression définitive. La durée dépend du type
+  d'abonnement et n'est pas confirmée ici.
+
+Il faut donc réactiver vite, ou décider de l'abandonner comme en §12, qui sait tout reconstruire depuis
+le dépôt sauf les données (runs kecore, décisions de revue, étiquettes).
+
+**Reprendre après réactivation.** Il faut repartir de zéro, car le passage par l'état désactivé a laissé
+des effets de bord en 2026-09 (§10.10). D'abord, vérifier l'état et les services :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+$ErrorActionPreference = 'Stop'
+$state = az account list --refresh --query "[?isDefault].state" -o tsv
+if ($state -ne 'Enabled') { throw "abonnement Azure dans l'état '$state', pas Enabled : voir §19.21" }
+az webapp show -n app-knowledgeengine3-v9 -g rg-knowledgeengine-v9 --query state -o tsv
+az functionapp show -n fn-kecore-knowledgeengine3-v9 -g rg-knowledgeengine-v9 --query state -o tsv
+```
+
+Ensuite, selon le résultat :
+
+- **Les deux services répondent `Running`** : relancer tel quel le bloc 1 de §19.19. Il refabrique le
+  paquet ; le zip du 2026-10-15 est ignoré par git et peut être supprimé.
+- **L'un des deux répond `Stopped`** : le démarrer d'abord (`az webapp start` ou
+  `az functionapp start`, avec les mêmes `-n`/`-g`), puis relancer le bloc 1.
+
+Puis reprendre §19.20 au point 2. Les Logic Apps d'ingestion échouent pendant la désactivation : relire
+leur historique d'exécutions depuis la dernière exécution réussie avant de conclure à un autre défaut,
+comme en §10.10 (la date de la désactivation n'est pas connue).
