@@ -582,6 +582,17 @@ class RoutingOrchestrationTest(unittest.TestCase):
         self.assertNotIn("routing", dict(ctx.calls)["kecore_publish"]["summary"])
         self.assertNotIn("catalog", out)
 
+    def test_the_catalog_activity_follows_whatever_map_is_published_now(self):
+        seen = []
+        tables = {"kefindfiches": "fiches table"}
+        with unittest.mock.patch.object(self.fa, "storage", lambda: "storage"), \
+                unittest.mock.patch.object(self.fa, "table", lambda name=None: tables[name]), \
+                unittest.mock.patch.object(self.fa.tickets_svc, "catalog",
+                                           lambda storage, table, p: seen.append((storage, table, p)) or {"fiches": 3}):
+            out = self.fa.kecore_catalog(self.kecore_payload())
+        self.assertEqual(out, {"fiches": 3})
+        self.assertEqual(seen, [("storage", "fiches table", {"client": "client-s", "run_id": None})])
+
     def test_a_routing_run_assigns_in_waves_builds_measures_then_finishes(self):
         prepared = lambda p: {"client": p["client"], "run_id": "r7", "build_id": p["build_id"], "fiches": 5,  # noqa: E731
                               "taxonomy": {"version": 1, "sha256": "t"}, "needs_b": False, "needs_c": True}
@@ -823,6 +834,40 @@ class RoutingRoutesTest(unittest.TestCase):
                                  dict(freeze, intents=self.fx.FROZEN[1:], orphans_ok=True))
         self.assertEqual((status, data["version"]), (200, 2))
 
+    def test_a_concurrent_freeze_and_a_damaged_file_have_their_own_status(self):
+        fx, route = self.fx, "kecore/review/taxonomy"
+        freeze = {"client": "client-s", "by": "Yassine", "source_build": "", "intents": fx.FROZEN}
+        self.assertEqual(self.call(self.fa.kecore_review_taxonomy, "POST", route, freeze)[0], 200)
+        self.storage.write(fx.CONTAINER, "taxonomy.history/v2.json", b"{}")         # another freeze landed first
+        status, data = self.call(self.fa.kecore_review_taxonomy, "POST", route, dict(freeze, intents=fx.FROZEN[:1]))
+        self.assertEqual(status, 409)
+        self.assertNotIn("orphans", data)                                           # no confirm box for this one
+        self.assertIn("une autre version", data["error"])
+        status, data = self.call(self.fa.kecore_review_taxonomy, "POST", route, dict(freeze, intents="x"))
+        self.assertEqual(status, 400)
+        taxonomy = json.loads(self.storage.read(fx.CONTAINER, "taxonomy.json"))
+        taxonomy["intents"][0]["label_fr"] = "edited by hand"
+        self.storage.write(fx.CONTAINER, "taxonomy.json", json.dumps(taxonomy).encode())
+        for handler, method, path, body, params in (
+                (self.fa.kecore_review, "GET", "kecore/review", None, {"client": "client-s"}),
+                (self.fa.kecore_review_fiche, "GET", "kecore/review/fiche", None,
+                 {"client": "client-s", "key": fx.fiche_key(fx.TEAMS)}),
+                (self.fa.kecore_review_decision, "POST", "kecore/review/decision", self.decision(fx.TEAMS), None),
+                (self.fa.kecore_review_carry, "POST", "kecore/review/carry",
+                 {"client": "client-s", "by": "Y", "keys": [fx.fiche_key(fx.TEAMS)]}, None),
+                (self.fa.kecore_review_taxonomy, "POST", route, freeze, None)):
+            status, data = self.call(handler, method, path, body, params)
+            self.assertEqual(status, 500, path)
+            self.assertIn("taxonomy.json does not match its sha256", data["error"], path)
+        self.assertEqual(self.fa.kecore_review_decision(request("POST", "kecore/review/decision",
+                                                                dict(self.decision(fx.TEAMS), client="clienta"))
+                                                        ).status_code, 404)                 # no map for clienta yet
+
+    def test_the_routing_status_before_any_run(self):
+        status, data = self.call(self.fa.kecore_routing_status, "GET", "kecore/routing", params={"client": "clienta"})
+        self.assertEqual((status, data["run_id"], data["active"], data["effective"]), (200, None, None, False))
+        self.assertEqual(data["why_not_effective"], "no KB map for this client yet")
+
     def test_activation_and_deactivation(self):
         fx = self.fx
         fx.routing_run(self.storage, self.fa.table("kefindreview"), "b1")
@@ -846,6 +891,43 @@ class RoutingRoutesTest(unittest.TestCase):
         self.assertEqual(self.call(self.fa.kecore_routing_activate, "POST", "kecore/routing/activate",
                                    dict(body, by=""))[0], 400)
 
+    def test_a_deactivation_that_fails_halfway_still_stops_this_instance(self):
+        self.fa._routing_pointers["client-s"] = (0.0, "cached")
+
+        def broken(storage, payload, now):
+            raise OSError("blob service unavailable")
+
+        with unittest.mock.patch.object(self.fa.routing_svc, "deactivate", broken):
+            status, data = self.call(self.fa.kecore_routing_deactivate, "POST", "kecore/routing/deactivate",
+                                     {"client": "client-s", "by": "Yassine"})
+        self.assertEqual(status, 500)
+        self.assertIn("send it again", data["error"])
+        self.assertNotIn("client-s", self.fa._routing_pointers)
+
+    def test_a_routing_run_end_to_end_on_the_real_activities(self):
+        fx = self.fx
+        reviews = self.fa.table("kefindreview")
+        fx.freeze(self.storage, reviews)
+        fx.decide(self.storage, reviews, fx.TEAMS, intent="ATTRIBUER_LIGNE", app="teams", aliases=["attribuer ligne teams"])
+        names = ("routing_prepare", "routing_taxonomy", "routing_assign", "routing_assign_summary", "routing_build",
+                 "routing_finish")
+        with unittest.mock.patch.object(self.fa, "taxonomy_llm", lambda p: fx.taxonomy_llm()), \
+                unittest.mock.patch.object(self.fa, "assign_llm", lambda p: fx.assign_llm()), \
+                unittest.mock.patch.object(self.fa, "_now", lambda: fx.NOW):
+            payload = self.fa.routing_svc.validate_routing_request({"client": "client-s", "measure": False,
+                                                                    "batch_size": 4}, ["client-s"], "b1")
+            ctx = Ctx(payload, {name: getattr(self.fa, name) for name in names})
+            out = drive_throwing(self.fa.routing_run, ctx)
+        self.assertEqual((out["state"], out["error"], out["run_id"], out["assign"]["fiches"]),
+                         ("completed", None, fx.RUN, fx.ROUTABLE))
+        self.assertEqual([c[0] for c in ctx.calls].count("routing_assign"), 4)
+        tables = self.fa.routing_svc.load_tables(self.storage, "client-s", "b1")
+        self.assertEqual(tables.l2, [{"intent": "ATTRIBUER_LIGNE", "app": "teams", "fiches": [fx.TEAMS]}])
+        self.assertEqual(out["tables"], tables.stats)
+        self.assertIsNone(fx.blob(self.storage, "routing/running.json"))
+        self.assertEqual(fx.blob(self.storage, "routing/latest-build.json")["state"], "completed")
+        self.assertEqual(fx.blob(self.storage, "routing/candidate.json")["build_id"], "b1")
+
     def test_a_routing_run_starts_with_the_build_id_as_instance_id_unless_one_is_running(self):
         import asyncio
 
@@ -865,6 +947,354 @@ class RoutingRoutesTest(unittest.TestCase):
         self.assertEqual(len(durable.started), 1)
         bad = asyncio.run(self.fa.kecore_routing_start(request("POST", "kecore/routing/runs", {"client": "x"}), durable))
         self.assertEqual(bad.status_code, 400)
+
+
+class FindRoutingTest(unittest.TestCase):
+    """/kecore/find through the router: only tables a person activated for the served run, never when killed,
+    never tables that are not this map's; a failing route falls back to today's answer."""
+
+    QUESTION = "comment attribuer une ligne teams"
+
+    def setUp(self):
+        import test_routing_service as fixtures
+
+        self.fx = fixtures
+        self.fa = load_app()
+        self.storage = fixtures.write_run(fixtures.Storage())
+        self.tables = {}
+        self.fa.storage = lambda: self.storage
+        self.fa.table = lambda name=None: self.tables.setdefault(name or "tickets", MemoryTable())
+        self.env = unittest.mock.patch.dict("os.environ", {"KECORE_CLIENTS": "client-s,clienta"})
+        self.env.start()
+        self.forget()
+
+    def tearDown(self):
+        self.env.stop()
+        self.fa._kb_map.cache_clear()
+
+    def forget(self):
+        """A fresh instance: no map, pointer, tables or source hashes in memory."""
+        self.fa._kb_map.cache_clear()
+        for cache in (self.fa._routing_pointers, self.fa._routing_tables, self.fa._run_sources, self.fa._configs):
+            cache.clear()
+
+    def reviews(self):
+        return self.fa.table("kefindreview")
+
+    def activate(self, build_id="b1", aliases=("attribuer ligne teams",), **decision):
+        if aliases is not None:
+            self.fx.decide(self.storage, self.reviews(), self.fx.TEAMS, aliases=list(aliases), **decision)
+        self.fx.routing_run(self.storage, self.reviews(), build_id)
+        self.fx.write_gate(self.storage, build_id)
+        response = self.fa.kecore_routing_activate(request("POST", "kecore/routing/activate",
+                                                           {"client": "client-s", "build_id": build_id, "by": "Yassine"}))
+        self.assertEqual(response.status_code, 200)
+
+    def find(self, text=QUESTION, **body):
+        response = self.fa.kecore_find(request("POST", "kecore/find",
+                                               {"client": "client-s", "text": text, "interpret": False, **body}))
+        self.assertEqual(response.status_code, 200)
+        return json.loads(response.get_body())
+
+    def assert_unrouted(self, answer, routing_error):
+        self.assertIsNone(answer["route"])
+        if routing_error is None:
+            self.assertIsNone(answer["routing_error"])
+        else:
+            self.assertIn(routing_error, answer["routing_error"])
+        self.assertFalse(answer["decision"]["reason"].startswith("route_"))
+        self.assertNotEqual(answer["mode"], "routed")
+
+    def test_without_active_tables_find_answers_as_before_with_null_route(self):
+        import kefind_service as finder
+
+        answer = self.find()
+        self.assert_unrouted(answer, None)
+        kbmap = finder.load_map(self.storage, "client-s", self.fx.RUN)
+        today = finder.respond(kbmap, {"text": self.QUESTION, "answers": [], "interpret": False},
+                               config=finder.funnel_config(self.storage, "client-s"))
+        self.assertEqual(answer, json.loads(json.dumps(today)))
+        self.assertEqual(list(answer)[-2:], ["route", "routing_error"])
+        self.fx.decide(self.storage, self.reviews(), self.fx.TEAMS, aliases=["attribuer ligne teams"])
+        self.fx.routing_run(self.storage, self.reviews(), "b1")                # built, measured: still not active
+        self.fx.write_gate(self.storage, "b1")
+        self.forget()
+        self.assert_unrouted(self.find(), None)
+
+    def test_active_tables_on_the_served_run_route_a_validated_alias_exactly(self):
+        self.activate()
+        answer = self.find()
+        route = answer["route"]
+        self.assertEqual((route["level"], route["rule"], route["key"], route["fiche_id"], route["build_id"],
+                          route["run_id"]), ("L1", "alias", "attribuer ligne teams", self.fx.TEAMS, "b1", self.fx.RUN))
+        self.assertEqual(route["tables_sha256"], self.fx.blob(self.storage, "routing/active.json")["tables_sha256"])
+        self.assertEqual((answer["mode"], answer["routing_error"], answer["interpreted"]), ("routed", None, None))
+        decision = answer["decision"]
+        self.assertEqual((decision["kind"], decision["reason"], decision["fiche_id"], decision["designated"]),
+                         ("fiche", "route_l1_alias", self.fx.TEAMS, True))
+        self.assertEqual((answer["fiche"]["fiche_id"], answer["candidates"][0]["fiche_id"]), (self.fx.TEAMS, self.fx.TEAMS))
+        other = self.find("imprimante bourrage papier")                       # no validated route: L3, offered
+        self.assertEqual((other["route"]["level"], other["decision"]["kind"]), ("L3", "question"))
+        self.assertEqual(other["candidates"][0]["fiche_id"], self.fx.PRINTER)
+
+    def test_the_kill_switch_stops_routing_at_once_on_this_instance(self):
+        self.activate()
+        self.assertEqual(self.find()["route"]["level"], "L1")
+        response = self.fa.kecore_routing_deactivate(request("POST", "kecore/routing/deactivate",
+                                                             {"client": "client-s", "by": "Yassine"}))
+        self.assertEqual(response.status_code, 200)
+        self.assert_unrouted(self.find(), "routing is switched off (by Yassine")
+
+    def test_tables_of_another_run_never_route_the_served_one(self):
+        self.activate()
+        self.fx.write_run(self.storage, self.fx.RUN2)                          # a kecore run published, no rebuild
+        self.forget()
+        self.assert_unrouted(self.find(), f"built for run {self.fx.RUN}, not {self.fx.RUN2}")
+        pinned = self.find(run_id=self.fx.RUN)                                # a session still on the activated run
+        self.assertEqual((pinned["route"]["level"], pinned["run_id"]), ("L1", self.fx.RUN))
+
+    def test_a_carried_over_activation_serves_both_runs(self):
+        self.activate()
+        self.fx.write_run(self.storage, self.fx.RUN2)
+        built = self.fx.routing_run(self.storage, self.reviews(), "b2", now=self.fx.LATER)
+        self.assertTrue(built["built"]["carried"])
+        self.forget()
+        served = self.find()
+        self.assertEqual((served["run_id"], served["route"]["build_id"]), (self.fx.RUN2, "b2"))
+        pinned = self.find(run_id=self.fx.RUN)
+        self.assertEqual((pinned["run_id"], pinned["route"]["build_id"]), (self.fx.RUN, "b1"))
+
+    def test_tables_that_are_not_the_activated_ones_or_not_this_code_s_never_route(self):
+        self.activate()
+        active = self.fx.blob(self.storage, "routing/active.json")
+        self.storage.write(self.fx.CONTAINER, "routing/active.json",
+                           json.dumps({**active, "tables_sha256": "0" * 64}).encode("utf-8"))
+        self.forget()
+        self.assert_unrouted(self.find(), "are not the ones activated (sha256)")
+        self.storage.write(self.fx.CONTAINER, "routing/active.json", json.dumps(active).encode("utf-8"))
+        self.forget()
+        with unittest.mock.patch.object(self.fa.routing_svc, "CODE_VERSION", {**self.fa.routing_svc.CODE_VERSION,
+                                                                               "route": 99}):
+            self.assert_unrouted(self.find(), "were built for code")
+        self.forget()
+        self.storage.write(self.fx.CONTAINER, "routing/active.json", json.dumps({**active, "tables_sha256": ""}).encode())
+        self.assert_unrouted(self.find(), "names no tables_sha256")
+        self.forget()
+        self.storage.write(self.fx.CONTAINER, "routing/active.json", json.dumps(active).encode("utf-8"))
+        self.storage.write(self.fx.CONTAINER, "routing/builds/b1/tables.json", b'{"client": "client-s"}')
+        self.assert_unrouted(self.find(), "do not match their sha256")
+        self.storage.write(self.fx.CONTAINER, "routing/active.json", b"{not json")
+        self.forget()
+        self.assert_unrouted(self.find(), "routing/active.json is not valid JSON")
+
+    def test_tables_built_for_another_state_of_the_knowledge_base_never_route(self):
+        self.activate()
+        name = f"runs/{self.fx.RUN}/fiches.jsonl"                            # a fiche's text changed under the run
+        self.storage.write(self.fx.CONTAINER, name, self.storage.read(self.fx.CONTAINER, name).replace(b"SOURCE", b"EDIT", 1))
+        self.forget()
+        self.assert_unrouted(self.find(), "another state of the knowledge base")
+
+    def test_a_route_that_raises_answers_again_without_routing(self):
+        import kefind.route
+
+        self.activate()
+        unrouted = self.find("imprimante bourrage papier")
+        with unittest.mock.patch.object(kefind.route, "match_l1", side_effect=RuntimeError("bug")):
+            answer = self.find("imprimante bourrage papier")
+        self.assert_unrouted(answer, "routing failed (RuntimeError)")
+        self.assertEqual(answer["routing_error"], "routing failed (RuntimeError)")
+        self.forget()
+        with unittest.mock.patch.object(self.fa, "_active_routing", lambda client, run_id, kb_map: (None, None, None)):
+            today = self.find("imprimante bourrage papier")
+        self.assertEqual({k: v for k, v in answer.items() if k != "routing_error"},
+                         {k: v for k, v in today.items() if k != "routing_error"})
+        self.assertEqual(unrouted["route"]["level"], "L3")
+
+    def test_reading_the_routing_state_never_fails_an_answer(self):
+        self.activate()
+        self.forget()
+        with unittest.mock.patch.object(self.fa.routing_svc, "active_for", side_effect=OSError("storage down")):
+            self.assert_unrouted(self.find(), "routing unavailable (OSError: storage down)")
+
+    def test_the_pointer_is_read_at_most_once_a_minute_and_the_tables_once(self):
+        self.activate()
+        self.forget()
+        svc = self.fa.routing_svc
+        clock = [1000.0]
+        with unittest.mock.patch.object(svc, "active_for", wraps=svc.active_for) as pointer, \
+                unittest.mock.patch.object(svc, "load_tables", wraps=svc.load_tables) as loads, \
+                unittest.mock.patch.object(svc, "source_hashes", wraps=svc.source_hashes) as hashes, \
+                unittest.mock.patch.object(self.fa.time, "monotonic", lambda: clock[0]):
+            for _ in range(3):
+                self.assertEqual(self.find()["route"]["level"], "L1")
+            self.assertEqual((pointer.call_count, loads.call_count, hashes.call_count), (1, 1, 1))
+            # another instance deactivated: this one still routes for at most a minute...
+            self.storage.write(self.fx.CONTAINER, "routing/kill.json", json.dumps(
+                {"killed": True, "by": "Yassine", "at": self.fx.NOW}).encode("utf-8"))
+            clock[0] += 59
+            self.assertEqual(self.find()["route"]["level"], "L1")
+            clock[0] += 2                                                     # ...then reads the switch again
+            self.assert_unrouted(self.find(), "routing is switched off")
+            self.assertEqual(pointer.call_count, 2)
+            self.storage.write(self.fx.CONTAINER, "routing/kill.json", json.dumps({"killed": False}).encode("utf-8"))
+            clock[0] += 61
+            self.assertEqual(self.find()["route"]["level"], "L1")
+            self.assertEqual((pointer.call_count, loads.call_count, hashes.call_count), (3, 1, 1))   # tables kept
+
+    def l2_tables(self):
+        self.fx.freeze(self.storage, self.reviews())
+        self.activate(aliases=("attribuer ligne teams",), intent="ATTRIBUER_LIGNE", app="teams")
+        tables = self.fa.routing_svc.load_tables(self.storage, "client-s", "b1")
+        self.assertEqual(tables.l2, [{"intent": "ATTRIBUER_LIGNE", "app": "teams", "fiches": [self.fx.TEAMS]}])
+
+    def test_l2_maps_the_question_with_the_live_model(self):
+        from kefind.tests.schema_llm import SchemaLLM
+
+        self.l2_tables()
+        question = "donner un numéro de téléphone sur teams"
+        mapping = SchemaLLM({("question_intent_app", question): {"intent": "ATTRIBUER_LIGNE", "app": "teams"}})
+        calls = []
+        with unittest.mock.patch.object(self.fa, "intent_llm", lambda client, **kw: calls.append((client, kw)) or mapping):
+            answer = self.find(question)
+            self.assertEqual(self.find()["route"]["level"], "L1")              # L1 decides: no mapping call
+        self.assertEqual((answer["route"]["level"], answer["route"]["key"], answer["decision"]["fiche_id"]),
+                         ("L2", "ATTRIBUER_LIGNE|teams", self.fx.TEAMS))
+        self.assertEqual(calls[0], ("client-s", {}))                           # the live budget (live=True)
+        self.assertEqual(mapping.calls, [("question_intent_app", question)])
+
+    def test_l2_without_a_model_client_is_an_l2_failure_never_a_silent_skip(self):
+        self.l2_tables()
+        with unittest.mock.patch.object(self.fa, "intent_llm", side_effect=KeyError("KECORE_AOAI_ENDPOINT")):
+            answer = self.find("donner un numéro de téléphone sur teams")
+        self.assertEqual((answer["route"]["level"], answer["route"]["l2"]["reason"]), ("L3", "map_failed"))
+        self.assertIn("KECORE_AOAI_ENDPOINT", answer["route"]["l2"]["error"])
+        self.assertIsNone(answer["routing_error"])
+
+    def test_tables_without_l2_build_no_mapping_model(self):
+        self.activate()
+        built = []
+        with unittest.mock.patch.object(self.fa, "intent_llm", lambda client, **kw: built.append(client)):
+            self.assertEqual(self.find("donner un numéro de téléphone sur teams")["route"]["level"], "L3")
+        self.assertEqual(built, [])
+
+
+class ScoreboardRoutingTest(unittest.TestCase):
+    """The scoreboard run measures the pinned tables in every batch, a few batches at a time."""
+
+    def setUp(self):
+        self.fa = load_app()
+
+    def waves(self, payload, prepared):
+        sizes = []
+
+        class Recording(Ctx):
+            def task_all(self, tasks):
+                sizes.append(len(tasks))
+                return super().task_all(tasks)
+
+        ctx = Recording(payload, {"scoreboard_prepare": lambda p: prepared,
+                                  "scoreboard_batch": lambda p: {"records": p["end"] - p["start"]},
+                                  "scoreboard_report": lambda p: {"report": p}})
+        return drive(self.fa.scoreboard_run, ctx)["report"], sizes, ctx
+
+    def test_every_batch_measures_the_pinned_tables_two_at_a_time(self):
+        pin = {"build_id": "b1", "tables_sha256": "t", "content_sha256": "c", "kb_sha256": "k"}
+        report, sizes, ctx = self.waves({"client": "client-s", "sb_id": "sb1", "interpret": True, "llm_parallelism": 2},
+                                        {"count": 80, "kb_run_id": "r9", "routing": pin})
+        self.assertEqual(sizes, [2, 2])                                      # 4 batches of 25, two at a time
+        batches = [c[1] for c in ctx.calls if c[0] == "scoreboard_batch"]
+        self.assertEqual([(b["start"], b["routing"], b["kb_run_id"]) for b in batches],
+                         [(0, pin, "r9"), (25, pin, "r9"), (50, pin, "r9"), (75, pin, "r9")])
+        self.assertEqual((report["prepared"]["routing"], report["routing"], len(report["batches"])), (pin, pin, 4))
+
+    def test_an_input_from_before_llm_parallelism_runs_its_batches_at_once_and_pins_nothing_it_lacks(self):
+        report, sizes, ctx = self.waves({"client": "client-s", "sb_id": "sb1", "interpret": True},
+                                        {"count": 80, "kb_run_id": "r9"})           # an old prepared: no "routing"
+        self.assertEqual(sizes, [4])
+        self.assertTrue(all(c[1]["routing"] is None for c in ctx.calls if c[0] == "scoreboard_batch"))
+
+    def test_the_batch_maps_questions_for_l2_only_when_tables_are_pinned(self):
+        seen = []
+        with unittest.mock.patch.object(self.fa, "find_llm", lambda client, live=True: "interpret"), \
+                unittest.mock.patch.object(self.fa, "query_embedder", lambda client, dims, live=True: "vectors"), \
+                unittest.mock.patch.object(self.fa, "intent_llm", lambda client, live=True: ("l2", live)), \
+                unittest.mock.patch.object(self.fa, "storage", lambda: None), \
+                unittest.mock.patch.object(self.fa.sb_svc, "batch", lambda *a, **k: seen.append(k) or {}):
+            payload = {"client": "client-s", "interpret": True, "start": 0, "end": 1}
+            self.fa.scoreboard_batch(payload)
+            self.fa.scoreboard_batch({**payload, "routing": {"build_id": "b1"}})
+        self.assertEqual(seen, [{"llm": "interpret", "embedder": "vectors", "intent_llm": None},
+                                {"llm": "interpret", "embedder": "vectors", "intent_llm": ("l2", False)}])
+
+    def test_a_mapping_model_that_cannot_be_built_fails_each_l2_call_instead(self):
+        seen = []
+        with unittest.mock.patch.object(self.fa, "find_llm", lambda client, live=True: None), \
+                unittest.mock.patch.object(self.fa, "query_embedder", lambda client, dims, live=True: None), \
+                unittest.mock.patch.object(self.fa, "intent_llm", side_effect=KeyError("KECORE_AOAI_ENDPOINT")), \
+                unittest.mock.patch.object(self.fa, "storage", lambda: None), \
+                unittest.mock.patch.object(self.fa.sb_svc, "batch", lambda *a, **k: seen.append(k["intent_llm"]) or {}):
+            self.fa.scoreboard_batch({"client": "client-s", "interpret": False, "start": 0, "end": 1,
+                                      "routing": {"build_id": "b1"}})
+        with self.assertRaises(KeyError):
+            seen[0].complete_json("system", "Question: x", {}, "question_intent_app")
+
+
+class RoutingMeasureEndToEndTest(unittest.TestCase):
+    """POST kecore/routing/runs' orchestration on the real activities, measure included: the tables are built,
+    measured next to today's engine, their gate written -- then a person activates them and /find routes."""
+
+    def setUp(self):
+        import test_routing_service as fixtures
+        import test_scoreboard_service as scoreboard_fixtures
+
+        self.fx = fixtures
+        self.fa = load_app()
+        self.scenario = scoreboard_fixtures.Scenario(build=False)
+        self.storage = self.scenario.storage
+        self.tables = {"tickets": self.scenario.tickets, "ticketlabels": self.scenario.labels,
+                       "refquestions": self.scenario.refs, "kefindreview": self.scenario.reviews,
+                       "kecorescores": self.scenario.scores}
+        self.fa.storage = lambda: self.storage
+        self.fa.table = lambda name=None: self.tables.setdefault(name or "tickets", MemoryTable())
+        self.env = unittest.mock.patch.dict("os.environ", {"KECORE_CLIENTS": "client-s"})
+        self.env.start()
+        self.fa._kb_map.cache_clear()
+
+    def tearDown(self):
+        self.env.stop()
+        self.fa._kb_map.cache_clear()
+
+    def test_build_measure_activate_then_find_routes(self):
+        fx = self.fx
+        names = ("routing_prepare", "routing_taxonomy", "routing_assign", "routing_assign_summary", "routing_build",
+                 "routing_finish", "scoreboard_prepare", "scoreboard_batch", "scoreboard_report")
+        with unittest.mock.patch.object(self.fa, "taxonomy_llm", lambda p: fx.taxonomy_llm()), \
+                unittest.mock.patch.object(self.fa, "assign_llm", lambda p: fx.assign_llm()), \
+                unittest.mock.patch.object(self.fa, "find_llm", lambda client, live=True: None), \
+                unittest.mock.patch.object(self.fa, "intent_llm", side_effect=AssertionError("no L2 tables")), \
+                unittest.mock.patch.object(self.fa, "_now", lambda: fx.NOW):
+            payload = self.fa.routing_svc.validate_routing_request({"client": "client-s", "batch_size": 4},
+                                                                   ["client-s"], "b1")
+            ctx = Ctx(payload, {name: getattr(self.fa, name) for name in names})
+            out = drive_throwing(self.fa.routing_run, ctx)
+        self.assertEqual((out["state"], out["error"], out["scoreboard"]["routing"]),
+                         ("completed", None, {"status": "passed", "build_id": "b1", "why_not": None}))
+        measured = [c[1] for c in ctx.calls if c[0] == "scoreboard_batch"]
+        self.assertEqual({b["routing"]["build_id"] for b in measured}, {"b1"})
+        self.assertEqual(out["scoreboard"]["sb_id"], "b1-sb")
+        gate = self.scenario.blob(self.scenario.gate_name())
+        self.assertEqual((gate["sb_id"], gate["status"]), ("b1-sb", "passed"))
+        status = json.loads(self.fa.kecore_routing_status(request("GET", "kecore/routing",
+                                                                  params={"client": "client-s"})).get_body())
+        self.assertEqual((status["gate"]["status"], status["effective"]), ("passed", False))
+        # nothing routes yet: a person activates
+        ask = {"client": "client-s", "text": "comment attribuer une ligne teams", "interpret": False}
+        self.assertIsNone(json.loads(self.fa.kecore_find(request("POST", "kecore/find", ask)).get_body())["route"])
+        response = self.fa.kecore_routing_activate(request("POST", "kecore/routing/activate",
+                                                           {"client": "client-s", "build_id": "b1", "by": "Yassine"}))
+        self.assertEqual(response.status_code, 200)
+        answer = json.loads(self.fa.kecore_find(request("POST", "kecore/find", ask)).get_body())
+        self.assertEqual((answer["route"]["level"], answer["decision"]["fiche_id"]), ("L1", fx.TEAMS))
 
 
 import unittest.mock  # noqa: E402  (used by RoutesTest)

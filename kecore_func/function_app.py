@@ -23,6 +23,11 @@ POST /api/kecore/find  (function key)  {"client": "client-s", "text": "<ticket>"
      decide, with the client's calibrated settings (funnel-config.json) and, with "interpret"
      (default), one recorded model call that turns the ticket into search terms (kefind.interpret).
      The KB map of a run is read once and kept in memory (4 maps at most).
+     Routing: when a person activated routing tables for the run served (and the kill switch is off),
+     the tables answer first (kefind.route.answer: L0 number/code, L1 validated alias, L2 intent and
+     application with one recorded mapping call, L3 today's engine offered, L4 abstain) and "route" says
+     how; otherwise "route" is null and the answer is today's, "routing_error" saying why tables that exist
+     were not used. A failing route never fails the answer: it is answered again without routing.
 
 POST /api/kecore/tickets/scrub  (function key)  {"client": "client-s"}
   -> scrubs every raw export under tickets-<client>/raw/*.csv (kecore.tickets.scrub: personal
@@ -42,7 +47,10 @@ POST /api/kecore/scoreboard/runs  (function key)  {"client": "client-s", "run_id
                                                      "interpret": true, "max_wrong": 0.05}
   -> one Durable run of every LABELED ticket through the funnel, measured by the scoreboard
      package (exact fiche @1, wrong fiche shown, recall@5, 95% intervals) with the floor
-     (min_show) chosen on half the labels and confirmed on the other half.
+     (min_show) chosen on half the labels and confirmed on the other half. When the run's candidate
+     routing tables exist, the same questions also go through them ("kefind-route") and the run writes
+     their gate (routing/gates/), which an activation requires; "llm_parallelism" (default 2) batches at
+     a time.
 GET  /api/kecore/scoreboard/latest?client=client-s  (function key)
   -> the last scoreboard run: summary and Markdown report.
 POST /api/kecore/funnel-config/apply  (function key)  {"client": "client-s", "scoreboard_id": "<id>"}
@@ -101,6 +109,7 @@ import semantic_service as semantic_svc
 import tickets_service as tickets_svc
 from kecore.llm import AzureOpenAIChat, AzureOpenAIEmbeddings, RecordingEmbeddings, RecordingLLM
 from kefind.assign import C_LLM_OVERRIDES
+from kefind.route import check_tables
 from kefind.taxonomy import B_LLM_OVERRIDES
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -345,6 +354,8 @@ def _routing_steps(context, payload: dict):
             payload = {**payload, "run_id": prepared["run_id"]}  # every step reads the same map
             if prepared["needs_b"]:
                 out["taxonomy"] = yield context.call_activity("routing_taxonomy", payload)
+            elif prepared.get("skipped_b"):
+                out["taxonomy"] = {"skipped": prepared["skipped_b"]}
             if prepared["needs_c"]:
                 ranges = pipeline.batches(prepared["fiches"], payload["batch_size"])
                 parts = yield from _fan_out(context, "routing_assign", payload, ranges)
@@ -509,6 +520,25 @@ def intent_llm(client: str, live: bool = True) -> RecordingLLM:
                         store=pipeline.StorageRecordStore(storage(), client, prefix="find-cache/"))
 
 
+class _UnavailableModel:
+    """A model client that could not be built (a missing setting...): every call fails the way the build
+    did. For the L2 mapping that is an L2 failure like any other -- the question goes on to L3, marked
+    degraded "l2_failed:<Exc>", and a measure holding one is invalid -- never L2 silently skipped."""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+
+    def complete_json(self, *args, **kwargs):
+        raise self.exc.with_traceback(None)
+
+
+def _model_or_unavailable(factory, *args, **kwargs):
+    try:
+        return factory(*args, **kwargs)
+    except Exception as exc:
+        return _UnavailableModel(exc)
+
+
 _embeddings: dict = {}
 
 
@@ -600,7 +630,11 @@ def kecore_find(req: func.HttpRequest) -> func.HttpResponse:
     # the ticket text is neither logged nor stored; only the model's search terms are recorded
     llm = find_llm(payload["client"]) if payload["interpret"] else None
     embedder = query_embedder(payload["client"], kb_map.semantic.dimensions) if kb_map.semantic is not None else None
-    answer = finder.respond(kb_map, payload, config=_funnel_config(payload["client"]), llm=llm, embedder=embedder)
+    # routing: only tables a person activated for this very run, unless killed; None -> today's answer exactly
+    routing, current, routing_error = _active_routing(payload["client"], run_id, kb_map)
+    mapping = _model_or_unavailable(intent_llm, payload["client"]) if routing is not None and routing.l2 else None
+    answer = finder.respond(kb_map, payload, config=_funnel_config(payload["client"]), llm=llm, embedder=embedder,
+                            routing=routing, routing_error=routing_error, current=current, intent_llm=mapping)
     if payload["observe"]:  # the dictionary's online loop (only names, never the text); never fails the answer
         try:
             from kecore_table import PENDING
@@ -766,17 +800,18 @@ def scoreboard_run(context: df.DurableOrchestrationContext):
 
 
 def _scoreboard_steps(context, payload: dict):
-    """One scoreboard run (``yield from``): prepare -> every batch -> report. Shared by ``scoreboard_run``
-    and the measure that ends a routing run (``_routing_steps``)."""
+    """One scoreboard run (``yield from``): prepare (the frozen set, the candidate routing tables pinned) ->
+    every batch -> report (and the routing gate). Shared by ``scoreboard_run`` and the measure that ends a
+    routing run (``_routing_steps``). Batches go ``llm_parallelism`` at a time through ``_fan_out`` (they call
+    the shared deployment); an input from before that key keeps the shape it was scheduled with, all at once.
+    Every batch gets the pinned tables (``"routing"``: None when there are none), never re-reads the pointer."""
     prepared = yield context.call_activity("scoreboard_prepare", payload)
     if not prepared["count"]:
         return {"client": payload["client"], "sb_id": payload["sb_id"], "error": "no labeled ticket or reference question yet",
                 "prepared": prepared}
-    payload = {**payload, "kb_run_id": prepared["kb_run_id"]}
+    payload = {**payload, "kb_run_id": prepared["kb_run_id"], "routing": prepared.get("routing")}
     ranges = pipeline.batches(prepared["count"], sb_svc.BATCH_SIZE)
-    parts = yield context.task_all(
-        [context.call_activity("scoreboard_batch", {**payload, "start": start, "end": end}) for start, end in ranges]
-    )
+    parts = yield from _fan_out(context, "scoreboard_batch", payload, ranges)
     summary = yield context.call_activity("scoreboard_report",
                                           {**payload, "ranges": ranges, "prepared": prepared, "batches": parts})
     return summary
@@ -792,8 +827,11 @@ def scoreboard_prepare(payload: dict) -> dict:
 @app.activity_trigger(input_name="payload")
 def scoreboard_batch(payload: dict) -> dict:
     llm = find_llm(payload["client"], live=False) if payload["interpret"] else None
+    # the routed engine maps questions for L2 as live /find does (same record, find-cache/), on the batch budget;
+    # built only when tables are pinned: a measure without routing makes no call it did not make before
+    mapping = _model_or_unavailable(intent_llm, payload["client"], live=False) if payload.get("routing") else None
     return sb_svc.batch(storage(), payload, payload["start"], payload["end"], llm=llm,
-                        embedder=_query_embedder_for_run(payload))
+                        embedder=_query_embedder_for_run(payload), intent_llm=mapping)
 
 
 @app.activity_trigger(input_name="payload")
@@ -855,13 +893,71 @@ def kecore_funnel_config_apply(req: func.HttpRequest) -> func.HttpResponse:
 
 # The active routing pointer, as /kecore/find reads it (at most once a minute per client and instance, like
 # the funnel config): an activation or a deactivation drops it on the instance that handled it at once,
-# every other instance within the minute.
+# every other instance within the minute. Per client: (monotonic time read, {run_id: (tables, current,
+# error)}) -- a session pinned to an older run resolves its own entry (the carried-over "previous" one).
 _ROUTING_TTL_S = 60
 _routing_pointers: dict[str, tuple[float, object]] = {}
+# The tables themselves never change under a sha256 (load_tables verifies it): kept by (client, sha256), so a
+# pointer re-read costs two small blobs, not the tables. The run's source hashes (kb_sha256's input) likewise
+# by (client, run): a run's fiches.jsonl is written once, at extraction.
+_MAX_ROUTING_CACHE = 8
+_routing_tables: dict[tuple[str, str], object] = {}
+_run_sources: dict[tuple[str, str], dict] = {}
 
 
 def _forget_routing(client: str) -> None:
     _routing_pointers.pop(client, None)
+
+
+def _remember(cache: dict, key, value):
+    if key not in cache and len(cache) >= _MAX_ROUTING_CACHE:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+    return value
+
+
+def _resolve_routing(client: str, run_id: str, kb_map) -> tuple[object, dict | None, str | None]:
+    """The active tables that apply to ``run_id``, loaded and checked against the map they will route:
+    (tables, current, None), (None, None, None) when routing was never activated, (None, None, why) when it
+    is switched off, built for another run, or its tables do not load, verify or match this map."""
+    entry, why = routing_svc.active_for(storage(), client, run_id)
+    if entry is None:
+        return None, None, why
+    sha = entry.get("tables_sha256")
+    if not isinstance(sha, str) or not sha:
+        return None, None, "routing/active.json names no tables_sha256: activate the tables again"
+    try:
+        tables = _routing_tables.get((client, sha))
+        if tables is None:
+            tables = _remember(_routing_tables, (client, sha),
+                               routing_svc.load_tables(storage(), client, entry.get("build_id"), sha))
+        current = _run_sources.get((client, run_id))
+        if current is None:
+            current = _remember(_run_sources, (client, run_id), routing_svc.source_hashes(storage(), client, run_id))
+        check_tables(tables, kb_map, current)  # client, run, code version, knowledge base (kb_sha256)
+    except (ValueError, FileNotFoundError, routing_svc.StoredFileError) as exc:  # TablesMismatchError included
+        return None, None, str(exc)[:500]
+    return tables, current, None
+
+
+def _active_routing(client: str, run_id: str, kb_map) -> tuple[object, dict | None, str | None]:
+    """(tables, current source hashes, routing_error) for /kecore/find. Never raises: routing is optional, and
+    anything wrong with it gives (None, None, why) -- today's answer, with ``routing_error`` saying why.
+    The kill switch and the pointer are re-read at most once a minute per client (``_ROUTING_TTL_S``),
+    at once on the instance that activated or deactivated (``_forget_routing``)."""
+    try:
+        now = time.monotonic()
+        cached = _routing_pointers.get(client)
+        if (not isinstance(cached, tuple) or len(cached) != 2 or not isinstance(cached[1], dict)
+                or now - cached[0] > _ROUTING_TTL_S):
+            cached = (now, {})
+            _routing_pointers[client] = cached
+        resolved = cached[1]
+        if run_id not in resolved:
+            resolved[run_id] = _resolve_routing(client, run_id, kb_map)
+        return resolved[run_id]
+    except Exception as exc:  # storage down, a bug: /find still answers, without routing
+        return None, None, f"routing unavailable ({type(exc).__name__}: {str(exc)[:300]})"
 
 
 def _client_param(req: func.HttpRequest) -> str | None:
@@ -944,8 +1040,12 @@ def kecore_routing_deactivate(req: func.HttpRequest) -> func.HttpResponse:
         payload = routing_svc.validate_deactivate_request(body, allowed_clients())
     except ValueError as exc:
         return _error(400, str(exc))
-    result = routing_svc.deactivate(storage(), payload, _now())
-    _forget_routing(payload["client"])
+    try:
+        result = routing_svc.deactivate(storage(), payload, _now())
+    except Exception as exc:  # the switch may already be written: this instance stops routing at once anyway
+        return _error(500, f"deactivation incomplete ({type(exc).__name__}): send it again")
+    finally:
+        _forget_routing(payload["client"])
     return _json(result)
 
 

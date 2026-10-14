@@ -30,9 +30,8 @@ import kecore_pipeline as pipeline
 import kefind_service as finder
 from kecore.tickets import scrub as scrub_tickets
 from kecore.tickets import scrub_entity, ticket_text
-from kefind import semantic as sem
-from kefind.funnel import FUNNEL_VERSION, FunnelConfig, find
-from kefind.interpret import interpret
+from kefind.funnel import FUNNEL_VERSION, FunnelConfig
+from kefind.route import answer
 
 MAX_RUN_LIMIT = 2000
 DEFAULT_RUN_LIMIT = 200
@@ -141,7 +140,8 @@ def catalog(storage: pipeline.Storage, fiches_table, payload: dict) -> dict:
     return {"client": client, "run_id": kbmap.run_id, "fiches": len(keep), "removed": removed}
 
 
-def _finding_row(client: str, row_key: str, finding, run_id: str, interpreted: bool) -> dict:
+def _finding_row(client: str, row_key: str, finding, run_id: str, interpreted: bool, degraded: str | None = None
+                 ) -> dict:
     return {
         "PartitionKey": client, "RowKey": row_key,
         "kefind_kind": finding.kind, "kefind_reason": finding.reason,
@@ -151,6 +151,10 @@ def _finding_row(client: str, row_key: str, finding, run_id: str, interpreted: b
         "kefind_designated": bool(finding.designated),
         "kefind_question": (finding.question or "")[:MAX_QUESTION_CHARS],
         "kefind_kb_run": run_id, "kefind_interpreted": interpreted, "kefind_funnel": FUNNEL_VERSION,
+        # why the ticket was not decided the way /find decides it ("no_embedder", "embedding_failed:<Exc>"...);
+        # "" when it was: a string column, never None (the Tables SDK drops None, and a MERGE would then keep
+        # an earlier run's mark on a ticket decided normally this time)
+        "kefind_degraded": degraded or "",
         "kefind_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -158,9 +162,14 @@ def _finding_row(client: str, row_key: str, finding, run_id: str, interpreted: b
 def run_batch(storage: pipeline.Storage, table, payload: dict, start: int, end: int,
               llm=None, config: FunnelConfig | None = None, embedder=None) -> dict:
     """One slice [start, end) of the client's scrubbed tickets, tallied by what the funnel does; each
-    ticket's finding is merged into its row. One ticket that fails is counted, never fatal. With a
-    semantic index and an ``embedder`` (recorded), each ticket is decided by meaning, exactly as
-    /kecore/find decides it; ``modes`` counts how each ticket was decided."""
+    ticket's finding is merged into its row. One ticket that fails is counted, never fatal. Each ticket is
+    decided by ``kefind.route.answer`` without routing tables -- the very code /kecore/find runs while no
+    tables are active: by meaning with a semantic index and an ``embedder`` (recorded), else by words and
+    ``llm``'s interpretation when asked. ``modes`` counts how each decided ticket was decided;
+    ``kefind_degraded`` keeps why a ticket was not decided the way /find decides it ("" when it was).
+
+    The blank run measures the engine as it is, never routing: a person reviews tickets against it, and a
+    routed ticket would show a validated fiche as the engine's own proposal."""
     client = payload["client"]
     kbmap = _map_for(storage, payload)
     config = config or finder.funnel_config(storage, client)
@@ -171,32 +180,27 @@ def run_batch(storage: pipeline.Storage, table, payload: dict, start: int, end: 
     errors = 0
     interpret_failures = 0
     modes: Counter = Counter()
-    semantic = kbmap.semantic is not None and embedder is not None and getattr(embedder, "model_id", None) == kbmap.semantic.model
+    interpret_ticket = bool(payload.get("interpret", True))
     for entity in entities:
         text = ticket_text(entity)
         if not text.strip():
             empty += 1
             continue
         try:
-            vector = None
-            if semantic:
-                try:
-                    vector = embedder.embed([sem.query_text(text)])[0]
-                except Exception:  # decided by words for this ticket, and counted as degraded
-                    vector = None
-            modes["semantic" if vector is not None else "degraded" if kbmap.semantic is not None else "words"] += 1
-            asked = payload.get("interpret", True) and llm and vector is None
-            interpretation = interpret(llm, text, kbmap.dictionary) if asked else None
-            finding = find(kbmap, text, config=config, interpretation=interpretation, query_vector=vector)
-            interpreted = interpretation is not None and interpretation.error is None
-            if interpretation is not None and interpretation.error is not None:
+            result = answer(kbmap, text, config=config, llm=llm, embedder=embedder, interpret_ticket=interpret_ticket)
+            finding = result.finding
+            # the column keeps its meaning: True only when the model's terms were used (not asked, not needed
+            # or failed: False), as before the router existed
+            interpreted = result.interpreted is True
+            if llm is not None and result.interpreted is False:  # asked of a model, and the model failed
                 interpret_failures += 1
-            table.merge(_finding_row(client, entity["RowKey"], finding, kbmap.run_id, interpreted))
+            table.merge(_finding_row(client, entity["RowKey"], finding, kbmap.run_id, interpreted, result.degraded))
         except Exception as exc:  # one ticket must not void the run: counted and named, never hidden
             errors += 1
             kinds["error"] += 1
             reasons[f"error:{type(exc).__name__}"] += 1
             continue
+        modes[result.mode] += 1
         kinds[finding.kind] += 1
         reasons[finding.reason] += 1
     return {"run_id": kbmap.run_id, "tickets": len(entities), "empty": empty, "errors": errors,

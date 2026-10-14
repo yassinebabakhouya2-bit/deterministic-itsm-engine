@@ -443,16 +443,19 @@ def _current_c(kbmap, fiche_id: str, item: Assignment | None) -> Assignment | No
     return item
 
 
-def _proposals(kbmap, ids, pass_a: dict, pass_c: dict) -> dict[str, dict]:
+def _proposals(kbmap, ids, pass_a: dict, pass_c: dict, taxonomy: Taxonomy | None = None) -> dict[str, dict]:
     """What each routable fiche PROPOSES, for ``build_tables``: a fiche under review blocks these keys
-    instead of leaving another fiche alone in front of them."""
+    instead of leaving another fiche alone in front of them. With a frozen taxonomy, a fiche without a usable
+    pass-C answer has an unknown intent (``intent_known`` False): it blocks every L2 key until pass C or a
+    person says what it is."""
     out = {}
     for fiche_id in ids:
         a = _current_a(kbmap, fiche_id, pass_a.get(fiche_id))
         c = _current_c(kbmap, fiche_id, pass_c.get(fiche_id))
         aliases = (list(a.semantic_aliases_fr) + list(a.semantic_aliases_en)) if a else []
         aliases += (list(c.core_aliases_fr) + list(c.core_aliases_en)) if c else []
-        out[fiche_id] = {"intent": c.intent if c else None, "app": a.primary_app if a else None, "aliases": aliases}
+        out[fiche_id] = {"intent": c.intent if c else None, "app": a.primary_app if a else None, "aliases": aliases,
+                         "intent_known": c is not None or taxonomy is None}
     return out
 
 
@@ -480,7 +483,8 @@ def prepare(storage, payload: dict, now) -> dict:
     """The first step of a routing run: takes the lease, resolves the run, says which passes are needed.
 
     - pass B (``needs_b``) only while no taxonomy is frozen, once per run (a failed proposal is asked again);
-      refused while pass A has errors: a taxonomy frozen from a partial pass A misses intents for good;
+      skipped while pass A has errors (``skipped_b`` says why): a taxonomy frozen from a partial pass A
+      misses intents for good -- but the run goes on, so the L0/L1 tables of the run are still built;
     - pass C (``needs_c``) only with a frozen taxonomy, when the pass-C proposals are not about this run and
       this taxonomy, or have errors (a record run then asks only the missing calls);
     - the build ALWAYS follows: L0 numbers and L1 aliases need neither (phase 1).
@@ -489,7 +493,7 @@ def prepare(storage, payload: dict, now) -> dict:
     client, build_id = payload["client"], payload["build_id"]
     run_id = payload.get("run_id") or finder.latest_run(storage, client)
     out = {"client": client, "run_id": run_id, "build_id": build_id, "fiches": 0, "taxonomy": None,
-           "needs_b": False, "needs_c": False}
+           "needs_b": False, "needs_c": False, "skipped_b": None}
     held = _take_lease(storage, client, build_id, payload.get("kind") or "manual", now)
     if held is not None:
         return {**out, "error": f"a routing run is in progress ({held.get('build_id')}, since {held.get('started_at')})"}
@@ -513,8 +517,9 @@ def prepare(storage, payload: dict, now) -> dict:
         out["needs_b"] = pointer.get("run_id") != run_id or bool(pointer.get("error"))
         errors = int(summary.get("errors") or 0)
         if out["needs_b"] and errors:
-            return {**out, "error": f"pass A has {errors} errors: run a kecore record run first, only the missing "
-                                    "calls are made"}
+            out["needs_b"] = False
+            out["skipped_b"] = (f"pass A has {errors} errors: pass B waits for a kecore record run (only the "
+                                "missing calls are made); the L0/L1 tables are built meanwhile")
         return out
     out["taxonomy"] = {"version": taxonomy.version, "sha256": taxonomy.sha256}
     pointer = _dict(_read(storage, client, ASSIGNMENTS))
@@ -618,7 +623,8 @@ def build(storage, review_rows, payload: dict, now) -> dict:
     decisions = _decisions(review_rows)
     pass_a = _pass_a(storage, client, kbmap, ids)
     assign_build, pass_c = _pass_c(storage, client, kbmap, taxonomy)
-    tables = build_tables(kbmap, current, taxonomy, decisions, _proposals(kbmap, ids, pass_a, pass_c), build_id)
+    tables = build_tables(kbmap, current, taxonomy, decisions, _proposals(kbmap, ids, pass_a, pass_c, taxonomy),
+                          build_id)
     paths = build_paths(build_id)
     _write(storage, client, paths["decisions"], [d.to_dict() for d in decisions])
     storage.write(_container(client), paths["tables"], tables.to_bytes())
@@ -627,7 +633,10 @@ def build(storage, review_rows, payload: dict, now) -> dict:
     entry = {"build_id": build_id, "run_id": run_id, "tables_sha256": tables.sha256,
              "content_sha256": tables.content_sha256, "kb_sha256": tables.kb_sha256}
     latest = finder.latest_run(storage, client)
-    previous_candidate = _dict(_read(storage, client, CANDIDATE))
+    try:
+        previous_candidate = _dict(_read(storage, client, CANDIDATE))
+    except StoredFileError:  # only this function writes it: an unreadable one is replaced, never a dead end
+        previous_candidate = {}
     is_candidate = (run_id == latest or not previous_candidate.get("run_id")
                     or str(run_id) >= str(previous_candidate["run_id"]))
     if is_candidate:
@@ -660,10 +669,10 @@ def _carry_over(storage, client: str, tables: RoutingTables, now) -> tuple[bool,
         active = _dict(json.loads(before.decode("utf-8")))
     except (UnicodeDecodeError, ValueError):
         return False, "routing/active.json is unreadable: a person activates the tables again"
-    if active.get("build_id") == tables.build_id:
-        return True, ""  # this very build, carried by an earlier attempt of this activity
     if _killed(storage, client):
         return False, "routing is switched off (kill switch): only a person's activation turns it back on"
+    if active.get("build_id") == tables.build_id:
+        return True, ""  # this very build, carried by an earlier attempt of this activity
     if str(tables.run_id or "") < str(active.get("run_id") or ""):
         return False, f"the active tables are for a newer run ({active.get('run_id')})"
     if tables.content_sha256 != active.get("content_sha256"):
@@ -686,20 +695,28 @@ def _carry_over(storage, client: str, tables: RoutingTables, now) -> tuple[bool,
 
 def finish(storage, payload: dict, outcome: dict, now) -> dict:
     """The last step of every routing run, failed or not: the build's status.json, latest-build.json, and
-    the lease released -- only when this build holds it (a run refused at prepare never frees another's)."""
+    the lease released. latest-build.json and the lease are this build's only when it holds the lease (or
+    an earlier attempt of this activity already named it): a run refused at prepare because another one
+    is in progress never frees that run's lease, nor hides its state behind its own refusal."""
     client, build_id = payload["client"], payload["build_id"]
     outcome = _dict(outcome)
     state = "completed" if outcome.get("state") == "completed" else "failed"
     status_ = {"state": state, "error": outcome.get("error"), "finished_at": str(now)}
     _write(storage, client, build_paths(build_id)["status"], status_)
-    run_id = outcome.get("run_id") or payload.get("run_id") or ""
-    _write(storage, client, LATEST_BUILD, {"build_id": build_id, "run_id": run_id, "state": state,
-                                           "kind": payload.get("kind") or "manual"})
     try:
         held = _read(storage, client, LEASE)
     except StoredFileError:
         held = None
-    if isinstance(held, dict) and held.get("build_id") == build_id:
+    owner = isinstance(held, dict) and held.get("build_id") == build_id
+    try:
+        named = _dict(_read(storage, client, LATEST_BUILD)).get("build_id") == build_id
+    except StoredFileError:
+        named = False
+    if owner or named:
+        run_id = outcome.get("run_id") or payload.get("run_id") or ""
+        _write(storage, client, LATEST_BUILD, {"build_id": build_id, "run_id": run_id, "state": state,
+                                               "kind": payload.get("kind") or "manual"})
+    if owner:
         storage.delete(_container(client), LEASE)
     return {**status_, "build_id": build_id}
 

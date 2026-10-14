@@ -295,10 +295,19 @@ class LeaseTest(unittest.TestCase):
         self.assertEqual(refused["error"], f"a routing run is in progress (b1, since {NOW})")
         self.assertEqual(blob(self.storage, svc.LEASE), {"build_id": "b1", "kind": "manual", "started_at": NOW})
         self.assertEqual(svc.lease(self.storage, CLIENT, LATER)["build_id"], "b1")
+        svc.build(self.storage, [], payload("b1", RUN), NOW)                       # b1 is building
         svc.finish(self.storage, payload("b2"), {"state": "failed", "error": refused["error"]}, LATER)
         self.assertEqual(blob(self.storage, svc.LEASE)["build_id"], "b1")          # another run's lease is never freed
-        svc.finish(self.storage, payload("b1"), {"state": "completed"}, LATER)
+        self.assertEqual(blob(self.storage, svc.LATEST_BUILD)["build_id"], "b1")   # nor its state hidden
+        self.assertEqual(blob(self.storage, "routing/builds/b2/status.json"),       # the refusal is still said
+                         {"state": "failed", "error": refused["error"], "finished_at": LATER})
+        svc.finish(self.storage, payload("b1"), {"state": "completed", "run_id": RUN}, LATER)
         self.assertIsNone(blob(self.storage, svc.LEASE))
+        self.assertEqual(blob(self.storage, svc.LATEST_BUILD),
+                         {"build_id": "b1", "run_id": RUN, "state": "completed", "kind": "manual"})
+        # an activity retried by Durable after the lease was freed still records its own outcome
+        svc.finish(self.storage, payload("b1"), {"state": "failed", "error": "x", "run_id": RUN}, LATER)
+        self.assertEqual(blob(self.storage, svc.LATEST_BUILD)["state"], "failed")
         self.assertNotIn("error", svc.prepare(self.storage, payload("b3"), LATER))
 
     def test_a_retried_prepare_keeps_its_own_lease(self):
@@ -347,9 +356,14 @@ class PrepareTest(unittest.TestCase):
         self.assertFalse(svc.prepare(self.storage, payload("b2"), NOW)["needs_b"])
         svc.finish(self.storage, payload("b2"), {"state": "completed"}, NOW)
         failing = write_run(Storage(), errors=(WEBEX,))
-        refused = svc.prepare(failing, payload("b1"), NOW)
-        self.assertEqual(refused["error"], "pass A has 1 errors: run a kecore record run first, only the missing calls "
-                                           "are made")
+        skipped = svc.prepare(failing, payload("b1"), NOW)
+        # pass B waits for a complete pass A, the run goes on: its L0/L1 tables are still built
+        self.assertNotIn("error", skipped)
+        self.assertFalse(skipped["needs_b"])
+        self.assertEqual(skipped["skipped_b"], "pass A has 1 errors: pass B waits for a kecore record run (only the "
+                                               "missing calls are made); the L0/L1 tables are built meanwhile")
+        built = svc.build(failing, [], payload("b1", RUN), NOW)
+        self.assertEqual(built["build_id"], "b1")
 
     def test_a_failed_proposal_is_asked_again(self):
         svc.prepare(self.storage, payload("b1"), NOW)
@@ -547,6 +561,12 @@ class BuildTest(unittest.TestCase):
         self.assertFalse(out["built"]["candidate"])
         self.assertEqual(blob(self.storage, svc.CANDIDATE)["build_id"], "b2")
 
+    def test_an_unreadable_candidate_pointer_is_replaced_not_a_dead_end(self):
+        self.storage.write(CONTAINER, svc.CANDIDATE, b"{cut")
+        out = routing_run(self.storage, self.table, "b1")
+        self.assertTrue(out["built"]["candidate"])
+        self.assertEqual(blob(self.storage, svc.CANDIDATE)["build_id"], "b1")
+
     def test_review_json_holds_what_the_overview_lists(self):
         freeze(self.storage, self.table)
         routing_run(self.storage, self.table, "b1")
@@ -611,6 +631,17 @@ class CarryOverTest(unittest.TestCase):
         self.assertFalse(built["carried"])
         self.assertIn("kill switch", built["why_not"])
         self.assertEqual(blob(self.storage, svc.ACTIVE)["build_id"], "b1")
+
+    def test_a_retried_build_never_reports_a_carry_over_the_kill_switch_undid(self):
+        write_run(self.storage, RUN2, publish=False)
+        self.assertTrue(self.rebuild("b2")["carried"])
+        carried = blob(self.storage, svc.ACTIVE)
+        svc.deactivate(self.storage, {"client": CLIENT, "by": "Marie"}, LATER)
+        self.storage.write(CONTAINER, svc.ACTIVE, json.dumps(carried).encode())     # even with its pointer left
+        again = svc.build(self.storage, self.table.list(CLIENT), payload("b2", RUN2), LATER)
+        self.assertFalse(again["carried"])
+        self.assertIn("kill switch", again["why_not"])
+        self.assertEqual(svc.active_for(self.storage, CLIENT, RUN2)[0], None)
 
     def test_a_pointer_changed_during_the_build_is_left_alone(self):
         storage = self.storage
@@ -947,6 +978,14 @@ class ReviewFicheTest(unittest.TestCase):
         self.assertEqual(data["position"], {"index": 1, "total": 1})
         freeze(self.storage, self.table, [dict(FROZEN[0], label_fr="Attribuer un numéro"), FROZEN[1]], orphans_ok=True)
         self.assertEqual(self.fiche(TEAMS, RUN2)["prefill"]["intent"], "")
+
+    def test_a_pass_a_proposal_about_another_text_proposes_nothing(self):
+        index = kbmap(self.storage).ranked.index(TEAMS)
+        name = f"runs/{RUN}/enrichment/{index:05d}.json"
+        self.storage.write(CONTAINER, name, json.dumps({**blob(self.storage, name), "content_sha256": "0" * 64}).encode())
+        data = self.fiche(TEAMS)
+        self.assertEqual(data["proposal_a"]["canonical_intent"], "ATTRIBUTION_LIGNE_TELEPHONIQUE")  # shown as it is
+        self.assertEqual((data["prefill"]["aliases"], data["prefill"]["primary_app"]), ([], ""))      # never offered
 
     def test_pass_c_of_another_run_is_never_shown(self):
         freeze(self.storage, self.table)

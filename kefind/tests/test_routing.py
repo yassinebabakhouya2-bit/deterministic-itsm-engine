@@ -336,6 +336,40 @@ class L1Test(unittest.TestCase):
         self.assertFalse(l1(tables, self.kb, "attribuer ligne teams")["decided"])
         self.assertTrue(tables.verify())
 
+    def test_a_fiche_back_in_review_never_hands_its_question_to_a_vaguer_alias(self):
+        start = decided(OUTLOOK_START, self.current, aliases=["outlook ne démarre plus"], app="outlook")
+        sync = decided(OUTLOOK_SYNC, self.current, aliases=["outlook démarre"], app="outlook")
+        tables = self.build([start, sync])
+        self.assertEqual(l1(tables, self.kb, "outlook ne démarre plus")["fiche_id"], OUTLOOK_START)
+        # OUTLOOK_START's text changed: its decision is stale, its alias no longer routes -- and it must not
+        # leave its question to the less specific alias of another fiche
+        stale = decided(OUTLOOK_START, self.current, aliases=["outlook ne démarre plus"], app="outlook",
+                        source="old-text-hash")
+        tables = self.build([stale, sync])
+        self.assertEqual(tables.pending, [{"tokens": ["demarre", "outlook", "plus"], "fiches": [OUTLOOK_START]}])
+        result = l1(tables, self.kb, "outlook ne démarre plus")
+        self.assertFalse(result["decided"])
+        self.assertTrue(result["ambiguous"])
+        self.assertEqual(l1(tables, self.kb, "outlook démarre")["fiche_id"], OUTLOOK_SYNC)
+        self.assertEqual(tables.stats["pending_l1"], 1)
+        self.assertTrue(tables.verify())
+
+    def test_an_unreviewed_fiches_proposal_stops_a_vaguer_alias_never_decides(self):
+        tables = self.build([decided(PASSWORD, self.current, aliases=["réinitialiser mot de passe"])],
+                            proposals={SAP_PASSWORD: {"intent": None, "app": "sap",
+                                                      "aliases": ["réinitialiser mot de passe SAP"]}})
+        self.assertEqual([e["fiche_id"] for e in tables.l1], [PASSWORD])
+        self.assertFalse(l1(tables, self.kb, "réinitialiser mot de passe SAP")["decided"])
+        self.assertEqual(l1(tables, self.kb, "réinitialiser le mot de passe")["fiche_id"], PASSWORD)
+        # what a fiche under review proposes is in the content: reviewing it changes the tables
+        reviewed = self.build([decided(PASSWORD, self.current, aliases=["réinitialiser mot de passe"]),
+                               decided(SAP_PASSWORD, self.current, status="rejected")],
+                              proposals={SAP_PASSWORD: {"intent": None, "app": "sap",
+                                                        "aliases": ["réinitialiser mot de passe SAP"]}})
+        self.assertEqual(reviewed.pending, [])
+        self.assertNotEqual(reviewed.content_sha256, tables.content_sha256)
+        self.assertEqual(l1(reviewed, self.kb, "réinitialiser mot de passe SAP")["fiche_id"], PASSWORD)
+
     def test_a_question_citing_another_fiches_number_blocks_l1_outside_its_scope(self):
         tables = self.build([decided(TEAMS, self.current, aliases=["attribuer ligne teams"], app="teams")])
         outside = l1(tables, self.kb, "attribuer ligne teams KB0120")
@@ -442,6 +476,16 @@ class L2Test(unittest.TestCase):
                          {"exact": None, "offer": [PASSWORD, SAP_PASSWORD], "reason": "pending_review"})
         self.assertEqual(tables.blocked["l2"][-1], {"intent": "REINITIALISER_MOT_DE_PASSE", "app": "",
                                                     "fiches": [PASSWORD], "pending": [SAP_PASSWORD]})
+
+    def test_a_fiche_whose_pass_c_gave_nothing_blocks_every_key(self):
+        failed = {SAP_PASSWORD: {"intent": None, "app": "sap", "aliases": [], "intent_known": False}}
+        tables = self.build(self.lines(), proposals=failed)
+        self.assertEqual(tables.l2, [])
+        self.assertEqual([e["pending"] for e in tables.blocked["l2"]], [[SAP_PASSWORD], [SAP_PASSWORD]])
+        self.assertIsNone(lookup_l2(tables, "ATTRIBUER_LIGNE", "teams", True)["exact"])
+        # pass C answered "no intent fits": known, blocks nothing
+        none_fits = {SAP_PASSWORD: {"intent": None, "app": "sap", "aliases": [], "intent_known": True}}
+        self.assertEqual(len(self.build(self.lines(), proposals=none_fits).l2), 2)
 
     def test_a_pending_fiche_of_another_application_does_not_block(self):
         tables = self.build(self.lines(), proposals={VPN: {"intent": "ATTRIBUER_LIGNE", "app": "zoom", "aliases": []}})

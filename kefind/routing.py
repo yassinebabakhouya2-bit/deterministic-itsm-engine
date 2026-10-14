@@ -210,6 +210,10 @@ class RoutingTables:
     l2: list[dict] = field(default_factory=list)       # [{"intent","app","fiches"}] (app "": names no application)
     blocked: dict = field(default_factory=lambda: {"l1": [], "l2": []})
     collisions: dict = field(default_factory=lambda: {"l0_numbers": {}, "l1": [], "l2": []})
+    # token sets a fiche under review proposes (or validated before its text changed) that no validated fiche
+    # claims: [{"tokens","fiches"}]. They never decide; they stop a validated alias they are not less
+    # specific than (match_l1), so a fiche going back to review never hands its questions to a vaguer alias.
+    pending: list = field(default_factory=list)
     stats: dict = field(default_factory=dict)
     content_sha256: str = ""
     sha256: str = ""
@@ -228,6 +232,7 @@ class RoutingTables:
             "l1_collisions": [[c["tokens"], c["fiches"]] for c in (self.collisions or {}).get("l1", [])],
             "l2": self.l2,
             "blocked": self.blocked,
+            "pending": [[p["tokens"], p["fiches"]] for p in self.pending or []],
         }
 
     def compute_content_sha256(self) -> str:
@@ -377,6 +382,8 @@ def build_tables(kbmap, current: dict[str, str], taxonomy, decisions: list, prop
         else:
             l1.extend(owners.values())
     l1.sort(key=lambda e: (e["tokens"], e["fiche_id"]))
+    pending_l1 = [{"tokens": list(tokens), "fiches": sorted(fiches)} for tokens, fiches in sorted(waiting.items())
+                  if tokens not in claims]
 
     # L2
     l2: list[dict] = []
@@ -400,6 +407,9 @@ def build_tables(kbmap, current: dict[str, str], taxonomy, decisions: list, prop
             else:
                 keys.setdefault((decision.intent, decision.primary_app or ""), []).append(fiche_id)
         proposed: dict[str, list[tuple[str, str]]] = {}
+        # a fiche under review with no usable pass-C answer (failed, or about another text) might propose
+        # any intent: no key can be called unique while it waits, so every key is blocked by it
+        unknown = sorted(f for f in under_review if (proposals.get(f) or {}).get("intent_known") is False)
         for fiche_id in under_review:
             proposal = proposals.get(fiche_id) or {}
             if isinstance(proposal.get("intent"), str) and proposal["intent"]:
@@ -409,7 +419,8 @@ def build_tables(kbmap, current: dict[str, str], taxonomy, decisions: list, prop
                 proposed.setdefault(previous.intent, []).append((fiche_id, previous.primary_app or ""))
         for (intent, app), fiches in sorted(keys.items()):
             entry = {"intent": intent, "app": app, "fiches": sorted(fiches)}
-            pending = sorted({f for f, other in proposed.get(intent, []) if other in (app, "") or app == ""})
+            pending = sorted({f for f, other in proposed.get(intent, []) if other in (app, "") or app == ""}
+                             | set(unknown))
             if len(fiches) > 1:
                 l2_collisions.append(dict(entry, fiches=list(entry["fiches"])))
             if pending:
@@ -421,10 +432,10 @@ def build_tables(kbmap, current: dict[str, str], taxonomy, decisions: list, prop
         client=kbmap.client, run_id=kbmap.run_id or "", build_id=build_id, code_version=dict(CODE_VERSION),
         taxonomy=taxonomy_dict, apps=apps, kb_sha256=kb_sha256(kbmap, current),
         l0_numbers=dict(sorted(l0_numbers.items())), l0_codes=dict(sorted(l0_codes.items())), l1=l1, l2=l2,
-        blocked={"l1": l1_blocked, "l2": l2_blocked},
+        blocked={"l1": l1_blocked, "l2": l2_blocked}, pending=pending_l1,
         collisions={"l0_numbers": dict(sorted(number_collisions.items())), "l1": l1_collisions, "l2": l2_collisions},
         stats={"routable": len(ids), **counts, "l0_numbers": len(l0_numbers), "l0_codes": len(l0_codes),
-               "l1": len(l1), "l2": len(l2), "skipped": skipped})
+               "l1": len(l1), "l2": len(l2), "pending_l1": len(pending_l1), "skipped": skipped})
     return tables.seal()
 
 
@@ -502,7 +513,8 @@ def match_l1(tables: RoutingTables, cleaned_text: str, question_apps: set[str], 
     matches = [e for e in tables.l1 if set(e["tokens"]) <= question
                and not (e.get("app") and apps and e["app"] not in apps)]
     blockers = [{"tokens": list(b["tokens"]), "fiches": sorted(set(b.get("fiches") or []) | set(b.get("pending") or []))}
-                for b in list(tables.collisions.get("l1", [])) + list(tables.blocked.get("l1", []))
+                for b in (list(tables.collisions.get("l1", [])) + list(tables.blocked.get("l1", []))
+                          + list(tables.pending or []))
                 if set(b["tokens"]) <= question]
     out = {"decided": False, "fiche_id": None, "key": None, "tokens": [],
            "matches": [{"fiche_id": e["fiche_id"], "alias": e["alias"]} for e in matches],
