@@ -154,14 +154,15 @@ class GatePassedTest(unittest.TestCase):
         b, r = scenario()
         gate = routing_gate(b, r)
         self.assertEqual(list(gate), ["status", "passed", "tickets", "compared", "excluded", "wrong_exact",
-                                      "routed_exact", "right_first", "mcnemar", "by_level", "reasons"])
+                                      "routed_exact", "routed_exact_unseen", "right_first", "mcnemar", "by_level",
+                                      "reasons"])
         self.assertEqual(gate["status"], "passed")
         self.assertIs(gate["passed"], True)
         self.assertEqual(gate["tickets"], 30)
         self.assertEqual(gate["compared"], 30)
         self.assertEqual(gate["excluded"], [])
         self.assertEqual(gate["wrong_exact"], {"k": 0, "n": 3, "ids": []})
-        self.assertEqual(gate["routed_exact"], 3)
+        self.assertEqual((gate["routed_exact"], gate["routed_exact_unseen"]), (3, 3))
         self.assertEqual(gate["right_first"]["base"]["k"], 30)
         self.assertEqual(gate["right_first"]["base"]["n"], 30)
         self.assertEqual(gate["right_first"]["route"], gate["right_first"]["base"])
@@ -434,12 +435,17 @@ class GateInsufficientTest(unittest.TestCase):
         r = replace(r, tid(0), routed(tid(0), ["K0"], "L2", kind="question", fiches=["K0", "K1"]))
         self.assert_insufficient(routing_gate(b, r), "no question was decided at L0-L2")
 
-    def test_an_exact_decision_on_an_excluded_question_still_counts_as_evidence(self):
+    def test_an_exact_decision_only_on_an_excluded_question_is_no_evidence(self):
+        # the reference a reviewer wrote the alias from is decided by that alias: tautological, not evidence
         b, r = scenario(n=31, exact=0)
         r = replace(r, tid(30), routed(tid(30), ["K30"], "L1", fiches=["K30"]))
         gate = routing_gate(b, r, exclude_ids=[tid(30)])
-        self.assertEqual(gate["status"], "passed", gate["reasons"])
-        self.assertEqual(gate["routed_exact"], 1)
+        self.assert_insufficient(gate, "every question decided at L0-L2 was seen by a reviewer")
+        self.assertEqual((gate["routed_exact"], gate["routed_exact_unseen"]), (1, 0))
+        # one unseen question decided exactly is enough evidence
+        b, r = scenario(n=31, exact=1)
+        r = replace(r, tid(30), routed(tid(30), ["K30"], "L1", fiches=["K30"]))
+        self.assertEqual(routing_gate(b, r, exclude_ids=[tid(30)])["status"], "passed")
 
     def test_both_reasons(self):
         b, r = scenario(n=3, exact=0)
@@ -457,7 +463,7 @@ class GateInsufficientTest(unittest.TestCase):
         self.assertEqual(routing_gate(b, r, min_questions=0)["status"], "passed")
         b, r = scenario(n=1, exact=1)
         gate = routing_gate(b, r, exclude_ids=[tid(0)], min_questions=0)
-        self.assert_insufficient(gate, "at least 1 are needed")
+        self.assert_insufficient(gate, "at least 1 are needed", "every question decided at L0-L2 was seen")
 
 
 class GateExclusionTest(unittest.TestCase):

@@ -525,6 +525,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 {%- if g.route_level == 'L0' -%}Fiche identifiée par son numéro · par le moteur déterministe
 {%- elif g.route_level == 'L1' -%}Fiche identifiée par une formulation validée{% if g.route_key %} « {{ g.route_key }} »{% endif %} · par le moteur déterministe
 {%- elif g.route_level == 'L2' -%}Fiche identifiée par l'intention et l'application validées · par le moteur déterministe
+{%- elif g.route_level == 'offer' -%}Fiche proposée par le moteur déterministe — à confirmer
 {%- else -%}Fiche proche par le sens — à confirmer
 {%- endif %}
 {%- endmacro %}
@@ -578,7 +579,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 
 {% if s.state == 'LOCATE' and s.choices %}
 {% set choice_level = s.choices[0].route_level %}
-<div class="card" id="focus"><b>{% if choice_level == 'L2' %}Plusieurs fiches validées correspondent : laquelle ?{% elif choice_level == 'L3' %}Fiches proches par le sens — à confirmer{% else %}Quelle fiche correspond à votre problème ?{% endif %}</b>
+<div class="card" id="focus"><b>{% if choice_level == 'L2' and s.choices|length == 1 %}Une fiche validée correspond : est-ce la bonne ?{% elif choice_level == 'L2' %}Plusieurs fiches validées correspondent : laquelle ?{% elif choice_level == 'L3' %}Fiches proches par le sens — à confirmer{% else %}Quelle fiche correspond à votre problème ?{% endif %}</b>
 <div class="mut">Choisissez-en une : je vous montre aussitôt les étapes.</div>
 {% for c in s.choices %}<button class="alt pick" type="submit" name="action" value="pick:{{ loop.index }}">
 <b>{{ c.title }}</b>{% if not c.route_level %}<br><span class="mut">correspondance {{ 'forte' if c.score >= 2.5 else ('moyenne' if c.score >= 1.5 else 'faible') }}</span>{% endif %}</button>

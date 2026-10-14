@@ -227,27 +227,34 @@ titles, and 200 characters excluded a real two-line policy fiche of the demo KB.
   routing step, before publish), with these rules beyond the table above: only routable fiches (ranked,
   not a duplicate, not superseded); a rejected fiche never routes, even by its number; L0 codes only when
   a person validated them; L1 takes the alias's application into account, allows at most one question
-  word beyond the alias (`L1_MAX_UNCOVERED`), and must agree with any identifier the question cites; an
-  alias or (intent, application) a fiche still under review proposes -- or validated before its text
-  changed -- blocks instead of letting another fiche look unique, and a fiche with no pass-C answer blocks
-  every L2 key; an intent whose meaning changed at a refreeze (fingerprint) is skipped; at L2 only an
+  word beyond the alias (`L1_MAX_UNCOVERED`) and never a negation word, never lets an alias with no
+  application decide a question naming an application the alias does not name, and must agree with any
+  identifier the question cites (`err:`, `evt:`, `kb:`, `update:`); English negative contractions are
+  spelled out before tokenizing (normalization version 2); an alias or (intent, application) a fiche
+  still under review proposes -- or validated before its text changed, or validated for a fiche no longer
+  routable or an application no longer in the vocabulary -- blocks instead of letting another fiche look
+  unique, and a fiche with no pass-C answer blocks every L2 key; an intent whose meaning changed at a refreeze (fingerprint) is skipped; at L2 only an
   exact (intent, application) key is exact, everything else is offered. Every table carries the code and
   normalization versions, `content_sha256` (what routes) and `kb_sha256` (the map it routes on).
 - Runtime (`kefind/route.py`): one router for `/find`, the scoreboard and the tickets run. Without active
   tables it answers exactly as before (`route: null`). With them: L0 -> L1 -> L2 (one recorded mapping
   call; the question's own application read by code wins over the model's) -> L3 today's engine, its
-  fiche downgraded to a proposal -> L4. The Diagnostic shows L0-L2 as identified, L2/L3 choices as
-  proposals, L4 as the open answer.
+  fiche downgraded to a proposal -> L4. A definitive model refusal at L2 (content filter, HTTP 400, no
+  JSON) falls to L3 without a degraded mark; only a transient failure is degraded. The Diagnostic shows
+  only the exact L0-L2 fiche as identified, a fiche L2 merely offers as "proposed by the deterministic
+  engine", L3 choices as proposals, L4 as the open answer; sessions are stored without empty routing
+  fields so the previous Web App version still reads them after a rollback.
 - Gate: the scoreboard measures today's engine and the routed one on the same frozen questions; the
   verdict is `passed` only with no wrong fiche shown at L0-L2 (over every question, reference questions a
   reviewer had on screen included), the right fiche first at least as often as today's engine on the
-  questions not seen in review (McNemar reported), at least 30 such questions, and no degraded decision
-  or transient model failure; else `failed`, `insufficient` or `invalid`.
+  questions not seen in review (McNemar reported), at least 30 such questions, at least one question not
+  seen in review decided at L0-L2, and no degraded decision or transient model failure; else `failed`,
+  `insufficient` or `invalid`. An older measure finishing after a newer one never overwrites its gate.
 - Activation: by a person, only on tables built for the run `/find` serves and whose gate passed (or was
   `insufficient` and explicitly accepted with a reason, recorded). A sticky kill switch turns routing off
   everywhere within a minute. A later kecore run whose tables have the same `content_sha256` and
   `kb_sha256` carries the activation over; otherwise it is served without routing until measured and
-  activated again.
+  activated again. A `failed` latest measure of the active tables stops routing and refuses carry-over.
 
 **Order and gate**: ground truth first (30-50 real technician questions with their fiche in
 `/labels`, including "comment attribuer une ligne teams" -> KB0233 and questions no fiche answers --

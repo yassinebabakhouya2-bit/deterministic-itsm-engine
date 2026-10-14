@@ -340,9 +340,10 @@ TEAMS_QUESTION = "comment attribuer une ligne teams"
 class Scenario:
     """client-s with the routing fixtures' run (test_routing_service), one validated alias for the Teams fiche
     and its tables built (the candidate), 30 labeled tickets about the filler fiches (three phrasings each:
-    enough questions for a gate) and the reference question the alias was written from."""
+    enough questions for a gate) and the reference question the alias was written from. ``unseen``: one more
+    labeled ticket the alias decides, that no reviewer had on screen -- the evidence a gate needs to pass."""
 
-    def __init__(self, decisions=None, tickets=True, build=True, reference=True):
+    def __init__(self, decisions=None, tickets=True, build=True, reference=True, unseen=False):
         self.storage = fx.write_run(fx.Storage())
         self.reviews = MemoryTable()
         for fiche_id, kwargs in (decisions if decisions is not None
@@ -360,6 +361,10 @@ class Scenario:
                     self.tickets.upsert({"PartitionKey": CLIENT, "RowKey": ticket_id, "titre": text, "sujet": "",
                                          "description": ""})
                     label(self.labels, ticket_id, [f"KB09{i:02d} - {topic}"])
+        if unseen:
+            self.tickets.upsert({"PartitionKey": CLIENT, "RowKey": "I900", "titre": "attribuer une ligne teams svp",
+                                 "sujet": "", "description": ""})
+            label(self.labels, "I900", [fx.TEAMS])
         if reference:
             self.refs.upsert(fx.ref_row(fx.REF, TEAMS_QUESTION, [fx.TEAMS]))
 
@@ -429,8 +434,10 @@ class RoutingPinTest(unittest.TestCase):
         scenario = Scenario()
         prepared = scenario.prepare(scenario.payload())
         tables = routing_service.load_tables(scenario.storage, CLIENT, "b1")
-        self.assertEqual(prepared["routing"], {"build_id": "b1", "tables_sha256": tables.sha256,
-                                               "content_sha256": tables.content_sha256, "kb_sha256": tables.kb_sha256})
+        pin = dict(prepared["routing"])
+        self.assertTrue(pin.pop("prepared_at"))   # when the labels were frozen: orders the gates of one content
+        self.assertEqual(pin, {"build_id": "b1", "tables_sha256": tables.sha256,
+                               "content_sha256": tables.content_sha256, "kb_sha256": tables.kb_sha256})
         self.assertIsNone(prepared["routing_why_not"])
 
     def why_not(self, scenario, damage):
@@ -500,8 +507,43 @@ class RoutedMeasureTest(unittest.TestCase):
         self.assertEqual(without_latency(unpinned.records()), without_latency(base))
         self.assertEqual(short["exact"], unpinned.summary()["engines"][sb.ENGINE]["exact"])
 
+    def test_an_older_measure_finishing_last_never_replaces_a_newer_verdict(self):
+        scenario = Scenario(unseen=True)
+
+        def prepare(sb_id, now):
+            payload = scenario.payload(sb_id)
+            prepared = sb.prepare(scenario.storage, scenario.tickets, scenario.labels, payload,
+                                  refs_table=scenario.refs, now=now)
+            payload.update(kb_run_id=prepared["kb_run_id"], routing=prepared["routing"])
+            return payload, prepared
+
+        def finish(payload, prepared):
+            ranges = pipeline.batches(prepared["count"], 25)
+            parts = [sb.batch(scenario.storage, payload, a, b) for a, b in ranges]
+            return sb.report(scenario.storage, scenario.scores, payload, ranges, prepared, parts)
+
+        older = prepare("sbA", "2026-10-14T10:00:00+00:00")
+        # then a labeler adds a ticket the Teams alias decides, but that needs another fiche
+        scenario.tickets.upsert({"PartitionKey": CLIENT, "RowKey": "I901", "titre": "attribuer ligne teams",
+                                 "sujet": "", "description": ""})
+        label(scenario.labels, "I901", [f"KB0900 - {FILLER_TOPICS[0]}"])
+        newer = prepare("sbB", "2026-10-14T11:00:00+00:00")
+        self.assertEqual(finish(*newer)["routing"]["status"], "failed")
+        self.assertEqual(finish(*older)["routing"]["status"], "passed")        # measured on fewer labels
+        gate = scenario.blob(scenario.gate_name())
+        self.assertEqual((gate["sb_id"], gate["status"]), ("sbB", "failed"))   # the newer verdict stays
+        self.assertTrue(scenario.summary()["routing"]["gate_file_kept"])
+        with self.assertRaises(ValueError):
+            fx.activate(scenario.storage, "b1")
+
+    def test_a_gate_whose_only_exact_decision_is_a_seen_reference_is_insufficient(self):
+        short, _, _ = Scenario().measure()
+        self.assertEqual(short["routing"]["status"], "insufficient")
+        gate = Scenario().measure()[0]
+        self.assertEqual(gate["routing"]["status"], "insufficient")
+
     def test_the_gate_is_written_where_activation_reads_it_and_activation_accepts_it(self):
-        scenario = Scenario()
+        scenario = Scenario(unseen=True)
         short, _, _ = scenario.measure()
         gate = scenario.blob(scenario.gate_name())
         candidate = scenario.blob("routing/candidate.json")
@@ -513,8 +555,8 @@ class RoutedMeasureTest(unittest.TestCase):
         self.assertEqual((gate["content_sha256"], gate["tables_sha256"]),
                          (candidate["content_sha256"], candidate["tables_sha256"]))
         self.assertEqual((gate["wrong_exact"], gate["compared"], gate["excluded"], gate["routed_exact"]),
-                         ({"k": 0, "n": 1, "ids": []}, 30, [fx.REF], 1))
-        self.assertEqual((gate["route_first"]["k"], gate["base_first"]["k"]), (30, 30))
+                         ({"k": 0, "n": 2, "ids": []}, 31, [fx.REF], 2))
+        self.assertEqual((gate["route_first"]["k"], gate["base_first"]["k"]), (31, 31))
         self.assertEqual(short["routing"], {"status": "passed", "build_id": "b1", "why_not": None})
         raw = scenario.storage.read(fx.CONTAINER, scenario.gate_name()).decode("utf-8")
         self.assertEqual(raw, json.dumps(gate, ensure_ascii=False, sort_keys=True, indent=1) + "\n")
@@ -523,26 +565,26 @@ class RoutedMeasureTest(unittest.TestCase):
                          ("b1", "passed", "sb1"))
 
     def test_the_summary_short_output_and_scores_row_carry_the_gate(self):
-        scenario = Scenario()
+        scenario = Scenario(unseen=True)
         short, _, _ = scenario.measure()
         summary = scenario.summary()
         routing = summary["routing"]
         self.assertEqual((routing["engine"], routing["build_id"], routing["gate"]["status"], routing["seen"],
                           routing["failures"], routing["gate_file"]),
                          (sb.ROUTE_ENGINE, "b1", "passed", [fx.REF], 0, scenario.gate_name()))
-        self.assertEqual(routing["counters"]["records"], 31)
+        self.assertEqual(routing["counters"]["records"], 32)
         self.assertEqual(list(summary["engines"]), [sb.ENGINE, sb.ROUTE_ENGINE])
         self.assertEqual(set(summary["by_route"][sb.ROUTE_ENGINE]), {"L1", "L3"})
         self.assertEqual(summary["degraded"], {"base": 0, "route": 0,
                                                "reasons": {sb.ENGINE: {}, sb.ROUTE_ENGINE: {}}})
         self.assertEqual(summary["prepared"]["routing"]["build_id"], "b1")
         self.assertEqual(short["degraded"], {"base": 0, "route": 0})
-        self.assertEqual((short["tickets"], short["interpret_failures"]), (31, 0))   # today's engine's, top-level
+        self.assertEqual((short["tickets"], short["interpret_failures"]), (32, 0))   # today's engine's, top-level
         row = scenario.scores.get(CLIENT, "sb1")
         self.assertEqual({k: row[k] for k in ("route_status", "route_wrong_k", "route_wrong_n", "route_first_k",
                                               "base_first_k", "route_compared", "route_build", "degraded_k")},
-                         {"route_status": "passed", "route_wrong_k": 0, "route_wrong_n": 1, "route_first_k": 30,
-                          "base_first_k": 30, "route_compared": 30, "route_build": "b1", "degraded_k": 0})
+                         {"route_status": "passed", "route_wrong_k": 0, "route_wrong_n": 2, "route_first_k": 31,
+                          "base_first_k": 31, "route_compared": 31, "route_build": "b1", "degraded_k": 0})
         report = sb.latest(scenario.storage, CLIENT)["report_md"]
         self.assertIn("## Routing gate (tables of build b1)", report)
         self.assertIn("Status: **passed**", report)

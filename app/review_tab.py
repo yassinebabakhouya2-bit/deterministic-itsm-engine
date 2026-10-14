@@ -564,7 +564,10 @@ def create_review_blueprint(engine, deps: dict):
                           "warnings": extra.get("warnings", []), "origin": extra.get("origin", "")})
         shown += [{"orig": "", "id": "", "label_fr": "", "description_fr": "", "delete": False, "n": None,
                    "members": [], "fiches": 0, "warnings": [], "origin": ""}] * BLANK_TAXONOMY_ROWS
+        frozen = view.get("frozen") or {}
+        base_version = frozen.get("version") if isinstance(frozen.get("version"), int) else 0
         return _render("taxonomy", http_status=status, client=client, d=view, tax_source=source, source_build=source_build,
+                       base_version=base_version,
                        rows=shown, error=error, orphans=_orphan_rows(orphans), msg=msg if msg is not None else _msg(),
                        calls=view["counts"]["routable"] or "180")
 
@@ -599,7 +602,12 @@ def create_review_blueprint(engine, deps: dict):
             if rows is None:
                 abort(400)
         intents = freeze_intents(rows)
-        body = {"client": client, "by": _by(), "source_build": source_build, "intents": intents}
+        base = form.get("base_version", "")
+        if not base.isdigit() or len(base) > 6:
+            abort(400)
+        # the frozen version this form was built from: a freeze made by someone else meanwhile is never overwritten
+        body = {"client": client, "by": _by(), "source_build": source_build, "intents": intents,
+                "base_version": int(base)}
         if form.get("orphans_ok") == "1":
             body["orphans_ok"] = True
         try:
@@ -929,7 +937,7 @@ PAGE = """
   <form method="post" action="/review/{{ client }}/taxonomy" class="card" onsubmit="return confirm('Figer cette taxonomie relance la passe C sur chaque fiche routable au prochain « Reconstruire et mesurer » : environ {{ calls }} appels du modèle, {{ pass_c_minutes }}. Continuer ?')">
     <h2>{{ 'Proposition de la passe B' if tax_source == 'proposed' else 'Taxonomie figée' }} — à figer</h2>
     <p class="muted">Un identifiant : des mots français en MAJUSCULES séparés par « _ », l'action d'abord, jamais le nom d'une application (elle est un champ à part). Libellé court (120 caractères), description d'une phrase (200).</p>
-    <input type="hidden" name="source" value="{{ tax_source }}"><input type="hidden" name="source_build" value="{{ source_build }}"><input type="hidden" name="rows" value="{{ rows|length }}">
+    <input type="hidden" name="source" value="{{ tax_source }}"><input type="hidden" name="source_build" value="{{ source_build }}"><input type="hidden" name="base_version" value="{{ base_version }}"><input type="hidden" name="rows" value="{{ rows|length }}">
     <table><tr><th>Entrée</th><th>Identifiant</th><th>Libellé</th><th>Description</th><th>Membres</th><th>Supprimer</th></tr>
     {% for r in rows %}{% set i = loop.index0 %}<tr>
       <td class="muted">{{ r.n or '' }}</td>

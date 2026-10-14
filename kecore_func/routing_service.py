@@ -75,7 +75,10 @@ LEASE = "routing/running.json"
 HISTORY = "routing/history/"
 GATES = "routing/gates/"
 
-LEASE_TTL_S = 2 * 3600       # host.json functionTimeout: a lease older than any activity can run is a dead run's
+# A routing run's activities refresh its lease (``heartbeat_at``); a lease not refreshed for this long is a
+# dead run's. Longer than one activity can run (host.json functionTimeout, 2 h) plus the measure that follows
+# the last refresh (the build), which reads every labeled question through two engines.
+LEASE_TTL_S = 4 * 3600
 TEXT_EXCERPT_CHARS = 1500
 WRITE_TRIES = 3
 MAX_CARRY_KEYS = 500
@@ -123,6 +126,13 @@ def _read(storage, client: str, name: str):
         return json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise StoredFileError(f"{_container(client)}/{name} is not valid JSON ({str(exc)[:200]})") from None
+
+
+def _parse_json(data: bytes):
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, AttributeError):
+        return None
 
 
 def _write(storage, client: str, name: str, data) -> None:
@@ -335,10 +345,21 @@ def validate_carry_request(body, allowed_clients) -> dict:
 
 def _stale(held: dict, now) -> bool:
     try:
-        started = _parse_time(held.get("started_at"))
+        last = _parse_time(held.get("heartbeat_at") or held.get("started_at"))
     except (TypeError, ValueError):
         return True
-    return (_parse_time(now) - started).total_seconds() > LEASE_TTL_S
+    return (_parse_time(now) - last).total_seconds() > LEASE_TTL_S
+
+
+def heartbeat(storage, client: str, build_id: str, now=None) -> None:
+    """The run holding the lease says it is alive (each routing activity): a long pass C under throttling is
+    never mistaken for a dead run. Another run's lease is never touched."""
+    try:
+        held = _read(storage, client, LEASE)
+    except StoredFileError:
+        return
+    if isinstance(held, dict) and held.get("build_id") == build_id:
+        _write(storage, client, LEASE, {**held, "heartbeat_at": str(now or _now())})
 
 
 def lease(storage, client: str, now) -> dict | None:
@@ -365,9 +386,15 @@ def _take_lease(storage, client: str, build_id: str, kind: str, now) -> dict | N
         if isinstance(held, dict) and held and not _stale(held, now):
             return held
         if held is not None:
-            storage.delete(_container(client), LEASE)
+            # a dead run's lease: delete it only if it is still the very lease judged dead (another starter
+            # may have replaced it meanwhile), then take it and check it is really ours
+            seen = storage.read(_container(client), LEASE)
+            if seen is not None and _dict(_parse_json(seen)) == _dict(held):
+                storage.delete(_container(client), LEASE)
         if _write_if_absent(storage, client, LEASE, entry):
-            return None
+            mine = _dict(_parse_json(storage.read(_container(client), LEASE) or b"{}"))
+            if mine.get("build_id") == build_id:
+                return None
     return lease(storage, client, now) or {"build_id": "?", "started_at": "?"}
 
 
@@ -534,6 +561,7 @@ def propose_taxonomy(storage, payload: dict, llm) -> dict:
     the build (taxonomy.proposed.json) and named by routing/taxonomy-proposal.json. Nothing is frozen here:
     a person reviews, edits and freezes it (POST kecore/review/taxonomy)."""
     client, run_id, build_id = payload["client"], payload["run_id"], payload["build_id"]
+    heartbeat(storage, client, build_id)
     kbmap = _map(storage, client, run_id)
     ids = routable_fiches(kbmap)
     enrichments = [item for item in _pass_a(storage, client, kbmap, ids).values() if item is not None]
@@ -550,6 +578,7 @@ def assign(storage, payload: dict, start: int, end: int, llm) -> dict:
     """Pass C of routable fiches [start, end) (kefind.assign), one file each (assign/<position>.json), with
     the taxonomy the build copied. A per-fiche failure stays in that fiche's file, never the batch's."""
     client, run_id, build_id = payload["client"], payload["run_id"], payload["build_id"]
+    heartbeat(storage, client, build_id)
     kbmap = _map(storage, client, run_id)
     ids = routable_fiches(kbmap)
     taxonomy = _build_taxonomy(storage, client, build_id)
@@ -574,6 +603,7 @@ def assign_summary(storage, payload: dict) -> dict:
     """Reads every pass-C file of the build (all must be there), writes assign/index.json ({fiche_id:
     "nnnnn"}), assign/summary.json and routing/assignments.json (this build now holds the proposals)."""
     client, run_id, build_id = payload["client"], payload["run_id"], payload["build_id"]
+    heartbeat(storage, client, build_id)
     kbmap = _map(storage, client, run_id)
     ids = routable_fiches(kbmap)
     taxonomy = _build_taxonomy(storage, client, build_id)
@@ -616,6 +646,7 @@ def build(storage, review_rows, payload: dict, now) -> dict:
     was activated for keeps being served until this run is published). Anything else leaves active.json as
     it is and says why (``why_not``): a person measures and activates the new tables."""
     client, run_id, build_id = payload["client"], payload["run_id"], payload["build_id"]
+    heartbeat(storage, client, build_id)
     kbmap = _map(storage, client, run_id)
     current = source_hashes(storage, client, run_id)
     ids = routable_fiches(kbmap)
@@ -661,6 +692,19 @@ def _killed(storage, client: str) -> dict:
     return kill if kill.get("killed") is True else {}
 
 
+def failed_gate(storage, client: str, content_sha256, run_id) -> dict | None:
+    """The gate on file for these tables on that run when its latest verdict is "failed" (a wrong fiche
+    shown as exact, or the right fiche first less often), else None. Such tables are not served, and their
+    activation is never carried over: a measure found them wrong after a person activated them."""
+    if not content_sha256 or not run_id:
+        return None
+    try:
+        gate = _read(storage, client, gate_path(str(content_sha256), str(run_id)))
+    except StoredFileError:
+        return None
+    return gate if isinstance(gate, dict) and gate.get("status") == "failed" else None
+
+
 def _carry_over(storage, client: str, tables: RoutingTables, now) -> tuple[bool, str]:
     before = storage.read(_container(client), ACTIVE)
     if before is None:
@@ -679,6 +723,8 @@ def _carry_over(storage, client: str, tables: RoutingTables, now) -> tuple[bool,
         return False, "the routing tables changed (content_sha256): measure and activate them"
     if tables.kb_sha256 != active.get("kb_sha256"):
         return False, "the knowledge base changed (kb_sha256: fiches, graph or dictionary): measure and activate them"
+    if failed_gate(storage, client, active.get("content_sha256"), active.get("run_id")):
+        return False, "the latest measure of the active tables failed: fix the decisions, measure and activate again"
     pointer = {"build_id": tables.build_id, "run_id": tables.run_id, "tables_sha256": tables.sha256,
                "content_sha256": tables.content_sha256, "kb_sha256": tables.kb_sha256,
                "activated_by": active.get("activated_by"), "activated_at": active.get("activated_at"),
@@ -762,12 +808,20 @@ def active_for(storage, client: str, run_id: str) -> tuple[dict | None, str | No
         return None, str(exc)
     if not isinstance(active, dict) or not active.get("build_id"):
         return None, None
+    entry = None
     if active.get("run_id") == run_id:
-        return active, None
-    previous = _dict(active.get("previous"))
-    if previous.get("build_id") and previous.get("run_id") == run_id:
-        return previous, None
-    return None, f"the active routing tables were built for run {active.get('run_id')}, not {run_id}"
+        entry = active
+    else:
+        previous = _dict(active.get("previous"))
+        if previous.get("build_id") and previous.get("run_id") == run_id:
+            entry = previous
+    if entry is None:
+        return None, f"the active routing tables were built for run {active.get('run_id')}, not {run_id}"
+    failed = failed_gate(storage, client, entry.get("content_sha256"), run_id)
+    if failed:
+        return None, (f"the latest measure of the active routing tables failed ({failed.get('sb_id') or '?'}): "
+                      "not served until fixed, measured and activated again")
+    return entry, None
 
 
 def _gate_view(gate: dict | None) -> dict | None:
@@ -1317,8 +1371,15 @@ def freeze_taxonomy(storage, review_rows, body: dict, now, kbmap=None) -> dict:
     orphans_ok = body.get("orphans_ok", False)
     if not isinstance(orphans_ok, bool):
         raise ValueError("orphans_ok : vrai ou faux")
+    base_version = body.get("base_version")
+    if base_version is not None and (isinstance(base_version, bool) or not isinstance(base_version, int)
+                                     or base_version < 0):
+        raise ValueError("base_version : la version figée de départ, un entier positif ou nul")
     client = body["client"]
     old = frozen_taxonomy(storage, client)
+    if base_version is not None and base_version != (old.version if old else 0):
+        raise ChangedError(f"la taxonomie a été figée entre-temps (version {old.version if old else 0}) : "
+                           "rechargez la page avant de figer, pour ne pas effacer cette version")
     new = freeze(body.get("intents"), (old.version + 1) if old else 1, by, str(now), source_build)
     if old is not None and new.sha256 == old.sha256:
         return {"version": old.version, "sha256": old.sha256, "intents": old.intents, "orphans": [], "unchanged": True}

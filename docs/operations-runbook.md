@@ -3396,7 +3396,16 @@ même livraison.
   décision, bloque les alias et les clés qu'elle propose ; une fiche sans réponse de passe C bloque tout
   L2) ; une intention dont le sens a changé au regel est écartée ; seule une clé (intention, application)
   exacte donne une fiche exacte ; un alias ne doit pas dépendre d'un caractère isolé (« étage 3 ») que le
-  routage ignore.
+  routage ignore. Ajouts de la revue adverse du code (13 constats, tous corrigés) : L1 ne décide jamais
+  si le mot de plus est une négation (« pas », « plus », « jamais », « not », « unable »…) ; « can't »,
+  « won't », « doesn't » sont écrits « can not », « will not », « does not » avant le découpage
+  (normalisation version 2 : les tables d'une version antérieure sont refusées, il faut reconstruire) ;
+  un alias validé sans application ne décide pas une question qui nomme une application absente de
+  l'alias ; les identifiants `kb:` et `update:` comptent comme les codes `err:`/`evt:` ; un alias validé
+  d'une fiche qui n'est plus routable, ou dont l'application a quitté le vocabulaire, bloque au lieu de
+  laisser une autre fiche paraître unique ; un refus définitif du modèle en L2 (filtre de contenu, HTTP
+  400, réponse non JSON) part en L3 sans marque « dégradé » (`l2.reason` `map_refused`), seul un échec
+  passager est dégradé.
 - **Ingestion** : la passe B (une fois par client, tant qu'aucune taxonomie n'est figée) propose une
   taxonomie fermée à partir des intentions de la passe A ; une personne la relit et la **fige** dans
   `/review` ; la passe C (une fois par fiche et par taxonomie figée) attribue une intention et des alias
@@ -3411,21 +3420,32 @@ même livraison.
 - **Run de routage** (`POST /api/kecore/routing/runs`, ou l'étape `routing` d'un run kecore, juste avant
   `publish`) : passe B si besoin (sautée tant que la passe A a des erreurs), passe C si besoin, tables
   toujours, puis la mesure (scoreboard) sauf dans un run kecore. Un seul run de routage à la fois (bail
-  `routing/running.json`, 2 h).
+  `routing/running.json`, renouvelé au début de chaque étape ; un bail sans signe de vie depuis 4 h est
+  repris, et seulement s'il n'a pas changé entre la lecture et la suppression). Figer la taxonomie
+  envoie la version vue à l'écran : si quelqu'un l'a figée entre-temps, le gel est refusé (« rechargez la
+  page »).
 - **Mesure et porte** : le scoreboard mesure le moteur d'aujourd'hui ET le moteur routé sur les mêmes
   questions ; porte `routing/gates/<contenu>-<run>.json` : `passed` (aucune mauvaise fiche montrée en
   L0-L2, bonne fiche en premier au moins aussi souvent, au moins 30 questions comparées), `insufficient`
-  (trop peu de questions, ou rien de routé exactement), `failed`, `invalid` (erreur, échec transitoire du
-  modèle, décision dégradée). Les questions de référence que le relecteur avait sous les yeux en écrivant
-  un alias (« seen ») sont exclues de la comparaison « bonne fiche en premier », jamais du compte des
-  mauvaises fiches exactes.
+  (trop peu de questions, ou aucune question **non vue** décidée en L0-L2), `failed`, `invalid` (erreur,
+  échec transitoire du modèle, décision dégradée). Les questions de référence que le relecteur avait sous
+  les yeux en écrivant un alias (« seen ») sont exclues de la comparaison « bonne fiche en premier »,
+  jamais du compte des mauvaises fiches exactes ; une porte ne passe jamais sur ces seules questions
+  (`routed_exact_unseen` dans le résumé). Une mesure plus ancienne qui finit après une plus récente
+  n'écrase pas sa porte (`prepared_at`, `gate_file_kept`).
 - **Activation** : par une personne, seulement sur des tables du run servi dont la porte a dit `passed` --
   ou `insufficient` acceptée explicitement avec une raison (enregistrée comme `override`). **Interrupteur**
   (`routing/kill.json`) : « Désactiver » coupe le routage partout en moins d'une minute, et rien ne le
   rallume sauf une nouvelle activation par une personne. **Report** : un nouveau run kecore dont les tables
   ont le même contenu ET la même base (aucune fiche ni dictionnaire modifié) reprend l'activation tout
   seul ; sinon le nouveau run est servi **sans** routage (`routing_error` « built for run X, not Y ») jusqu'à
-  une nouvelle mesure et une nouvelle activation -- sûr, mais à surveiller après chaque run kecore.
+  une nouvelle mesure et une nouvelle activation -- sûr, mais à surveiller après chaque run kecore. Si la
+  dernière mesure des tables actives dit `failed`, `/find` cesse de router (`routing_error` « the latest
+  measure of the active routing tables failed ») et le report est refusé, sans attendre « Désactiver ».
+- **Diagnostic** : une fiche L0-L2 n'est « identifiée » que si c'est la fiche exacte montrée ; une fiche
+  L2 seulement proposée s'affiche « Fiche proposée par le moteur déterministe — à confirmer ». Les
+  sessions sont enregistrées sans les champs de routage vides : la version précédente de la Web App
+  relit les sessions en cours après un retour arrière.
 - **Lot 2** : #4 le catalogue `kefindfiches` est rafraîchi après chaque publication ; #5 voir §19.14 ;
   #9 décisions dégradées comptées par moteur (`summary.degraded`, colonne `degraded_k`), un seuil mesuré
   sur une mesure dégradée n'est plus applicable ; le run de tickets écrit `kefind_degraded`.
@@ -3521,7 +3541,14 @@ mesurer » (passe C), valider intention + application par fiche, mesurer, active
 suit ; sinon `why_not` dit pourquoi et le nouveau run est servi sans routage jusqu'à une nouvelle mesure
 et activation. `$s.output.catalog` : le catalogue d'étiquetage rafraîchi.
 
-Tests : kecore 163 (+14), kefind 350 (+190 : routage, revue, passes B/C, routeur), scoreboard 144 (+73 :
-porte, enregistrements routés), kecore_func 290 (+171 : service de routage, routes, mesure routée,
-bout en bout en mémoire), app 212 (+95 : onglet Revue, client, Diagnostic). Pas encore déployé à la date de
+Tests : kecore 163 (+14), kefind 356 (+196 : routage, revue, passes B/C, routeur), scoreboard 144 (+73 :
+porte, enregistrements routés), kecore_func 295 (+176 : service de routage, routes, mesure routée,
+bout en bout en mémoire), app 215 (+98 : onglet Revue, client, Diagnostic). Pas encore déployé à la date de
 cette entrée.
+
+**Limites connues** (acceptées, à reprendre si elles gênent) : L2 ne tourne que si la table L2 n'est pas
+vide (phase 2) ; toute modification d'une fiche ou du dictionnaire change `kb_sha256`, donc arrête le
+report : nouvelle mesure et nouvelle activation après un tel run kecore ; un refus (400) d'une décision de
+revue fait perdre les alias tapés dans le formulaire ; la reprise d'un bail périmé compare les octets mais
+n'utilise pas d'ETag (deux reprises exactement simultanées d'un bail périmé pourraient encore lancer deux
+runs de routage à la fois).

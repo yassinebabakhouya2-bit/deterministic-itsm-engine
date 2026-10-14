@@ -605,6 +605,7 @@ def test_carry_all_takes_the_stale_keys_from_the_engine_never_from_the_form():
 
 def taxonomy_form(**overrides):
     form = {"source": "proposed", "source_build": "20261012T090000Z-def456", "decision": "freeze", "rows": "5",
+            "base_version": "0",
             "orig_0": "ATTRIBUTION_LIGNE", "id_0": "ATTRIBUTION_LIGNE", "label_fr_0": "Attribuer une ligne",
             "description_fr_0": "Donner un numéro.",
             "orig_1": "DEVERROUILLAGE_COMPTE", "id_1": "DEVERROUILLAGE_COMPTE", "label_fr_1": "Déverrouiller",
@@ -639,6 +640,7 @@ def test_the_taxonomy_page_edits_the_frozen_one_first():
     page = get(c, f"/review/{CLIENT}/taxonomy").get_data(as_text=True)
     assert "Figée : version 2" in page and 'name="source" value="frozen"' in page
     assert 'name="source_build" value="20261011T090000Z-xyz000"' in page and "4 fiche(s)" in page
+    assert 'name="base_version" value="2"' in page                # a freeze made meanwhile is never overwritten
     assert "Figer la proposition telle quelle" not in page
     page = get(c, f"/review/{CLIENT}/taxonomy?source=proposed").get_data(as_text=True)
     assert 'name="source" value="proposed"' in page and "Figer la proposition telle quelle" in page
@@ -656,7 +658,7 @@ def test_a_freeze_posts_the_rows_kept_skipping_deleted_and_blank_ones():
     r = post(client_of(app), f"/review/{CLIENT}/taxonomy", taxonomy_form(delete=["1"]))
     assert r.headers["Location"] == f"/review?client={CLIENT}&msg=frozen"
     assert engine.bodies("review_taxonomy") == [{
-        "client": CLIENT, "by": "Yassine", "source_build": "20261012T090000Z-def456",
+        "client": CLIENT, "by": "Yassine", "source_build": "20261012T090000Z-def456", "base_version": 0,
         "intents": [{"id": "ATTRIBUTION_LIGNE", "label_fr": "Attribuer une ligne", "description_fr": "Donner un numéro."},
                     {"id": "TRANSFERT_APPELS", "label_fr": "Transférer les appels", "description_fr": ""}]}]
 
@@ -737,9 +739,18 @@ def test_bad_taxonomy_forms_are_refused():
     assert engine.bodies("review_taxonomy") == []
 
 
+def test_a_freeze_without_its_base_version_is_refused():
+    app, engine = make_app()
+    form = taxonomy_form()
+    del form["base_version"]
+    assert post(client_of(app), f"/review/{CLIENT}/taxonomy", form).status_code == 400
+    assert post(client_of(app), f"/review/{CLIENT}/taxonomy", taxonomy_form(base_version="-1")).status_code == 400
+    assert engine.bodies("review_taxonomy") == []
+
+
 def test_a_large_taxonomy_can_delete_its_last_rows():
     rows = {"rows": "203", "source": "proposed", "source_build": "20261012T090000Z-def456", "decision": "freeze",
-            "delete": ["202"]}
+            "delete": ["202"], "base_version": "0"}
     for i in range(203):
         rows.update({f"id_{i}": f"INTENTION_{i:03d}", f"label_fr_{i}": f"Intention {i}"})
     app, engine = make_app()

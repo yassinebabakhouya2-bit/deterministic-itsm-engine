@@ -15,7 +15,7 @@ from kefind.interpret import interpret
 from kefind.review import ReviewDecision
 from kefind.route import (EXACT_LEVELS, MAP_SCHEMA_NAME, MAP_SYSTEM_PROMPT, TablesMismatchError, answer, check_tables,
                           map_prompt, map_question, map_schema, question_vector)
-from kefind.routing import CODE_VERSION, RoutingTables, build_tables
+from kefind.routing import CODE_VERSION, ROUTE_VERSION, RoutingTables, build_tables
 from kefind.taxonomy import freeze
 from scoreboard.dataset import Ticket
 from scoreboard.runner import make_record, run_engine
@@ -165,6 +165,7 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(intent_llm.calls, [])
         self.assertEqual(result.route["l1"], {"matches": [{"fiche_id": TEAMS, "alias": "attribuer ligne teams"}],
                                               "ambiguous": False, "uncovered": 0, "outside_scope": False,
+                                              "uncovered_negation": False, "generic_for_app": False,
                                               "blockers": []})
         self.assertFalse(result.route["l0"]["decided"])
         self.assertIsNone(result.route["l2"])
@@ -292,6 +293,18 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(self.ask(question, intent_llm=SchemaLLM({MAP_SCHEMA_NAME: RuntimeError("boom")}))
                          .route["l2"]["error"], "RuntimeError: boom")
 
+    def test_l2_a_mapping_the_model_refuses_for_good_is_measured_as_live_not_degraded(self):
+        question = "renvoyer mes appels sur mon portable"
+        for error in (LLMError("POST /chat -> HTTP 400: content_filter triggered"), LLMError("the model refused: no"),
+                      LLMError("the answer was cut at max_tokens (150)"), LLMError("the model did not return JSON")):
+            result = self.ask(question, intent_llm=SchemaLLM({MAP_SCHEMA_NAME: error}))
+            self.assertIsNone(result.degraded, str(error))
+            self.assertEqual((result.route["l2"]["reason"], result.route["l2"]["exact"]), ("map_refused", None))
+            self.assertIn(result.route["level"], ("L3", "L4"))
+        # throttling or the service down stay degraded: a rerun could answer otherwise
+        throttled = self.ask(question, intent_llm=SchemaLLM({MAP_SCHEMA_NAME: LLMError("POST /chat -> HTTP 429: busy")}))
+        self.assertEqual(throttled.degraded, "l2_failed:LLMError")
+
     def test_l2_and_the_embedding_both_failing_say_both(self):
         self.embedder = FailingEmbedder()
         result = self.ask("renvoyer mes appels sur mon portable", intent_llm=SchemaLLM({MAP_SCHEMA_NAME: LLMError("x")}))
@@ -392,10 +405,11 @@ class RouteTest(unittest.TestCase):
             route = result.route
             self.assertEqual(set(route), ROUTE_KEYS)
             self.assertEqual((route["version"], route["tables_sha256"], route["content_sha256"], route["build_id"],
-                              route["run_id"]), (1, tables.sha256, tables.content_sha256, "b1", "r1"))
+                              route["run_id"]), (ROUTE_VERSION, tables.sha256, tables.content_sha256, "b1", "r1"))
             self.assertEqual(set(route["l0"]), {"decided", "rule", "key", "fiche_id", "scope"})
             if route["l1"] is not None:
-                self.assertEqual(set(route["l1"]), {"matches", "ambiguous", "uncovered", "outside_scope", "blockers"})
+                self.assertEqual(set(route["l1"]), {"matches", "ambiguous", "uncovered", "outside_scope", "uncovered_negation",
+                                            "generic_for_app", "blockers"})
             if route["l2"] is not None:
                 self.assertEqual(set(route["l2"]), L2_KEYS)
             json.dumps(route)   # plain data
@@ -416,7 +430,7 @@ class RouteTest(unittest.TestCase):
         check_tables(tables, self.kbmap, CURRENT)
         other_run = tables_for(words_map(run_id="r2"))
         other_client = RoutingTables.from_dict({**tables.to_dict(), "client": "clientb"})
-        other_code = RoutingTables.from_dict({**tables.to_dict(), "code_version": {**CODE_VERSION, "route": 2}})
+        other_code = RoutingTables.from_dict({**tables.to_dict(), "code_version": {**CODE_VERSION, "route": 99}})
         for bad in (other_run, other_client, other_code):
             with self.assertRaises(TablesMismatchError):
                 self.ask("KB0120", tables=bad)

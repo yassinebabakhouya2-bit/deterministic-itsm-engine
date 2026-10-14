@@ -1249,7 +1249,7 @@ class RoutingMeasureEndToEndTest(unittest.TestCase):
 
         self.fx = fixtures
         self.fa = load_app()
-        self.scenario = scoreboard_fixtures.Scenario(build=False)
+        self.scenario = scoreboard_fixtures.Scenario(build=False, unseen=True)
         self.storage = self.scenario.storage
         self.tables = {"tickets": self.scenario.tickets, "ticketlabels": self.scenario.labels,
                        "refquestions": self.scenario.refs, "kefindreview": self.scenario.reviews,

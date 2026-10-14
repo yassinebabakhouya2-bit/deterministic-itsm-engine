@@ -314,12 +314,20 @@ class LeaseTest(unittest.TestCase):
         svc.prepare(self.storage, payload("b1"), NOW)
         self.assertNotIn("error", svc.prepare(self.storage, payload("b1"), LATER))
 
-    def test_a_dead_runs_lease_is_replaced_after_two_hours(self):
+    def test_a_dead_runs_lease_is_replaced_after_four_hours_without_a_heartbeat(self):
         svc.prepare(self.storage, payload("b1"), NOW)
-        self.assertIn("error", svc.prepare(self.storage, payload("b2"), "2026-10-14T13:59:00+00:00"))
-        self.assertIsNone(svc.lease(self.storage, CLIENT, "2026-10-14T14:01:00+00:00"))
-        self.assertNotIn("error", svc.prepare(self.storage, payload("b2"), "2026-10-14T14:01:00+00:00"))
+        self.assertIn("error", svc.prepare(self.storage, payload("b2"), "2026-10-14T15:59:00+00:00"))
+        self.assertIsNone(svc.lease(self.storage, CLIENT, "2026-10-14T16:01:00+00:00"))
+        self.assertNotIn("error", svc.prepare(self.storage, payload("b2"), "2026-10-14T16:01:00+00:00"))
         self.assertEqual(blob(self.storage, svc.LEASE)["build_id"], "b2")
+
+    def test_a_live_runs_heartbeat_keeps_its_lease(self):
+        svc.prepare(self.storage, payload("b1"), NOW)
+        svc.heartbeat(self.storage, CLIENT, "b1", "2026-10-14T15:00:00+00:00")
+        svc.heartbeat(self.storage, CLIENT, "b2", "2026-10-14T18:00:00+00:00")     # another run's: ignored
+        self.assertIn("error", svc.prepare(self.storage, payload("b2"), "2026-10-14T18:59:00+00:00"))
+        self.assertEqual(blob(self.storage, svc.LEASE)["build_id"], "b1")
+        self.assertNotIn("error", svc.prepare(self.storage, payload("b2"), "2026-10-14T19:01:00+00:00"))
 
     def test_a_storage_without_a_conditional_write_still_takes_one_lease(self):
         storage = write_run(MemoryStorage())
@@ -621,6 +629,20 @@ class CarryOverTest(unittest.TestCase):
         built = self.rebuild("b3")
         self.assertFalse(built["carried"])
         self.assertIn("content_sha256", built["why_not"])
+        self.assertEqual(blob(self.storage, svc.ACTIVE)["build_id"], "b1")
+
+    def test_a_failed_measure_of_the_active_tables_stops_them_and_their_carry_over(self):
+        self.assertEqual(svc.active_for(self.storage, CLIENT, RUN)[0]["build_id"], "b1")
+        write_gate(self.storage, "b1", status="failed")       # a later measure found a wrong exact fiche
+        entry, why = svc.active_for(self.storage, CLIENT, RUN)
+        self.assertIsNone(entry)
+        self.assertIn("latest measure of the active routing tables failed", why)
+        status = svc.status(self.storage, CLIENT, NOW)
+        self.assertFalse(status["effective"])
+        write_run(self.storage, RUN2, publish=False)
+        built = self.rebuild("b2")
+        self.assertFalse(built["carried"])
+        self.assertIn("latest measure of the active tables failed", built["why_not"])
         self.assertEqual(blob(self.storage, svc.ACTIVE)["build_id"], "b1")
 
     def test_the_kill_switch_is_sticky_against_carry_over(self):
@@ -1192,6 +1214,16 @@ class FreezeTaxonomyTest(unittest.TestCase):
         with self.assertRaisesRegex(svc.ChangedError, "une autre version"):
             freeze(self.storage, self.table, FROZEN[:1], now=LATER)
         self.assertEqual(svc.frozen_taxonomy(self.storage, CLIENT).version, 1)
+
+    def test_a_form_built_from_an_older_version_never_overwrites_a_newer_freeze(self):
+        freeze(self.storage, self.table, base_version=0)
+        freeze(self.storage, self.table, FROZEN[:1], now=LATER, base_version=1)       # reviewer B: v2
+        with self.assertRaisesRegex(svc.ChangedError, r"figée entre-temps \(version 2\)"):
+            freeze(self.storage, self.table, FROZEN, now=LATER, base_version=1)       # reviewer A, still on v1
+        self.assertEqual(svc.frozen_taxonomy(self.storage, CLIENT).version, 2)
+        for bad in (-1, "1", True):
+            with self.assertRaises(ValueError):
+                freeze(self.storage, self.table, FROZEN, base_version=bad)
 
 
 if __name__ == "__main__":

@@ -199,7 +199,8 @@ def pin_routing(storage: pipeline.Storage, client: str, run_id: str, kbmap) -> t
             "content_sha256": tables.content_sha256, "kb_sha256": tables.kb_sha256}, None
 
 
-def prepare(storage: pipeline.Storage, tickets_table, labels_table, payload: dict, refs_table=None) -> dict:
+def prepare(storage: pipeline.Storage, tickets_table, labels_table, payload: dict, refs_table=None,
+            now: str | None = None) -> dict:
     """Freezes the labeled set the run measures (dataset.jsonl): ticket text, accepted fiches, half --
     the labeled tickets, then the reference questions -- and pins the candidate routing tables of the run
     (``pin_routing``): "routing" is what every batch measures with them, None when there are none."""
@@ -229,6 +230,8 @@ def prepare(storage: pipeline.Storage, tickets_table, labels_table, payload: dic
     data = "".join(json.dumps(t.to_dict(), ensure_ascii=False) + "\n" for t in tickets).encode("utf-8")
     storage.write(pipeline.kecore_container(client), layout(payload["sb_id"])["dataset"], data)
     pin, why_not = pin_routing(storage, client, run_id, kbmap)
+    if pin is not None:  # when the labels were frozen: a gate never yields to a measure frozen before it
+        pin = {**pin, "prepared_at": now or datetime.now(timezone.utc).isoformat(timespec="microseconds")}
     return {"sb_id": payload["sb_id"], "kb_run_id": run_id, "count": len(tickets),
             "with_fiche": sum(1 for t in tickets if t.expected), "without_fiche": sum(1 for t in tickets if not t.expected),
             "references": len(references), "missing": missing, "empty": empty, "dataset_sha256": _sha256(data),
@@ -619,7 +622,8 @@ def _gate_file(gate: dict, pin: dict, sb_id: str, kb_run_id: str, seen: list[str
             "wrong_exact": gate["wrong_exact"], "route_first": gate["right_first"]["route"],
             "base_first": gate["right_first"]["base"], "compared": gate["compared"], "excluded": gate["excluded"],
             "tickets": gate["tickets"], "routed_exact": gate["routed_exact"], "mcnemar": gate["mcnemar"],
-            "by_level": gate["by_level"], "seen": list(seen), "failures": failures, "degraded": degraded}
+            "by_level": gate["by_level"], "seen": list(seen), "failures": failures, "degraded": degraded,
+            "prepared_at": pin.get("prepared_at") or ""}
 
 
 def report(storage: pipeline.Storage, scores_table, payload: dict, ranges: list[list[int]], prepared: dict,
@@ -664,9 +668,18 @@ def report(storage: pipeline.Storage, scores_table, payload: dict, ranges: list[
         both_degraded = degraded["base"] + (degraded["route"] or 0)
         gate = routing_gate(records, routed, seen, failures=transient, degraded=both_degraded)
         gate_name = _routing_svc().gate_path(pin["content_sha256"], payload["kb_run_id"])
-        storage.write(container, gate_name, _gate_bytes(_gate_file(
-            gate, pin, payload["sb_id"], payload["kb_run_id"], seen, transient, both_degraded)))
-        routing = {"engine": ROUTE_ENGINE, **pin, "gate": gate, "gate_file": gate_name, "seen": seen,
+        gate_file = _gate_file(gate, pin, payload["sb_id"], payload["kb_run_id"], seen, transient, both_degraded)
+        # the verdict on file is the one of the measure whose labels were frozen LAST: an older measure
+        # finishing late never replaces a newer one (a "failed" found on more labels stays)
+        try:
+            on_file = json.loads((storage.read(container, gate_name) or b"null").decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            on_file = None
+        newer = isinstance(on_file, dict) and str(on_file.get("prepared_at") or "") > gate_file["prepared_at"]
+        if not newer:
+            storage.write(container, gate_name, _gate_bytes(gate_file))
+        routing = {"engine": ROUTE_ENGINE, **pin, "gate": gate, "gate_file": gate_name, "gate_file_kept": newer,
+                   "seen": seen,
                    "seen_note": seen_note, "failures": transient, "counters": counters}
 
     refs = reference_results(records, tickets, routed, seen)

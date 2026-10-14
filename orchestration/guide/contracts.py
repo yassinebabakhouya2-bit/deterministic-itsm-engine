@@ -62,6 +62,7 @@ class KbCandidate(Strict):
     excerpt: str = Field("", max_length=4000)
     route_level: str = Field("", max_length=8)       # "" | "L0" | "L1" | "L2" | "L3" (module docstring)
     route_key: str = Field("", max_length=200)       # the table key that decided, for the fiche the engine shows only
+    route_exact: bool = False                        # THE fiche the engine showed as exact (L0-L2), never an offer
 
 
 class GuideStep(Strict):

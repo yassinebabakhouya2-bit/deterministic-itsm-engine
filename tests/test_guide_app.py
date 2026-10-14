@@ -628,3 +628,20 @@ def test_a_stored_approximate_guide_is_never_labelled_by_a_route():
     _pack(row, "stateJson", json.dumps(state))
     page = page_of(c, sid)
     assert "Fiche la plus proche" in page and "formulation validée" not in page and "Fiche identifiée" not in page
+
+
+def test_an_unrouted_session_is_stored_without_route_fields_and_a_routed_one_keeps_them():
+    # the previous Web App's Strict models refuse unknown fields: a session nobody routed must stay readable
+    # by it (a deployment in progress, a rollback)
+    from guide.service import _unpack
+    app, store = make_app()
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "probleme"}))
+    stored = _unpack(store.rows[("client-s", sid)], "stateJson")
+    assert "route_level" not in stored and "route_key" not in stored and "route_exact" not in stored
+    app, store = make_app(engine=FakeEngine(route={"level": "L1", "key": "attribuer ligne teams", "fiche_id": "KB0120"}))
+    c = app.test_client()
+    sid = sid_of(post(c, "/diag/new", {"client_id": "client-s", "text": "x"}))
+    stored = json.loads(_unpack(store.rows[("client-s", sid)], "stateJson"))
+    assert (stored["guide"]["route_level"], stored["guide"]["route_key"]) == ("L1", "attribuer ligne teams")
+    assert "formulation validée" in page_of(c, sid)

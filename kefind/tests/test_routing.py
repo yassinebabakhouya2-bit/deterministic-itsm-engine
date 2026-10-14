@@ -107,7 +107,7 @@ def l1(tables, kb, text):
 
 class ConstantsTest(unittest.TestCase):
     def test_code_version(self):
-        self.assertEqual(CODE_VERSION, {"tables": 1, "normalization": NORMALIZATION_VERSION, "route": 1,
+        self.assertEqual(CODE_VERSION, {"tables": 1, "normalization": NORMALIZATION_VERSION, "route": 2,
                                         "map_prompt": 1, "l1_max_uncovered": L1_MAX_UNCOVERED})
         self.assertEqual((L1_MAX_UNCOVERED, MIN_GATE_QUESTIONS), (1, 30))
 
@@ -368,7 +368,52 @@ class L1Test(unittest.TestCase):
                                                         "aliases": ["réinitialiser mot de passe SAP"]}})
         self.assertEqual(reviewed.pending, [])
         self.assertNotEqual(reviewed.content_sha256, tables.content_sha256)
-        self.assertEqual(l1(reviewed, self.kb, "réinitialiser mot de passe SAP")["fiche_id"], PASSWORD)
+        # the question names SAP and the alias's fiche names no application: L1 leaves it to L2
+        result = l1(reviewed, self.kb, "réinitialiser mot de passe SAP")
+        self.assertEqual((result["decided"], result["candidate"], result["generic_for_app"]), (False, PASSWORD, True))
+
+    def test_an_alias_naming_no_application_never_decides_a_question_naming_one(self):
+        tables = self.build([decided(PASSWORD, self.current, aliases=["réinitialiser mot de passe"]),
+                             decided(SAP_PASSWORD, self.current, aliases=["mot de passe SAP oublié"], app="sap")])
+        self.assertEqual(l1(tables, self.kb, "réinitialiser le mot de passe")["fiche_id"], PASSWORD)
+        result = l1(tables, self.kb, "réinitialiser mot de passe SAP")
+        self.assertEqual((result["decided"], result["candidate"], result["generic_for_app"]), (False, PASSWORD, True))
+        # an alias of the application's own fiche still decides
+        self.assertEqual(l1(tables, self.kb, "mot de passe SAP oublié")["fiche_id"], SAP_PASSWORD)
+
+    def test_the_word_beyond_the_alias_is_never_a_negation(self):
+        tables = self.build([decided(OUTLOOK_SYNC, self.current, aliases=["synchroniser contacts outlook"],
+                                     app="outlook")])
+        self.assertEqual(l1(tables, self.kb, "synchroniser les contacts outlook")["fiche_id"], OUTLOOK_SYNC)
+        for text in ("impossible de synchroniser les contacts outlook", "je ne peux pas synchroniser les contacts outlook",
+                     "I can't synchroniser contacts outlook"):
+            result = l1(tables, self.kb, text)
+            self.assertFalse(result["decided"], text)
+            if result["uncovered"] <= 1:
+                self.assertTrue(result["uncovered_negation"], text)
+
+    def test_a_validated_fiche_no_longer_routable_still_blocks_with_its_aliases(self):
+        self.assertNotIn(PRINTER_COPY, routable(self.kb))   # the duplicate of PRINTER
+        printer = decided(PRINTER, self.current, aliases=["bourrage papier imprimante"])
+        copy = decided(PRINTER_COPY, self.current, aliases=["bourrage papier imprimante accueil"])
+        self.assertEqual(l1(self.build([printer]), self.kb, "bourrage papier imprimante accueil")["fiche_id"], PRINTER)
+        tables = self.build([printer, copy])
+        self.assertIn({"tokens": ["accueil", "bourrage", "imprimante", "papier"], "fiches": [PRINTER_COPY]},
+                      tables.pending)
+        self.assertFalse(l1(tables, self.kb, "bourrage papier imprimante accueil")["decided"])
+        self.assertEqual(l1(tables, self.kb, "bourrage papier imprimante")["fiche_id"], PRINTER)
+
+    def test_a_cited_update_or_kb_article_restricts_the_scope(self):
+        update = "KB0700 - Mise à jour KB5034441"
+        kb = kbmap(extra=[make(update, "Installer la mise à jour KB5034441 manuellement.",
+                               entities=["update:KB5034441"])])
+        current = current_of(kb)
+        tables = build_tables(kb, current, None, [decided(PASSWORD, current, aliases=["mise à jour échoue"])], {}, "b1")
+        cleaned = clean_text("mise à jour KB5034441 échoue")
+        scope = identifier_scope(kb, cleaned)
+        self.assertEqual((scope["any"], scope["union"]), (True, [update]))
+        result = match_l1(tables, cleaned, set(), scope)
+        self.assertEqual((result["decided"], result["outside_scope"]), (False, True))
 
     def test_a_question_citing_another_fiches_number_blocks_l1_outside_its_scope(self):
         tables = self.build([decided(TEAMS, self.current, aliases=["attribuer ligne teams"], app="teams")])
@@ -565,7 +610,7 @@ class TablesTest(unittest.TestCase):
                                       app="webex")] + self.decisions[1:])
         self.assertNotEqual(changed.content_sha256, base.content_sha256)
         other_code = RoutingTables.from_dict(base.to_dict())
-        other_code.code_version = {**CODE_VERSION, "route": 2}
+        other_code.code_version = {**CODE_VERSION, "route": 99}
         self.assertNotEqual(other_code.compute_content_sha256(), base.content_sha256)
 
     def test_deterministic_whatever_the_order_of_the_decisions(self):

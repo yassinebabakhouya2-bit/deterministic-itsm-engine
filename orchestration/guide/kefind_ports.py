@@ -218,7 +218,8 @@ class KefindPorts:
             out.append(KbCandidate(parent_id=parent_id_of(fiche_id, run_id), title=(labels.get(fiche_id) or fiche_id)[:300],
                                    reranker_score=score, source_system="sharepoint",
                                    route_level=level if routed else "",
-                                   route_key=_route_key(route) if routed and fiche_id == shown else ""))
+                                   route_key=_route_key(route) if routed and fiche_id == shown else "",
+                                   route_exact=bool(routed and fiche_id == shown and level in EXACT_LEVELS)))
         return out[:MAX_CANDIDATES]
 
     # --------------------------------------------------------------- ports

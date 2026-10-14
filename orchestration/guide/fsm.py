@@ -203,6 +203,10 @@ def _route_of(cand: KbCandidate, forced: bool, approximate: bool) -> dict:
     unrouted guide (and its guide_sha256) stays byte-identical to what it was before routing existed."""
     if forced or approximate or not cand.route_level:
         return {}
+    if cand.route_level in ("L0", "L1", "L2") and not cand.route_exact:
+        # a fiche the engine only OFFERED (an L2 choice), taken because a client's thresholds count an offer
+        # as strong: never "identifiée" -- "offer" renders as a fiche to confirm
+        return {"route_level": "offer"}
     return {"route_level": cand.route_level, **({"route_key": cand.route_key} if cand.route_key else {})}
 
 

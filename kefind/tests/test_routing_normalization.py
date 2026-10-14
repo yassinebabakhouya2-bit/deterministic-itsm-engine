@@ -40,9 +40,17 @@ class RouteTokensTest(unittest.TestCase):
         self.assertEqual(alias_problem("comment bloquer"), "moins de 2 mots utiles au routage")
         self.assertIsNone(alias_problem("attribuer une ligne Teams"))
 
+    def test_english_negative_contractions_keep_their_negation(self):
+        self.assertEqual(route_tokens("I can't sign in to Teams"), ("not", "sign", "team"))
+        self.assertEqual(token_key("can't sign in to Teams"), token_key("cannot sign in to Teams"))
+        self.assertEqual(token_key("I can’t sign in to Teams"), token_key("can not sign in Teams"))
+        self.assertNotEqual(token_key("can't sign in to Teams"), token_key("sign in to Teams"))
+        self.assertIn("not", route_tokens("Outlook doesn't start"))
+        self.assertIn("not", route_tokens("Outlook won't start"))
+
     def test_frozen(self):
         # changing the stop words or the rule changes what a person validated: bump the version instead
-        self.assertEqual(NORMALIZATION_VERSION, 1)
+        self.assertEqual(NORMALIZATION_VERSION, 2)
         self.assertEqual(len(STOP_WORDS), 126)
 
 

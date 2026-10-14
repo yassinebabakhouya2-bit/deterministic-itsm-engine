@@ -30,7 +30,7 @@ from .enrich import app_vocabulary
 from .funnel import _ticket_entities
 from .graph import own_numbers
 
-NORMALIZATION_VERSION = 1
+NORMALIZATION_VERSION = 2   # 2: English negative contractions spelled out ("can't" -> "can not")
 
 # Characters NFKD does not decompose: "mise en œuvre" must not become "mise en uvre".
 _LIGATURES = str.maketrans({"œ": "oe", "Œ": "oe", "æ": "ae", "Æ": "ae", "ß": "ss", "ø": "o", "Ø": "o",
@@ -64,9 +64,22 @@ def fold_token(token: str) -> str:
     return token
 
 
+# English negative contractions, spelled out before tokenizing: "can't" must never read as "can" + "t"
+# (both grammar words) and so lose its negation -- "I can't sign in" is not "sign in".
+_CONTRACTIONS = (
+    (re.compile(r"\b(?:can['\u2019]t|cannot)\b"), "can not"),
+    (re.compile(r"\bwon['\u2019]t\b"), "will not"),
+    (re.compile(r"\bshan['\u2019]t\b"), "shall not"),
+    (re.compile(r"\b(\w+)n['\u2019]t\b"), r"\1 not"),
+)
+
+
 def _fold_text(text: str) -> str:
     text = unicodedata.normalize("NFKD", (text or "").translate(_LIGATURES))
-    return "".join(c for c in text if not unicodedata.combining(c)).casefold()
+    text = "".join(c for c in text if not unicodedata.combining(c)).casefold()
+    for pattern, spelled in _CONTRACTIONS:
+        text = pattern.sub(spelled, text)
+    return text
 
 
 def route_tokens(text: str) -> tuple[str, ...]:
@@ -120,7 +133,7 @@ def alias_problem(text: str) -> str | None:
 # another fiche alone in front: a partial review never makes a key look unique.
 
 TABLES_VERSION = 1
-ROUTE_VERSION = 1          # kefind.route's level logic
+ROUTE_VERSION = 2          # kefind.route's level logic (2: L1 negation and application rules, scope on kb/update)
 MAP_PROMPT_VERSION = 1     # kefind.route's L2 prompt and schema
 L1_MAX_UNCOVERED = 1       # question tokens an L1 alias may leave uncovered
 MIN_GATE_QUESTIONS = 30    # measurable questions the scoreboard's gate needs before "passed"
@@ -132,6 +145,12 @@ CODE_VERSION = {"tables": TABLES_VERSION, "normalization": NORMALIZATION_VERSION
 # "512 kb 300" (the funnel's permissive pattern still reads those, so they still restrict the scope).
 L0_NUMBER_RE = re.compile(r"(?i)(?<![\w.])KB[-_]?0*(\d{2,7})(?![\w])")
 L0_CODE_PREFIXES = ("err:", "evt:")
+# Identifiers that restrict a question's scope, as the funnel's strong levels do ("identifier", "update"):
+# a cited KB article or Windows update keeps L1/L2 from deciding a fiche that does not carry it.
+SCOPE_CODE_PREFIXES = ("err:", "evt:", "kb:", "update:")
+# Negations (folded): a question may say one routing word more than its alias, but never one of these --
+# "impossible de synchroniser les contacts" is not "synchroniser contacts".
+NEGATIONS = frozenset("pas plus non jamais aucun aucune rien sans ni impossible not no never none nothing unable".split())
 
 
 def _sha(obj) -> str:
@@ -340,11 +359,22 @@ def build_tables(kbmap, current: dict[str, str], taxonomy, decisions: list, prop
 
     # an application no longer in the vocabulary: the fiche's L1 / L2 entries would never match as decided
     usable = {}
+    unusable: dict[str, object] = {}   # validated, but can no longer route: their aliases still block
     for fiche_id, decision in validated.items():
         if decision.primary_app and decision.primary_app not in app_set:
             skipped["app_not_in_vocabulary"] += 1
+            unusable[fiche_id] = decision
         else:
             usable[fiche_id] = decision
+    # a fiche a person validated that is no longer routable (now a duplicate, or replaced) keeps its
+    # aliases as blockers: its questions must not go to a vaguer alias of another fiche
+    routable_set = set(ids)
+    for fiche_id in sorted(set(kbmap.fiches) - routable_set):
+        mine = [d for d in decisions if d.fiche_id == fiche_id and d.source_sha256 == current.get(fiche_id)]
+        if mine:
+            latest = max(mine, key=lambda d: (d.revision, d.decided_at))
+            if latest.status == "validated":
+                unusable[fiche_id] = latest
 
     # L1
     claims: dict[tuple[str, ...], dict[str, dict]] = {}
@@ -366,6 +396,11 @@ def build_tables(kbmap, current: dict[str, str], taxonomy, decisions: list, prop
         if previous is not None:
             texts += _alias_texts(previous.aliases)
         for text in texts:
+            tokens = token_key(text)
+            if len(tokens) >= 2:
+                waiting.setdefault(tokens, set()).add(fiche_id)
+    for fiche_id, decision in sorted(unusable.items()):
+        for text in _alias_texts(decision.aliases):
             tokens = token_key(text)
             if len(tokens) >= 2:
                 waiting.setdefault(tokens, set()).add(fiche_id)
@@ -444,7 +479,8 @@ def build_tables(kbmap, current: dict[str, str], taxonomy, decisions: list, prop
 def identifier_scope(kbmap, cleaned_text: str, answers=()) -> dict:
     """The fiches the question's identifiers point to, read exactly as the funnel reads them
     (``kefind.funnel._ticket_entities``): each cited fiche number (the funnel's permissive pattern) and
-    each known error / event code, resolved through the graph. A number or code no fiche carries points
+    each known error / event code, cited KB article or Windows update (the funnel's strong levels),
+    resolved through the graph. A number or code no fiche carries points
     nowhere and is left out, as the funnel ignores it. L0 decides only on the intersection; L1 and L2 may
     only return a fiche of the union when the question carries identifiers at all (``any``)."""
     known, _, _, step = _ticket_entities(kbmap, cleaned_text, answers)
@@ -454,7 +490,7 @@ def identifier_scope(kbmap, cleaned_text: str, answers=()) -> dict:
         if pruned:
             resolutions.append(pruned)
     for code in known:
-        if code.startswith(L0_CODE_PREFIXES):
+        if code.startswith(SCOPE_CODE_PREFIXES):
             pruned = sorted(kbmap.graph.prune(kbmap.entity_index.get(code, []))[0])
             if pruned:
                 resolutions.append(pruned)
@@ -527,9 +563,19 @@ def match_l1(tables: RoutingTables, cleaned_text: str, question_apps: set[str], 
         return out
     fiche_id = winner["fiche_id"]
     out["candidate"] = fiche_id
-    out["uncovered"] = len(question - set(winner["tokens"]))
+    uncovered = question - set(winner["tokens"])
+    out["uncovered"] = len(uncovered)
     out["outside_scope"] = bool(scope.get("any")) and fiche_id not in (scope.get("union") or [])
-    if out["uncovered"] <= L1_MAX_UNCOVERED and not out["outside_scope"]:
+    # the word the question says beyond the alias may not be a negation ("impossible de synchroniser" is
+    # not "synchroniser"), and an alias of a fiche naming no application never decides a question naming an
+    # application the alias itself does not name ("réinitialiser mot de passe" vs "... SAP"): L2 answers it
+    # with that application's own fiche, or offers this one
+    out["uncovered_negation"] = bool(uncovered & NEGATIONS)
+    alias_tokens = set(winner["tokens"])
+    out["generic_for_app"] = not winner.get("app") and any(
+        not set(route_tokens(app.replace("-", " "))) <= alias_tokens for app in sorted(apps))
+    if (out["uncovered"] <= L1_MAX_UNCOVERED and not out["outside_scope"] and not out["uncovered_negation"]
+            and not out["generic_for_app"]):
         out.update(decided=True, fiche_id=fiche_id, key=winner["alias"], tokens=list(winner["tokens"]))
     return out
 

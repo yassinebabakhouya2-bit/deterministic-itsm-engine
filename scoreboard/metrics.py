@@ -472,8 +472,14 @@ def routing_gate(base: list[dict], routed: list[dict], exclude_ids=(), *, failur
     if len(compared) < floor:
         insufficient.append(f"only {len(compared)} question(s) with an expected fiche can be compared "
                             f"({len(excluded)} excluded as seen by a reviewer); at least {floor} are needed")
+    # the evidence must come from questions nobody wrote the tables from: a seen reference decided at L1 by
+    # the alias written from it proves nothing about the tables (it still counts for wrong exact fiches)
+    unseen_exact = {ticket_key(r) for r in routed if is_routed_exact(r) and not is_excluded(r)}
     if not exact_keys:
         insufficient.append("no question was decided at L0-L2: the measure says nothing about the validated tables")
+    elif not unseen_exact:
+        insufficient.append("every question decided at L0-L2 was seen by a reviewer while writing the tables: "
+                            "the measure says nothing about questions the tables were not written from")
 
     status = "invalid" if invalid else "failed" if failed else "insufficient" if insufficient else "passed"
     return {
@@ -484,6 +490,7 @@ def routing_gate(base: list[dict], routed: list[dict], exclude_ids=(), *, failur
         "excluded": excluded,
         "wrong_exact": {"k": len(wrong), "n": len(exact_keys), "ids": wrong_ids},
         "routed_exact": len(exact_keys),
+        "routed_exact_unseen": len(unseen_exact),
         "right_first": {"base": Rate(base_k, len(compared)).to_dict(), "route": Rate(route_k, len(compared)).to_dict()},
         "mcnemar": {"base_only": base_only, "route_only": route_only, "p_value": mcnemar_exact(base_only, route_only)},
         "by_level": by_route(routed),

@@ -29,6 +29,7 @@ it), and the code re-checks it against the closed lists. The route dict holds no
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -45,7 +46,7 @@ from .routing import (CODE_VERSION, ROUTE_VERSION, RoutingTables, _is_routable, 
 MAP_SCHEMA_NAME = "question_intent_app"
 EXACT_LEVELS = ("L0", "L1", "L2")
 # The keys of the route's L1 summary (``match_l1`` gives more: its decision is the route's own level/key)
-L1_SUMMARY_KEYS = ("matches", "ambiguous", "uncovered", "outside_scope", "blockers")
+L1_SUMMARY_KEYS = ("matches", "ambiguous", "uncovered", "outside_scope", "uncovered_negation", "generic_for_app", "blockers")
 
 MAP_SYSTEM_PROMPT = """You map ONE service-desk question onto the closed list of intents of an IT support \
 knowledge base. A deterministic router looks your answer up among procedures a person validated; the code \
@@ -240,6 +241,17 @@ def _exact(kbmap: KBMap, config: FunnelConfig, route: dict, level: str, rule: st
     return Answer(finding, "routed", getattr(kbmap, "semantic_error", None), None, route, None, usage)
 
 
+# A mapping the model REFUSES for good (content filter, refusal, a cut or malformed answer, a bad request)
+# fails the same way at the desk: /find then answers by L3, and a measure of it is faithful -- no
+# degraded mark. Anything else (throttling, the service down, no model client) is a degraded decision.
+_REFUSED_RE = re.compile(r"HTTP 400\b|content[_ ]?filter|ResponsibleAIPolicyViolation|the model refused|"
+                         r"cut at max_tokens|did not return JSON|unexpected answer", re.IGNORECASE)
+
+
+def refused_for_good(error: str | None) -> bool:
+    return bool(error) and bool(_REFUSED_RE.search(error))
+
+
 def _degraded(*causes) -> str | None:
     kept = [c for c in causes if c]
     return "; ".join(kept) if kept else None
@@ -284,7 +296,9 @@ def answer(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelC
         mapped, failure = _map_question(intent_llm, text, tables, kbmap.dictionary)
         usage = _usage(usage, mapped["usage"])
         summary = {k: v for k, v in mapped.items() if k != "usage"}
-        if mapped["error"]:
+        if mapped["error"] and refused_for_good(mapped["error"]):
+            route["l2"] = {**summary, "exact": None, "offer": [], "reason": "map_refused"}
+        elif mapped["error"]:
             l2_failed = f"l2_failed:{failure}"
             route["l2"] = {**summary, "exact": None, "offer": [], "reason": "map_failed"}
         else:

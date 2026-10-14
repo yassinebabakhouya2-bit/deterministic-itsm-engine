@@ -293,8 +293,18 @@ def test_invalid_action_is_rejected():
 
 
 # ------------------------------------------------------------- routing chantier: route fields
-def routed(pid, score, level, key=""):
-    return KbCandidate(parent_id=pid, title=pid, reranker_score=score, route_level=level, route_key=key)
+def routed(pid, score, level, key="", exact=None):
+    # an L0-L2 candidate with a key is the fiche the engine showed (kefind_ports marks it route_exact)
+    exact = bool(key) and level in ("L0", "L1", "L2") if exact is None else exact
+    return KbCandidate(parent_id=pid, title=pid, reranker_score=score, route_level=level, route_key=key,
+                       route_exact=exact)
+
+
+def test_an_offered_l2_fiche_taken_on_thresholds_is_only_ever_to_confirm():
+    # a client whose thresholds count an offered fiche (1.5) as strong: the FSM guides with it, never as identified
+    p = ports([routed("SAP", 1.5, "L2")], th=Thresholds(exact_score=1.5))
+    g = advance(new(), ev("réinitialiser mon mot de passe", kind="created"), p, T0).state.guide
+    assert g is not None and (g.route_level, g.route_key, g.approximate) == ("offer", "", False)
 
 
 def test_a_guide_taken_as_exact_carries_the_route_of_its_candidate():

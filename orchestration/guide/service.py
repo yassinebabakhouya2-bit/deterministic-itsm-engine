@@ -24,6 +24,26 @@ MAX_MESSAGES = 14
 Image = Tuple[str, bytes, str]          # (filename, bytes, mime)
 
 
+
+
+_ROUTE_FIELDS = ("route_level", "route_key", "route_exact")
+
+
+def _drop_empty_route(value):
+    """Removes route fields left empty, at any depth (candidates, choices, the guide)."""
+    if isinstance(value, dict):
+        return {k: _drop_empty_route(v) for k, v in value.items() if not (k in _ROUTE_FIELDS and not v)}
+    if isinstance(value, list):
+        return [_drop_empty_route(v) for v in value]
+    return value
+
+
+def state_json(state: GuideState) -> str:
+    """The stored session: the route fields are written only when a route set them, so a session the
+    engine never routed is stored exactly as before routing existed -- and stays readable by the previous
+    Web App (its Strict models refuse unknown fields) during a deployment or after a rollback."""
+    return json.dumps(_drop_empty_route(state.model_dump(mode="json")), ensure_ascii=False, separators=(",", ":"))
+
 class Conflict(Exception):
     """Another writer updated the session in between (caller may retry)."""
 
@@ -217,7 +237,7 @@ class GuideService:
                 break
             messages = messages[1:]
         _pack(record, "messagesJson", blob)
-        _pack(record, "stateJson", state.model_dump_json())
+        _pack(record, "stateJson", state_json(state))
         record["state"] = state.phase.value
         record["updatedUtc"] = now.isoformat()
 
