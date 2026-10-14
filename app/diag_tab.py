@@ -15,7 +15,11 @@
 # is linked to the deterministic engine (deps["engine"], app/kecore_client.py),
 # fn-kecore finds the fiche first and its verified steps are shown word for word;
 # the search index answers when the engine abstains or cannot be reached
-# (orchestration/guide/kefind_ports.py).
+# (orchestration/guide/kefind_ports.py). Once routing is active, the page says
+# how the engine's route found the fiche (its number, a validated phrasing, a
+# validated intent and application) or why fiches are only offered (several
+# validated fiches, fiches close by meaning to confirm); a fiche the person
+# picked is never labelled by a route (orchestration/guide/fsm.py _route_of).
 #
 # Security rules, enforced server-side:
 #   - user routes: the client must be in the caller's allowed clients (Easy Auth
@@ -487,7 +491,7 @@ a.l{color:var(--acc);text-decoration:none}
 input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--txt)}
 </style></head><body>
 <header><h1>KnowledgeEngine v9</h1>
-<a class="cur" href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a>{% if labels_nav %}<a href="/labels">Labellisation</a><a href="/dictionary">Dictionnaire</a>{% endif %}
+<a class="cur" href="/diag">Assistant</a><a href="/itsm">Tickets ITSM</a>{% if labels_nav %}<a href="/labels">Labellisation</a><a href="/dictionary">Dictionnaire</a><a href="/review">Revue</a>{% endif %}
 <span class="mut" style="margin-left:auto">{{ display_name }}</span></header>
 <main>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -514,6 +518,18 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 
 {% else %}
 {% set g = s.guide %}
+{# how the engine's route identified the guide's fiche; set only on a fiche the engine itself decided. Only
+   L0-L2 ever say "identifiée": any other level (L3, reached only if a client's thresholds let an offered
+   fiche count as strong) says the fiche is to be confirmed #}
+{% macro route_label(g) -%}
+{%- if g.route_level == 'L0' -%}Fiche identifiée par son numéro · par le moteur déterministe
+{%- elif g.route_level == 'L1' -%}Fiche identifiée par une formulation validée{% if g.route_key %} « {{ g.route_key }} »{% endif %} · par le moteur déterministe
+{%- elif g.route_level == 'L2' -%}Fiche identifiée par l'intention et l'application validées · par le moteur déterministe
+{%- elif g.route_level == 'offer' -%}Fiche proposée par le moteur déterministe — à confirmer
+{%- else -%}Fiche proche par le sens — à confirmer
+{%- endif %}
+{%- endmacro %}
+{% set routed = g and g.route_level and not g.approximate %}
 <p><a class="l" href="/diag?client_id={{ s.client_id }}">← Conversations</a></p>
 <div class="card" style="padding:12px 18px"><span class="badge b-{{ s.state }}">{{ states.get(s.state, s.state) }}</span>
 <span class="mut">{% if s.ticket_id %} · ticket {{ s.ticket_id }}{% endif %}</span></div>
@@ -526,7 +542,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <div class="{{ 'layout' if g else '' }}">
 {% if g %}
 <aside><div class="card">
-<div class="mut">📄 Fiche {{ 'la plus proche' if g.approximate else 'identifiée' }}{% if g.parent_id.startswith('kefind:') %} par le moteur déterministe{% elif g.origin == 'fallback' %} · résumé automatique{% endif %}</div>
+<div class="mut">📄 {% if routed %}{{ route_label(g) }}{% else %}Fiche {{ 'la plus proche' if g.approximate else 'identifiée' }}{% if g.parent_id.startswith('kefind:') %} par le moteur déterministe{% elif g.origin == 'fallback' %} · résumé automatique{% endif %}{% endif %}</div>
 <h2 style="margin:4px 0 6px;font-size:1.2rem">{{ g.title }}</h2>
 {% if g.summary %}<div>{{ g.summary }}</div>{% endif %}
 {% if g.approximate %}<div class="mut" style="margin-top:6px">Je n'ai pas pu confirmer que c'est exactement la bonne fiche : dites-le-moi si elle ne correspond pas.</div>{% endif %}
@@ -562,10 +578,11 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 <input type="hidden" name="client_id" value="{{ s.client_id }}">
 
 {% if s.state == 'LOCATE' and s.choices %}
-<div class="card" id="focus"><b>Quelle fiche correspond à votre problème ?</b>
+{% set choice_level = s.choices[0].route_level %}
+<div class="card" id="focus"><b>{% if choice_level == 'L2' and s.choices|length == 1 %}Une fiche validée correspond : est-ce la bonne ?{% elif choice_level == 'L2' %}Plusieurs fiches validées correspondent : laquelle ?{% elif choice_level == 'L3' %}Fiches proches par le sens — à confirmer{% else %}Quelle fiche correspond à votre problème ?{% endif %}</b>
 <div class="mut">Choisissez-en une : je vous montre aussitôt les étapes.</div>
 {% for c in s.choices %}<button class="alt pick" type="submit" name="action" value="pick:{{ loop.index }}">
-<b>{{ c.title }}</b><br><span class="mut">correspondance {{ 'forte' if c.score >= 2.5 else ('moyenne' if c.score >= 1.5 else 'faible') }}</span></button>
+<b>{{ c.title }}</b>{% if not c.route_level %}<br><span class="mut">correspondance {{ 'forte' if c.score >= 2.5 else ('moyenne' if c.score >= 1.5 else 'faible') }}</span>{% endif %}</button>
 {% if s.candidates and loop.index0 < s.candidates|length and s.candidates[loop.index0].excerpt %}
 <details><summary class="mut" style="cursor:pointer;padding:4px 14px">▸ voir l'extrait</summary>
 <div style="white-space:pre-wrap;padding:6px 14px" class="mut">{{ s.candidates[loop.index0].excerpt | kb_text(700) }}</div></details>{% endif %}{% endfor %}
@@ -574,7 +591,7 @@ input.tk{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radiu
 
 {% if g and s.state == 'GUIDING' and not s.steps_started %}
 <div class="card" id="focus" style="border-left:4px solid var(--acc)">
-<div class="mut">📄 Fiche {{ 'la plus proche' if g.approximate else 'sélectionnée' }}{% if g.parent_id.startswith('kefind:') %} par le moteur déterministe{% endif %}</div>
+<div class="mut">📄 {% if routed %}{{ route_label(g) }}{% else %}Fiche {{ 'la plus proche' if g.approximate else 'sélectionnée' }}{% if g.parent_id.startswith('kefind:') %} par le moteur déterministe{% endif %}{% endif %}</div>
 <h2 style="margin:4px 0 6px;font-size:1.2rem">{{ g.title }}</h2>
 {% if g.summary %}<div>{{ g.summary }}</div>{% endif %}
 {% if g.preconditions %}<p class="mut" style="margin:10px 0 0"><b>Avant de commencer :</b> {{ g.preconditions|join(' · ') }}</p>{% endif %}

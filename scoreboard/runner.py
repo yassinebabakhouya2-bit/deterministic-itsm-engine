@@ -21,6 +21,9 @@ from .engines import Decision, decision_from_dict
 
 MAX_FICHES_KEPT = 20
 MAX_TITLES_KEPT = 5
+# what a record keeps of a decision's route: enough to score it by level and to say which rule and
+# which validated key decided; the rest (table hashes, matcher details) stays in the engine's trace
+ROUTE_RECORD_KEYS = ("level", "rule", "key", "fiche_id")
 
 
 def safe_name(name: str) -> str:
@@ -28,8 +31,12 @@ def safe_name(name: str) -> str:
 
 
 def make_record(engine_name: str, run: int, ticket: Ticket, decision: Decision) -> dict:
+    """One decision as the metrics read it. "route" ({level, rule, key, fiche_id}) and "degraded" are
+    written only when the decision carries them: a record without them reads as None (``r.get``), which
+    is also what every record written before they existed says, and the results of an engine that
+    knows nothing of routing stay byte for byte what they were."""
     fiches = decision.fiches[:MAX_FICHES_KEPT]
-    return {
+    record = {
         "engine": engine_name,
         "run": run,
         "ticket_id": ticket.ticket_id,
@@ -44,6 +51,11 @@ def make_record(engine_name: str, run: int, ticket: Ticket, decision: Decision) 
         "usage": decision.usage.to_dict(),
         "error": decision.error,
     }
+    if decision.route is not None:
+        record["route"] = {key: decision.route.get(key) for key in ROUTE_RECORD_KEYS}
+    if decision.degraded is not None:
+        record["degraded"] = decision.degraded
+    return record
 
 
 def run_engine(engine, tickets: list[Ticket], runs: int = 1, out_path: str | Path | None = None,

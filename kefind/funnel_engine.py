@@ -13,24 +13,28 @@ from pathlib import Path
 from kecore.profile import Profile
 from scoreboard.engines import Decision, Usage
 
-from . import semantic as sem
 from .funnel import FunnelConfig, KBMap, find
-from .interpret import interpret
 from .io import load_decomposed_jsonl
+from .route import answer, question_vector
 
 _CONFIG_KEYS = frozenset({"name", "fiches_path", "profile_path", "funnel"})
 
 
 class FunnelEngine:
-    """Entities first, graph next, text to break ties; the decision is code (``kefind.funnel.find``)."""
+    """Entities first, graph next, text to break ties; the decision is code (``kefind.funnel.find``). With
+    routing tables, the same engine routes first (``kefind.route.answer``: L0 to L4), exactly as live /find
+    does once the tables are activated -- the scoreboard measures both side by side."""
 
     def __init__(self, maps: dict[str, KBMap] | None = None, fiches_path: str | None = None,
                  profile_path: str | None = None, config: FunnelConfig | None = None, name: str = "kefind-funnel",
-                 llm=None, embedder=None):
+                 llm=None, embedder=None, routing=None, intent_llm=None, current: dict | None = None):
         self.name = name
         self.config = config or FunnelConfig()
         self.llm = llm  # interprets each ticket (kefind.interpret); None: code only
         self.embedder = embedder  # the semantic mode's question vectors (recorded); None: words only
+        self.routing = routing  # kefind.routing.RoutingTables of the map's run; None: no routing (today's engine)
+        self.intent_llm = intent_llm  # the L2 mapping (kefind.route.map_question, recorded); None: no L2
+        self.current = current  # {fiche_id: source_sha256} of the run: the tables must be the KB's (kb_sha256)
         self._maps = dict(maps or {})
         self._fiches_path = fiches_path
         self._profile_path = profile_path
@@ -56,18 +60,17 @@ class FunnelEngine:
         kbmap = self._map_for(ticket.client)
         if kbmap is None:
             return Decision("abstain", error=f"no KB map for client {ticket.client!r}")
-        vector = self._vector(kbmap, ticket.text)
-        interpretation = (interpret(self.llm, ticket.text, kbmap.dictionary)
-                          if self.llm is not None and vector is None else None)
-        finding = find(kbmap, ticket.text, config=self.config, interpretation=interpretation, query_vector=vector)
-        usage = Usage(search_calls=1)
-        if interpretation is not None:
-            usage.input_tokens, usage.output_tokens = interpretation.usage.input_tokens, interpretation.usage.output_tokens
+        result = answer(kbmap, ticket.text, config=self.config, llm=self.llm, embedder=self.embedder,
+                        routing=self.routing, current=self.current, intent_llm=self.intent_llm)
+        finding = result.finding
+        usage = Usage(input_tokens=result.usage["input_tokens"], output_tokens=result.usage["output_tokens"],
+                      search_calls=1)
         # a designated fiche has no score for the scoreboard: no calibrated floor ever hides it
         # (kefind.funnel._show), so the threshold sweep must not count on hiding it either
         score = None if finding.designated else finding.score
         return Decision(finding.kind, fiches=finding.fiches, score=score, question=finding.question,
-                        titles={f: kbmap.label(f) for f in finding.fiches}, usage=usage, trace=finding.trace)
+                        titles={f: kbmap.label(f) for f in finding.fiches}, usage=usage, trace=finding.trace,
+                        route=result.route, degraded=result.degraded)
 
     def candidates(self, ticket, k: int) -> list[tuple[str, str]]:
         kbmap = self._map_for(ticket.client)
@@ -79,14 +82,7 @@ class FunnelEngine:
     def _vector(self, kbmap: KBMap, text: str):
         """The question's vector when the map has an index and the embedder is the index's model; None
         otherwise or on failure (the finding then says it was decided by words: ``degraded``)."""
-        if kbmap.semantic is None or self.embedder is None:
-            return None
-        if getattr(self.embedder, "model_id", None) != kbmap.semantic.model:
-            return None
-        try:
-            return self.embedder.embed([sem.query_text(text)])[0]
-        except Exception:
-            return None
+        return question_vector(kbmap, self.embedder, text)[0]
 
     @classmethod
     def from_config(cls, config: dict) -> "FunnelEngine":

@@ -10,6 +10,11 @@ only; the steps returned are the fiche's own text, verified at decomposition. Wi
 (the default), the model first turns the ticket into search terms in the words of the fiches,
 English and French (kefind.interpret, checked by code): they rank, they never filter or decide.
 
+Routing (spec "Semantic enrichment at ingestion, deterministic routing at runtime"): the answer goes
+through ``kefind.route.answer``, the router the scoreboard and the tickets run share. Only tables a
+person activated for the run being served reach it (function_app._active_routing); without them the
+answer is today's, with ``"route": null`` and, when tables exist but were not used, ``routing_error``.
+
 Like kecore_pipeline, this module never imports an Azure SDK: storage is any object with
 list/read/write, so it is tested in memory.
 """
@@ -23,9 +28,10 @@ import kecore_pipeline as pipeline
 from kecore.decompose import DecomposedFiche
 from kecore.profile import Profile
 from kefind import semantic as sem
-from kefind.funnel import FunnelConfig, KBMap, fiche_view, find
+from kefind.funnel import FunnelConfig, KBMap, fiche_view
 from kefind.graph import KBGraph
-from kefind.interpret import interpret
+from kefind.route import answer
+from kefind.routing import RoutingTables
 
 MAX_TEXT_CHARS = 20_000
 MAX_ANSWERS = 10
@@ -145,46 +151,55 @@ def fiche_payload(kbmap: KBMap, fiche_id: str) -> dict | None:
     return {**fiche_view(kbmap, fiche_id), "run_id": kbmap.run_id, "text": kbmap.fiches[fiche_id].text}
 
 
-def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm=None, embedder=None) -> dict:
-    """The answer to a find request.
+def respond(kbmap: KBMap, payload: dict, config: FunnelConfig | None = None, llm=None, embedder=None,
+            routing: RoutingTables | None = None, routing_error: str | None = None, current: dict | None = None,
+            intent_llm=None) -> dict:
+    """The answer to a find request, through the one router live /find, the scoreboard and the tickets run
+    share (``kefind.route.answer``).
 
-    With a semantic index in the map, the question is embedded once (``embedder``: recorded, the same
-    text always gets the same vector) and decided by meaning; the model interprets nothing. Without
-    an index, or when the question gets no vector (no client, another model than the index's, the
-    service failed), the words decide as before and ``llm`` interprets the ticket when asked;
+    Without ``routing`` (nothing activated, the kill switch, tables refused: ``routing_error`` says why) the
+    answer is today's, exactly: with a semantic index in the map, the question is embedded once
+    (``embedder``: recorded, the same text always gets the same vector) and decided by meaning, the model
+    interprets nothing; without an index, or when the question gets no vector (no client, another model
+    than the index's, the service failed), the words decide and ``llm`` interprets the ticket when asked.
     ``mode`` says which ("semantic", "words", or "degraded": an index was there but unusable for this
     question, ``semantic_error`` says why). ``interpreted``: None when no interpretation was asked or
     needed, else whether it gave terms (False: the model failed -- the Diagnostic does not trust a
-    text-only decision made that way, orchestration/guide/kefind_ports.py)."""
-    vector, semantic_error = None, getattr(kbmap, "semantic_error", None)
-    if kbmap.semantic is not None:
-        if embedder is None:
-            semantic_error = "no embedding client"
-        elif getattr(embedder, "model_id", None) != kbmap.semantic.model:
-            semantic_error = "the embedding model is not the index's"
-        else:
-            try:
-                vector = embedder.embed([sem.query_text(payload["text"])])[0]
-            except Exception as exc:  # the service is down: words decide, and the answer says so
-                semantic_error = f"embedding failed ({type(exc).__name__})"
-    interpretation = None
-    asked = bool(payload.get("interpret", True)) and vector is None
-    if asked and llm is not None:
-        interpretation = interpret(llm, payload["text"], kbmap.dictionary)
-    finding = find(kbmap, payload["text"], answers=payload["answers"], config=config, interpretation=interpretation,
-                   query_vector=vector)
-    interpreted = (interpretation is not None and interpretation.error is None) if asked else None
-    mode = "semantic" if vector is not None else ("degraded" if kbmap.semantic is not None else "words")
+    text-only decision made that way, orchestration/guide/kefind_ports.py).
+
+    With ``routing`` (tables a person activated for this run; ``current``: the run's source hashes;
+    ``intent_llm``: the L2 mapping) the tables answer first, L0 to L4, and ``route`` says how (``mode``
+    "routed" for an L0-L2 decision). Routing is optional, never a reason to fail an answer: when the routed
+    answer raises (tables that are not this map's, a bug in a matcher), the question is answered again
+    without routing and ``routing_error`` says why -- the Diagnostic then behaves exactly as before routing
+    existed (``route`` null)."""
+    try:
+        result = _answer(kbmap, payload, config, llm, embedder, routing, current, intent_llm)
+    except Exception as exc:
+        if routing is None:
+            raise
+        result = _answer(kbmap, payload, config, llm, embedder, None, None, None)
+        routing_error = f"routing failed ({type(exc).__name__})"
+    finding = result.finding
     return {
         "client": kbmap.client,
         "run_id": kbmap.run_id,
-        "mode": mode,
-        "semantic_error": semantic_error,
-        "interpreted": interpreted,
+        "mode": result.mode,
+        "semantic_error": result.semantic_error,
+        "interpreted": result.interpreted,
         "decision": finding.to_dict(),
         "fiche": fiche_view(kbmap, finding.fiche_id) if finding.fiche_id else None,
         "candidates": [{"fiche_id": f, "label": kbmap.label(f)} for f in finding.fiches],
+        "route": result.route,
+        "routing_error": routing_error if result.route is None else None,
     }
+
+
+def _answer(kbmap: KBMap, payload: dict, config, llm, embedder, routing, current, intent_llm):
+    return answer(kbmap, payload["text"], payload.get("answers", ()), config, llm=llm, embedder=embedder,
+                  interpret_ticket=bool(payload.get("interpret", True)), routing=routing, current=current,
+                  intent_llm=intent_llm)
+
 
 __all__ = ["validate_find_request", "validate_fiche_request", "latest_run", "load_map", "with_index", "funnel_config", "respond",
            "fiche_payload", "FUNNEL_CONFIG", "RUN_ID_RE"]

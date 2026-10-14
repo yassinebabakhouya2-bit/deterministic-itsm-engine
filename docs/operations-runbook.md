@@ -2927,7 +2927,9 @@ au modèle), appliqué par la phase `report` du run (`kecore_func/kecore_pipelin
 - **fiche vide** : aucune étape vérifiée ET moins de 40 caractères de corps (texte sans gabarit ni titre).
 
 Les fiches exclues ne sont ni dans `fiches.decomposed.jsonl` ni dans `graph.json` : ni l'index
-sémantique, ni le funnel, ni le catalogue d'étiquetage ne les voient. `report.md` et `summary.json`
+sémantique, ni le funnel ne les voient -- ni le catalogue d'étiquetage, mais seulement depuis le correctif
+§19.18 #4 (§19.20 : chaque run kecore le rafraîchit après publication ; avant, seul un run de tickets le
+réécrivait, et `/labels` proposait encore KB0266). `report.md` et `summary.json`
 décrivent toujours toutes les fiches décomposées (les chiffres de décomposition ne bougent pas) ;
 `runs/<run>/excluded.json` liste chaque exclusion avec sa règle, `report.md` a une section « Fiches
 excluded from the map », le résumé du run un bloc `exclusion`.
@@ -2946,6 +2948,17 @@ personne n'a écrite) :
 ```
 
 `force_include` remet une fiche exclue à tort, quelles que soient les règles.
+
+Depuis §19.20 (défaut §19.18 #5 corrigé) : le fichier est lu en UTF-8 avec ou sans BOM (`Out-File
+-Encoding utf8` de PowerShell 5.1 convient) ; un fichier UTF-16 (`Out-File` sans encodage, ou `>` en
+PowerShell 5.1), UTF-32 ou en page de code ANSI (`Set-Content` avec des accents) fait échouer le run à
+`report` avec « … is UTF-16: save it as UTF-8 » (ou UTF-32 / not UTF-8). Écriture sûre :
+`[IO.File]::WriteAllText($path, $json, [Text.UTF8Encoding]::new($false))` puis `az storage blob upload`.
+Une entrée de `force_include` désigne une fiche par son identifiant exact ; sinon l'unique fiche dont
+l'identifiant lui est égal une fois les espaces réduits et la casse ignorée (un identifiant recopié de
+`report.md`, où les doubles espaces de `KB0233 -  Associate…` sont réduits). `excluded.json`, le résumé du
+run et `report.md` listent désormais `forced` (fiches réellement repêchées), `matched_loosely` (entrée →
+fiche) et `force_include_unmatched` (entrées qui ne désignent aucune fiche : à corriger).
 
 Tests : kecore 141 (+9, `kecore/tests/test_exclusion.py`), kecore_func 104 (+2), kefind 141,
 scoreboard 69, app 105.
@@ -3211,6 +3224,12 @@ traitée en §19.17) ; ordre du bloc §19.15 hors cas déjà connus.
 Le bloc donné à l'opérateur pour le run de la passe A (même jour) évite déjà #6 (dossier temporaire,
 `-Encoding UTF8`) et s'arrête si le run n'est pas `Completed`.
 
+**État après le lot 2 (§19.20, code seul)** : #4 (catalogue rafraîchi par chaque run kecore après
+publication), #5 (BOM accepté, UTF-16/32 et ANSI refusés clairement, `force_include` rapproché et chaque
+entrée rapportée) et #9 (décision dégradée marquée par moteur dans le scoreboard ; un seuil n'est plus
+applicable sur une mesure dégradée) sont corrigés, à déployer. #7 et #8 restent couverts par les blocs de
+§19.19.
+
 **État après le lot 1 (§19.19)** : corrigés (code, tests, revue adverse ; à déployer) : #1, #2, #3, #6,
 #10. En partie : #7 (les blocs de §19.19 remettent leurs variables à zéro et s'arrêtent sur erreur ; les
 anciens blocs portent un avertissement) et #8 (le bloc 3 de §19.19 sépare l'import et le scoreboard et
@@ -3350,3 +3369,186 @@ fiche par son numéro (`KB0233`) ; elle est retrouvée dans le catalogue si une 
 numéro (`KB0233 -  Associate a phone line`), sinon la question est listée « non importable » avec la
 raison sur `/labels/<client>/refs` -- jamais devinée entre deux fiches. La page montre l'état de chaque
 question du dépôt avant l'import.
+
+### 19.20 Routage déterministe L0-L4 : passes B et C, revue, tables, mesure et activation (2026-10-14, code seul)
+
+**Pourquoi.** §19.16 a montré la limite du classement par le sens : la bonne fiche en premier 46 % du
+temps, et KB0217 montrée pour « comment attribuer une ligne teams ». Décision (§19.13, spécification
+`docs/v10-deterministic-engine.md`, « Semantic enrichment at ingestion… ») : le sens est porté par des
+métadonnées par fiche, proposées par le modèle, vérifiées par le code et **validées par une personne** ;
+à l'exécution, des tables décident, pas un score. Option L1 retenue : « 1+3 » (alias courts proposés par la
+passe C + formulations observées promues en revue). Le lot 2 de §19.18 (#4, #5, #9) fait partie de la
+même livraison.
+
+**Ce qui change** (Function + Web App ; rien ne route tant qu'une personne n'a pas activé de tables) :
+
+- **Niveaux** (`kefind/route.py`, un seul routeur pour `/find`, le scoreboard et le run de tickets) :
+  L0 un numéro de fiche (`KB0233` écrit d'un bloc) ou un code d'erreur validé, propres à une seule fiche ;
+  L1 un alias validé dont tous les mots utiles sont dans la question (au plus un mot de plus que l'alias,
+  application compatible, cohérent avec les identifiants cités) ; L2 l'intention + l'application
+  validées (un appel gpt-4o enregistré par question normalisée, `find-cache/`) ; L3 le moteur d'aujourd'hui,
+  dont les fiches sont **proposées, jamais montrées seules** ; L4 rien (conversation ouverte). L0-L2 :
+  `"mode": "routed"`, fiche montrée comme identifiée ; la réponse de `/find` porte `route` (niveau, règle,
+  clé, tables) et `routing_error`.
+- **Sûreté** (relevée par une revue de conception à trois angles avant le code, puis par une revue
+  adverse du code) : une fiche remplacée ou doublon n'est jamais routable ; une fiche rejetée sort de L0 ;
+  une revue partielle ne rend jamais une clé unique (une fiche pas encore revue, ou modifiée depuis sa
+  décision, bloque les alias et les clés qu'elle propose ; une fiche sans réponse de passe C bloque tout
+  L2) ; une intention dont le sens a changé au regel est écartée ; seule une clé (intention, application)
+  exacte donne une fiche exacte ; un alias ne doit pas dépendre d'un caractère isolé (« étage 3 ») que le
+  routage ignore. Ajouts de la revue adverse du code (13 constats, tous corrigés) : L1 ne décide jamais
+  si le mot de plus est une négation (« pas », « plus », « jamais », « not », « unable »…) ; « can't »,
+  « won't », « doesn't » sont écrits « can not », « will not », « does not » avant le découpage
+  (normalisation version 2 : les tables d'une version antérieure sont refusées, il faut reconstruire) ;
+  un alias validé sans application ne décide pas une question qui nomme une application absente de
+  l'alias ; les identifiants `kb:` et `update:` comptent comme les codes `err:`/`evt:` ; un alias validé
+  d'une fiche qui n'est plus routable, ou dont l'application a quitté le vocabulaire, bloque au lieu de
+  laisser une autre fiche paraître unique ; un refus définitif du modèle en L2 (filtre de contenu, HTTP
+  400, réponse non JSON) part en L3 sans marque « dégradé » (`l2.reason` `map_refused`), seul un échec
+  passager est dégradé.
+- **Ingestion** : la passe B (une fois par client, tant qu'aucune taxonomie n'est figée) propose une
+  taxonomie fermée à partir des intentions de la passe A ; une personne la relit et la **fige** dans
+  `/review` ; la passe C (une fois par fiche et par taxonomie figée) attribue une intention et des alias
+  courts (2 à 4 mots). Phase 1 (L0 + L1) : ni taxonomie ni passe C. Phase 2 (L2) : taxonomie figée + passe C.
+- **Revue** (onglet « Revue » de la Web App, `/review`) : file des fiches (les fiches attendues par une
+  question de référence d'abord), formulaire prérempli (intention de la passe C, application de la passe
+  A, alias courts cochés), promotion d'une question de référence en alias (mot pour mot), décision
+  « reconduite » pour une fiche modifiée, taxonomie à figer, « Reconstruire et mesurer », « Activer »,
+  « Désactiver ». Une décision est rangée par fiche et par empreinte du texte **extrait**
+  (`runs/<run>/fiches.jsonl`, avant retrait du gabarit : ajouter d'autres documents ne renvoie aucune fiche
+  en revue). Table `kefindreview` (créée au premier usage, aucune infra).
+- **Run de routage** (`POST /api/kecore/routing/runs`, ou l'étape `routing` d'un run kecore, juste avant
+  `publish`) : passe B si besoin (sautée tant que la passe A a des erreurs), passe C si besoin, tables
+  toujours, puis la mesure (scoreboard) sauf dans un run kecore. Un seul run de routage à la fois (bail
+  `routing/running.json`, renouvelé au début de chaque étape ; un bail sans signe de vie depuis 4 h est
+  repris, et seulement s'il n'a pas changé entre la lecture et la suppression). Figer la taxonomie
+  envoie la version vue à l'écran : si quelqu'un l'a figée entre-temps, le gel est refusé (« rechargez la
+  page »).
+- **Mesure et porte** : le scoreboard mesure le moteur d'aujourd'hui ET le moteur routé sur les mêmes
+  questions ; porte `routing/gates/<contenu>-<run>.json` : `passed` (aucune mauvaise fiche montrée en
+  L0-L2, bonne fiche en premier au moins aussi souvent, au moins 30 questions comparées), `insufficient`
+  (trop peu de questions, ou aucune question **non vue** décidée en L0-L2), `failed`, `invalid` (erreur,
+  échec transitoire du modèle, décision dégradée). Les questions de référence que le relecteur avait sous
+  les yeux en écrivant un alias (« seen ») sont exclues de la comparaison « bonne fiche en premier »,
+  jamais du compte des mauvaises fiches exactes ; une porte ne passe jamais sur ces seules questions
+  (`routed_exact_unseen` dans le résumé). Une mesure plus ancienne qui finit après une plus récente
+  n'écrase pas sa porte (`prepared_at`, `gate_file_kept`).
+- **Activation** : par une personne, seulement sur des tables du run servi dont la porte a dit `passed` --
+  ou `insufficient` acceptée explicitement avec une raison (enregistrée comme `override`). **Interrupteur**
+  (`routing/kill.json`) : « Désactiver » coupe le routage partout en moins d'une minute, et rien ne le
+  rallume sauf une nouvelle activation par une personne. **Report** : un nouveau run kecore dont les tables
+  ont le même contenu ET la même base (aucune fiche ni dictionnaire modifié) reprend l'activation tout
+  seul ; sinon le nouveau run est servi **sans** routage (`routing_error` « built for run X, not Y ») jusqu'à
+  une nouvelle mesure et une nouvelle activation -- sûr, mais à surveiller après chaque run kecore. Si la
+  dernière mesure des tables actives dit `failed`, `/find` cesse de router (`routing_error` « the latest
+  measure of the active routing tables failed ») et le report est refusé, sans attendre « Désactiver ».
+- **Diagnostic** : une fiche L0-L2 n'est « identifiée » que si c'est la fiche exacte montrée ; une fiche
+  L2 seulement proposée s'affiche « Fiche proposée par le moteur déterministe — à confirmer ». Les
+  sessions sont enregistrées sans les champs de routage vides : la version précédente de la Web App
+  relit les sessions en cours après un retour arrière.
+- **Lot 2** : #4 le catalogue `kefindfiches` est rafraîchi après chaque publication ; #5 voir §19.14 ;
+  #9 décisions dégradées comptées par moteur (`summary.degraded`, colonne `degraded_k`), un seuil mesuré
+  sur une mesure dégradée n'est plus applicable ; le run de tickets écrit `kefind_degraded`.
+
+**Coûts du modèle** (gpt-4o, 30 kTPM partagés avec l'Assistant) : passe B un appel (`max_tokens` 12000,
+600 s, une nouvelle tentative) ; passe C un appel par fiche après chaque gel (~180, `max_tokens` 800,
+~30 à 50 min, deux lots à la fois) ; L2 en direct un appel par nouvelle question non décidée en L0/L1
+(8 s, aucune nouvelle tentative, `max_tokens` 150 : un appel lent part en L3, marqué dégradé), le même
+enregistrement que la mesure. Réglage facultatif `KECORE_AOAI_BATCH_DEPLOYMENT` : le déploiement des seules
+passes B et C (par exemple `gpt-4o-enrich`, s'il existe), pour les sortir du quota des réponses en direct.
+Non activé ici.
+
+**1. Déployer** : fusionner la branche dans `main` puis le bloc 1 de §19.19 (Web App ET Function) ;
+aucun run ne doit tourner. Attendu : « Commit to deploy: … », la Function répond le commit.
+
+**2. Premier run de routage sur le run publié** (phase 1 : proposition de taxonomie + tables L0 ; rien
+n'est encore validé, donc rien ne route ; sans mesure) :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+$ErrorActionPreference = 'Stop'; $rr = $null; $s = $null
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+if ($LASTEXITCODE -or -not $key) { throw "clé de la Function introuvable" }
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$want = "$(git rev-parse HEAD)".Trim(); $served = (Invoke-RestMethod "$base/kecore/version?code=$key").commit
+if ($served -ne $want) { throw "la Function sert $served, pas $want : relancer .\scripts\deploy-kecore-function.ps1" }
+$body = @{ client = 'client-s'; measure = $false } | ConvertTo-Json
+$rr = Invoke-RestMethod -Method Post -Uri "$base/kecore/routing/runs?code=$key" -Body $body -ContentType 'application/json'
+"suivi : $($rr.statusQueryGetUri)"
+do {
+    Start-Sleep -Seconds 20
+    try { $s = Invoke-RestMethod $rr.statusQueryGetUri } catch { Write-Warning "état illisible, nouvel essai : $($_.Exception.Message)"; continue }
+    $s.runtimeStatus
+} while (-not $s -or $s.runtimeStatus -in 'Pending', 'Running')
+if ($s.runtimeStatus -ne 'Completed') { $s | ConvertTo-Json -Depth 6; throw "run de routage $($s.runtimeStatus)" }
+$s.output | Select-Object build_id, run_id, state, error, carried, why_not | Format-List
+"--- passe B"; $s.output.taxonomy | ConvertTo-Json -Depth 3
+"--- tables";  $s.output.tables | ConvertTo-Json -Depth 3
+```
+
+Attendu : `state` `completed`, `error` vide, `taxonomy.intents` (une proposition, jamais figée seule),
+`tables.l0_numbers` > 0, `l1` 0, `l2` 0. Un 409 au départ : un autre run de routage tient le bail.
+
+**3. Revue** (dans la Web App, à la main) : importer d'abord les questions de référence (bloc 3a de
+§19.19), puis `https://app-knowledgeengine3-v9.azurewebsites.net/review`. Pour KB0233 : valider avec
+l'alias promu « comment attribuer une ligne teams » et/ou un alias court « attribuer ligne teams »,
+application `teams` ; idem KB0120 (« compte bloqué », application `active-directory` si la fiche est
+propre à l'AD). Une fiche non revue reste simplement en L3. Si la vue d'ensemble liste l'alias dans
+« bloqués » (une fiche encore en revue propose les mêmes mots, par exemple KB0022 « Frequently blocked
+accounts » pour « compte bloqué »), revoir aussi cette fiche : tant qu'elle attend, l'alias ne route pas.
+
+**4. Reconstruire et mesurer** : bouton « Reconstruire et mesurer » de `/review` (ou le bloc 2 avec
+`measure = $true`). Attendu tant qu'il n'y a que 2 questions de référence : porte `insufficient` (les deux
+questions sont « seen », 0 comparée). Ajouter 30 à 50 vraies questions de technicien (dont des questions
+sans fiche) dans `/labels/client-s/refs` avant de chercher une porte `passed`.
+
+**5. État, activation, contrôle sur `/find`** :
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+$ErrorActionPreference = 'Stop'
+$key  = az functionapp keys list --name fn-kecore-knowledgeengine3-v9 --resource-group rg-knowledgeengine-v9 --query "functionKeys.default" -o tsv
+if ($LASTEXITCODE -or -not $key) { throw "clé de la Function introuvable" }
+$base = "https://fn-kecore-knowledgeengine3-v9.azurewebsites.net/api"
+$st = Invoke-RestMethod "$base/kecore/routing?client=client-s&code=$key"
+$st | Select-Object run_id, effective, killed, why_not_effective | Format-List
+"--- candidate"; $st.candidate | ConvertTo-Json -Depth 3
+"--- gate";      $st.gate | ConvertTo-Json -Depth 4
+"--- active";    $st.active | ConvertTo-Json -Depth 3
+foreach ($q in 'comment attribuer une ligne teams', 'Mon compte est bloqué') {
+    $a = Invoke-RestMethod -Method Post -Uri "$base/kecore/find?code=$key" -ContentType 'application/json; charset=utf-8' `
+         -Body ([Text.Encoding]::UTF8.GetBytes((@{ client = 'client-s'; text = $q } | ConvertTo-Json)))
+    "{0} | niveau {1} | clé {2} | fiche {3} | {4} | routing_error {5}" -f $q, $a.route.level, $a.route.key, $a.decision.fiche_id, $a.decision.kind, $a.routing_error
+}
+```
+
+L'activation se fait dans `/review` (« Activer », avec la case « accepter une mesure insuffisante » et
+une raison si la porte dit `insufficient` : c'est une décision de personne, enregistrée). Attendu après
+activation : « comment attribuer une ligne teams | niveau L1 | … | fiche KB0233 -  Associate a phone line |
+fiche ». Avant activation : `route` vide et `routing_error` vide. **Couper** : « Désactiver » dans
+`/review`, ou :
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "$base/kecore/routing/deactivate?code=$key" -ContentType 'application/json' `
+  -Body (@{ client = 'client-s'; by = 'Yassine' } | ConvertTo-Json)
+```
+
+**6. Phase 2 (L2)**, plus tard : figer la taxonomie dans `/review` (relire les entrées signalées « names
+the application … », renommer, supprimer ; le gel coûte ~180 appels de passe C), « Reconstruire et
+mesurer » (passe C), valider intention + application par fiche, mesurer, activer.
+
+**Après chaque run kecore** : lire `$s.output.routing` (bloc 2 de §19.19) : `carried` vrai -> le routage
+suit ; sinon `why_not` dit pourquoi et le nouveau run est servi sans routage jusqu'à une nouvelle mesure
+et activation. `$s.output.catalog` : le catalogue d'étiquetage rafraîchi.
+
+Tests : kecore 163 (+14), kefind 356 (+196 : routage, revue, passes B/C, routeur), scoreboard 144 (+73 :
+porte, enregistrements routés), kecore_func 295 (+176 : service de routage, routes, mesure routée,
+bout en bout en mémoire), app 215 (+98 : onglet Revue, client, Diagnostic). Pas encore déployé à la date de
+cette entrée.
+
+**Limites connues** (acceptées, à reprendre si elles gênent) : L2 ne tourne que si la table L2 n'est pas
+vide (phase 2) ; toute modification d'une fiche ou du dictionnaire change `kb_sha256`, donc arrête le
+report : nouvelle mesure et nouvelle activation après un tel run kecore ; un refus (400) d'une décision de
+revue fait perdre les alias tapés dans le formulaire ; la reprise d'un bail périmé compare les octets mais
+n'utilise pas d'ETag (deux reprises exactement simultanées d'un bail périmé pourraient encore lancer deux
+runs de routage à la fois).

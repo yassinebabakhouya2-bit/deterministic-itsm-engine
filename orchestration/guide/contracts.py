@@ -1,4 +1,11 @@
-"""Pydantic contracts of the guided resolution engine (all models forbid unknown fields)."""
+"""Pydantic contracts of the guided resolution engine (all models forbid unknown fields).
+
+Sessions are stored as these models' JSON (diagsessions ``stateJson``) and validated on every read, so a
+field is only ever ADDED, with a default: a session stored before the field existed must stay readable.
+The ``route_*`` fields (routing chantier) say how the deterministic engine's routing found a fiche --
+"L0" its number or a validated identifier, "L1" a validated phrasing (``route_key`` is that phrasing),
+"L2" a validated intent and application, "L3" closeness by meaning; "" when the answer was not routed
+(an older Function, routing not activated, the search index)."""
 from __future__ import annotations
 
 import re
@@ -53,6 +60,9 @@ class KbCandidate(Strict):
     source_system: SourceSystem = "servicenow_kb"
     source_url: str = ""
     excerpt: str = Field("", max_length=4000)
+    route_level: str = Field("", max_length=8)       # "" | "L0" | "L1" | "L2" | "L3" (module docstring)
+    route_key: str = Field("", max_length=200)       # the table key that decided, for the fiche the engine shows only
+    route_exact: bool = False                        # THE fiche the engine showed as exact (L0-L2), never an offer
 
 
 class GuideStep(Strict):
@@ -75,12 +85,17 @@ class Guide(Strict):
     origin: Literal["llm", "fallback"] = "llm"
     approximate: bool = False            # fiche chosen automatically after the clarification rounds
     guide_sha256: str = ""
+    # how the engine's routing identified THIS fiche; "" when it did not (not routed, picked by the person,
+    # taken as the closest): only a fiche the engine itself decided is ever labelled by its route
+    route_level: str = Field("", max_length=8)
+    route_key: str = Field("", max_length=200)
 
 
 class Choice(Strict):
     parent_id: str
     title: str
     score: float
+    route_level: str = Field("", max_length=8)       # "L2": validated fiches of one intent; "L3": close by meaning
 
 
 class OpenTurn(Strict):

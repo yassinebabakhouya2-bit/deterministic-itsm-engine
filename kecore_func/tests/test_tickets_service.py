@@ -305,6 +305,66 @@ class RunBatchTest(unittest.TestCase):
         self.assertTrue(row["kefind_reason"].endswith("_below_min_show"), row["kefind_reason"])
 
 
+class RunBatchThroughTheRouterTest(unittest.TestCase):
+    """run_batch decides each ticket with kefind.route.answer and no tables (what /find runs while nothing is
+    active): the columns keep their meaning, and kefind_degraded says why a ticket was not decided as live."""
+
+    def setUp(self):
+        self.storage = kb_storage(fiche(), *filler())
+        self.table = MemoryTable()
+        self.table.upsert({"PartitionKey": "client-s", "RowKey": "I1", "titre": "Active Directory : locked account"})
+        self.payload = {"client": "client-s", "run_id": None, "interpret": True, "limit": 200}
+
+    def row(self):
+        return self.table.get("client-s", "I1")
+
+    def test_interpreted_keeps_its_meaning_and_failures_are_counted_once(self):
+        from kecore.llm import LLMError
+
+        cases = (  # (interpret, llm) -> (kefind_interpreted, interpret_failures)
+            ((True, StubLLM({"terms": ["locked account"], "application": None})), (True, 0)),
+            ((True, StubLLM(LLMError("POST /x -> HTTP 429: quota"))), (False, 1)),
+            ((True, None), (False, 0)),                     # asked, but no model given: not a failure
+            ((False, StubLLM({"terms": ["x"], "application": None})), (False, 0)),   # not asked
+        )
+        for (interpret_ticket, llm), (interpreted, failures) in cases:
+            result = svc.run_batch(self.storage, self.table, {**self.payload, "interpret": interpret_ticket}, 0, 200,
+                                   llm=llm)
+            self.assertIs(self.row()["kefind_interpreted"], interpreted, (interpret_ticket, llm))
+            self.assertEqual(result["interpret_failures"], failures, (interpret_ticket, llm))
+            self.assertEqual((result["modes"], self.row()["kefind_degraded"]), ({"words": 1}, ""))
+            if interpret_ticket is False:
+                self.assertEqual(llm.calls, [])
+
+    def test_the_finding_is_the_one_find_answers_without_routing(self):
+        import kefind_service as finder
+
+        svc.run_batch(self.storage, self.table, {**self.payload, "interpret": False}, 0, 200)
+        kbmap = finder.load_map(self.storage, "client-s", "r1")
+        live = finder.respond(kbmap, {"text": "Active Directory : locked account", "answers": [], "interpret": False},
+                              config=finder.funnel_config(self.storage, "client-s"))
+        row = self.row()
+        self.assertEqual((row["kefind_kind"], row["kefind_reason"], row["kefind_fiche"]),
+                         (live["decision"]["kind"], live["decision"]["reason"], live["decision"]["fiche_id"] or ""))
+        self.assertEqual(json.loads(row["kefind_candidates"]), live["decision"]["fiches"][:5])
+        self.assertIsNone(live["route"])
+
+    def test_the_blank_run_never_routes_even_when_tables_are_active(self):
+        import test_routing_service as fx
+
+        storage = fx.write_run(fx.Storage())
+        reviews = MemoryTable()
+        fx.decide(storage, reviews, fx.TEAMS, aliases=["attribuer ligne teams"])
+        fx.routing_run(storage, reviews, "b1")
+        fx.write_gate(storage, "b1")
+        fx.activate(storage, "b1")
+        self.table.upsert({"PartitionKey": "client-s", "RowKey": "I1", "titre": "comment attribuer une ligne teams"})
+        result = svc.run_batch(storage, self.table, {**self.payload, "interpret": False}, 0, 200)
+        self.assertFalse([r for r in result["reasons"] if r.startswith("route_")])
+        self.assertNotIn("routed", result["modes"])
+        self.assertFalse(self.row()["kefind_reason"].startswith("route_"))
+
+
 class MergeRunsTest(unittest.TestCase):
     def test_tallies_add_up_across_batches(self):
         parts = [

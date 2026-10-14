@@ -168,21 +168,32 @@ def _request_sha256(system: str, user: str, schema_: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def _apps_in(text: str, dictionary) -> set[str]:
+def apps_in(text: str, dictionary) -> set[str]:
+    """The application ids kecore reads in ``text`` (its static table plus the client's dictionary)."""
     return {e.canonical.split(":", 1)[1] for e in extract_entities(text, dictionary or None) if e.kind == "app"}
 
 
-def _alias_reason(alias: str, reference: str, dictionary, claimed: set[str]) -> str | None:
+_apps_in = apps_in
+
+
+def alias_reason(alias: str, reference: str, dictionary, claimed: set[str], min_words: int = MIN_ALIAS_WORDS,
+                 max_words: int = MAX_ALIAS_WORDS) -> str | None:
+    """Why a proposed request is refused, None when it passes: word count, contact detail, a technical
+    entity or fiche number ``reference`` does not contain, an application outside ``claimed``. Shared by
+    pass A (2-8 words) and pass C's core requests (``kefind.assign``, 2-4 words)."""
     words = alias.split()
-    if len(words) < MIN_ALIAS_WORDS:
+    if len(words) < min_words:
         return "too short"
-    if len(words) > MAX_ALIAS_WORDS:
+    if len(words) > max_words:
         return "too long"
     if EMAIL_RE.search(alias) or PHONE_RE.search(alias):
         return "contact detail"
     novel = novel_technical_entities(alias, reference, dictionary or None) + novel_fiche_numbers(alias, reference)
     novel += [f"app:{a}" for a in sorted(_apps_in(alias, dictionary) - claimed)]
     return "adds " + ", ".join(novel) if novel else None
+
+
+_alias_reason = alias_reason
 
 
 def make_enrichment(llm, kbmap, fiche_id: str) -> Enrichment:
@@ -304,9 +315,13 @@ def make_enrichment(llm, kbmap, fiche_id: str) -> Enrichment:
     return out
 
 
-def _content_sha256(fiche) -> str:
-    """The fiche's text hash as kecore wrote it, else computed: a changed fiche goes back to review."""
+def content_sha256(fiche) -> str:
+    """The fiche's text hash as kecore wrote it, else computed: a changed fiche goes back to review. This
+    is the key of a review decision (kefind.review): (fiche_id, content_sha256)."""
     return fiche.text_sha256 or hashlib.sha256((fiche.text or "").encode("utf-8")).hexdigest()
+
+
+_content_sha256 = content_sha256
 
 
 def stats(enrichments: list[Enrichment]) -> dict:
@@ -323,4 +338,4 @@ def stats(enrichments: list[Enrichment]) -> dict:
 
 
 __all__ = ["Enrichment", "make_enrichment", "stats", "schema", "user_prompt", "app_vocabulary", "canonical_intent",
-           "SYSTEM_PROMPT", "SCHEMA_NAME", "ENRICH_VERSION"]
+           "content_sha256", "alias_reason", "apps_in", "SYSTEM_PROMPT", "SCHEMA_NAME", "ENRICH_VERSION"]

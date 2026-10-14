@@ -11,6 +11,15 @@ A decision is one of three kinds:
 * ``abstain``: it says it does not know.
 
 ``fiches`` may hold ranked candidates for every kind (used for recall@5).
+
+Two optional marks, both None for an engine that knows nothing of them:
+
+* ``route``: how a routing engine (``kefind.route``) reached the decision, a dict whose ``level`` is
+  one of ``ROUTE_LEVELS``. L0-L2 show a fiche a person validated as exact, L3 offers fiches close in
+  meaning, L4 abstains. The scoreboard's gate reads it (``scoreboard.metrics.routing_gate``);
+* ``degraded``: why the decision was not made the way the live engine makes it (no question vector,
+  the embedding model is not the index's, a failed model call...). A measure holding one says less
+  about live behaviour than it seems to, so the gate refuses to judge it.
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 KINDS = ("fiche", "question", "abstain")
+ROUTE_LEVELS = ("L0", "L1", "L2", "L3", "L4")
 
 BUILTIN_ENGINES = {
     "search-baseline": "scoreboard.engines.search_baseline:SearchBaselineEngine",
@@ -54,6 +64,8 @@ class Decision:
     titles: dict[str, str] = field(default_factory=dict)
     trace: list[dict] = field(default_factory=list)
     error: str | None = None
+    route: dict | None = None
+    degraded: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
@@ -61,6 +73,16 @@ class Decision:
         self.fiches = [str(f) for f in self.fiches if f is not None and str(f).strip()]
         if self.kind == "fiche" and not self.fiches:
             raise ValueError("a 'fiche' decision must name at least one fiche")
+        if self.route is not None:
+            # a level the gate does not know would silently count as "not exact": refuse it here instead
+            if not isinstance(self.route, dict):
+                raise ValueError(f"a decision's route must be a dict, got {type(self.route).__name__}")
+            if self.route.get("level") not in ROUTE_LEVELS:
+                raise ValueError(f"unknown route level {self.route.get('level')!r}; "
+                                 f"expected one of {', '.join(ROUTE_LEVELS)}")
+            self.route = dict(self.route)
+        # "" is how table rows spell "not degraded" (an empty column): it is not a reason
+        self.degraded = str(self.degraded) if self.degraded else None
 
     @property
     def shown(self) -> str | None:
@@ -88,6 +110,8 @@ def decision_from_dict(data) -> Decision:
         titles=dict(data.get("titles") or {}),
         trace=list(data.get("trace") or []),
         error=data.get("error"),
+        route=data.get("route") or None,
+        degraded=data.get("degraded") or None,
     )
 
 

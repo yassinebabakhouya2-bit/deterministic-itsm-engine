@@ -158,6 +158,60 @@ class FindBySemanticTest(unittest.TestCase):
             KBMap("clienta", filler(), semantic=self.kbmap.semantic)
 
 
+class AppFilterTest(unittest.TestCase):
+    """find(..., app_filter=True), the routed L3 only: the meaning ranks the fiches of the one application
+    the question names. Off by default: today's engine never filters by application in the semantic path."""
+
+    def setUp(self):
+        self.kbmap, _ = build_map()
+
+    def test_off_by_default_byte_identical(self):
+        for text in ("mon compte est bloqué depuis teams", "comment attribuer une ligne teams", "le vpn se coupe"):
+            default = ask(self.kbmap, text).to_dict()
+            self.assertEqual(json.dumps(ask(self.kbmap, text, app_filter=False).to_dict(), sort_keys=True),
+                             json.dumps(default, sort_keys=True))
+            self.assertNotIn("app_filter", [s["step"] for s in default["trace"]])
+
+    def test_the_one_application_named_restricts_the_ranking(self):
+        unfiltered = ask(self.kbmap, "mon compte est bloqué depuis teams")
+        self.assertEqual(unfiltered.fiche_id, "KB0120 - LOCKED ACCOUNT")
+        filtered = ask(self.kbmap, "mon compte est bloqué depuis teams", app_filter=True)
+        self.assertIn({"step": "app_filter", "app": "app:teams", "kept": 2}, filtered.trace)
+        self.assertEqual(sorted(filtered.fiches), ["KB0217 - Transfert d'appels TEAMS", "KB0233 - Associate a phone line"])
+        semantic = next(s for s in filtered.trace if s["step"] == "semantic")
+        self.assertEqual(semantic["candidates"], 2)
+
+    def test_no_fiche_of_the_pool_carries_it_the_pool_stays_whole(self):
+        text = "voir la KB0120 svp, rien à voir avec teams"
+        unfiltered, filtered = ask(self.kbmap, text), ask(self.kbmap, text, app_filter=True)
+        self.assertIn({"step": "app_filter", "app": "app:teams", "kept": 0}, filtered.trace)
+        self.assertEqual((filtered.kind, filtered.fiche_id, filtered.fiches),
+                         (unfiltered.kind, unfiltered.fiche_id, unfiltered.fiches))
+        self.assertEqual([s for s in filtered.trace if s["step"] != "app_filter"], unfiltered.trace)
+
+    def test_several_applications_named_no_filter(self):
+        fiches = kb_fiches() + [make("KB0300 - Outlook profile", "Open Outlook. Rebuild the profile.",
+                                     entities=["app:outlook"])]
+        plain = KBMap("clienta", fiches)
+        index, _ = sem.build(entries_for(plain, CARDS), ConceptEmbedder(), "concept-embed@test", DIMS,
+                             anchors=anchors_for(plain))
+        index.calibration = {**CALIBRATED, "index_sha256": index.sha256}
+        kbmap = KBMap("clienta", fiches, semantic=index)
+        text = "transfert d'appels teams et outlook"
+        filtered = ask(kbmap, text, app_filter=True)
+        self.assertNotIn("app_filter", [s["step"] for s in filtered.trace])
+        self.assertEqual(filtered.to_dict(), ask(kbmap, text).to_dict())
+        one = ask(kbmap, "profil outlook", app_filter=True)
+        self.assertIn({"step": "app_filter", "app": "app:outlook", "kept": 1}, one.trace)
+
+    def test_the_calibration_s_ranking_never_filters(self):
+        from kefind.funnel import semantic_scored
+
+        vector = ConceptEmbedder().embed([sem.query_text("mon compte est bloqué depuis teams")])[0]
+        scored, _, _ = semantic_scored(self.kbmap, "mon compte est bloqué depuis teams", vector)
+        self.assertEqual(scored[0][1], "KB0120 - LOCKED ACCOUNT")
+
+
 class IndexTest(unittest.TestCase):
     def test_a_question_closer_to_another_fiche_is_dropped(self):
         cards = dict(CARDS)

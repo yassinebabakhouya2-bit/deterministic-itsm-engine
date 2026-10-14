@@ -249,6 +249,19 @@ app.register_blueprint(create_dictionary_blueprint(_engine, {
     "label_access": lambda: labels_access_for_request(),
 }))
 
+# Routing chantier: review of the routing proposals (app/review_tab.py) -- per fiche, a person validates
+# what may route (intent, application, aliases, codes) or rejects it, freezes the taxonomy, rebuilds and
+# measures the routing tables, activates or deactivates them. Same access as the labeling tab; everything
+# goes through fn-kecore, which validates every decision again.
+from review_tab import create_review_blueprint  # noqa: E402
+
+app.register_blueprint(create_review_blueprint(_engine, {
+    "allowed_clients": lambda: _resolve_allowed_clients_for_request(),
+    "user_id": lambda: _resolve_user_id_for_request(),
+    "display_name": lambda: _resolve_display_name_for_request() or "Utilisateur",
+    "label_access": lambda: labels_access_for_request(),
+}))
+
 HISTORY_MAX = 30  # conversations listed in the sidebar
 
 EXAMPLE_QUESTIONS = [

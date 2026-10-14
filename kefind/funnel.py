@@ -377,13 +377,15 @@ def _finish(finding: Finding, ranked: list[str], config: FunnelConfig, trace: li
 
 
 def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelConfig | None = None,
-         interpretation: Interpretation | None = None, query_vector: Sequence[float] | None = None) -> Finding:
+         interpretation: Interpretation | None = None, query_vector: Sequence[float] | None = None,
+         app_filter: bool = False) -> Finding:
     """The decision for one ticket. ``answers``: entities the technician chose in answer to a question;
     ``interpretation``: the ticket's search terms from ``kefind.interpret`` (text only, never a filter);
     ``query_vector``: the question's embedding (``kefind.semantic.normalize_text`` of the ticket, recorded).
     With a semantic index in the map and a vector, the decision is made by meaning
     (``_find_semantic``); without a vector the words decide, as before, and the finding says it was
-    ``degraded``."""
+    ``degraded``. ``app_filter`` (the routed L3 of ``kefind.route`` only): the meaning ranks only the
+    fiches of the one application the ticket names, when there are any (``_app_filter``)."""
     config = config or FunnelConfig()
     trace: list[dict] = []
     cleaned = clean_text(text or "")[:MAX_TEXT_CHARS]
@@ -402,7 +404,7 @@ def find(kbmap: KBMap, text: str, answers: Sequence[str] = (), config: FunnelCon
     degraded = False
     if kbmap.semantic is not None:
         if query_vector is not None:
-            return _find_semantic(kbmap, query_vector, known, accepted, cited, config, trace)
+            return _find_semantic(kbmap, query_vector, known, accepted, cited, config, trace, app_filter)
         degraded = True
         trace.append({"step": "semantic", "degraded": True,
                       "why": "no vector for this question (the embedding service did not answer): words only"})
@@ -490,13 +492,29 @@ def _semantic_pool(kbmap: KBMap, known: list[str], accepted: list[str], cited: l
     return [f for f in pruned if f in kbmap.semantic.fiche_ids], strong, designated
 
 
+def _app_filter(kbmap: KBMap, pool: list[str], known: list[str], trace: list[dict]) -> list[str]:
+    """The routed L3's application filter: when the ticket names exactly one application the map knows,
+    only the pool's fiches carrying it are ranked -- unless none does (kecore missed the application on
+    the right fiche, or the ticket names it in passing): the whole pool then stays, and ``kept`` is 0.
+    ``semantic_scored`` (what the calibration replays) never applies it: the thresholds are calibrated on
+    the unfiltered ranking, and the trace step is how a routed answer shows the difference."""
+    apps = [c for c in known if c.startswith("app:")]
+    if len(apps) != 1:
+        return pool
+    kept = [f for f in pool if apps[0] in kbmap.entities_of(f)]
+    trace.append({"step": "app_filter", "app": apps[0], "kept": len(kept)})
+    return kept or pool
+
+
 def _find_semantic(kbmap: KBMap, query_vector: Sequence[float], known: list[str], accepted: list[str],
-                   cited: list[str], config: FunnelConfig, trace: list[dict]) -> Finding:
+                   cited: list[str], config: FunnelConfig, trace: list[dict], app_filter: bool = False) -> Finding:
     """The decision by meaning: the question's vector against the run's frozen index, compared with the
     run's calibrated thresholds (kefind.semantic.decide). Code only, no model; byte-identical for the
     same vector."""
     index = kbmap.semantic
     pool, strong, designated = _semantic_pool(kbmap, known, accepted, cited, trace)
+    if app_filter:
+        pool = _app_filter(kbmap, pool, known, trace)
     scored = index.rank(query_vector, pool)
     thresholds = index.thresholds()
     verdict = sem.decide(scored, thresholds, strong=strong, designated=designated)

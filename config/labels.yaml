@@ -16,6 +16,7 @@
 # Tables of the storage account shared with fn-kecore (kecore_func/kecore_table.py).
 tables:
   tickets: tickets          # scrubbed tickets + the engine's last finding (kefind_*), written by fn-kecore
-  fiches: kefindfiches      # the fiches a labeler may pick, written by fn-kecore's ticket runs
+  fiches: kefindfiches      # the fiches a labeler may pick, written by fn-kecore's ticket runs and
+                            # refreshed by every kecore run (the catalog follows the latest map)
   labels: ticketlabels      # the labels, written HERE only
   scores: kecorescores      # one row per scoreboard run, written by fn-kecore
