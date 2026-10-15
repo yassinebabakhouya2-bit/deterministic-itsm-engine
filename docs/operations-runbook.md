@@ -3652,3 +3652,30 @@ Ensuite, selon le résultat :
 Puis reprendre §19.20 au point 2. Les Logic Apps d'ingestion échouent pendant la désactivation : relire
 leur historique d'exécutions depuis la dernière exécution réussie avant de conclure à un autre défaut,
 comme en §10.10 (la date de la désactivation n'est pas connue).
+
+**Sauvegarde des données humaines avant suppression (2026-10-15).** L'abonnement ne sera pas réactivé : la
+plateforme est reconstruite dans un nouveau tenant, sans l'audio ni la vidéo. Ce qui ne se régénère pas doit
+être lu tant que le stockage répond :
+
+- les documents de `kb-client-s` (entrée exacte des runs kecore ; le site SharePoint source est dans l'ancien
+  tenant) ;
+- la table `tickets` (370 tickets nettoyés ; l'export brut a été supprimé au nettoyage) ;
+- `ticketlabels`, `refquestions`, `kefindpending`, `kefindreview` ;
+- `dictionary-decisions.json` et `exclusion-config.json`.
+
+Script en lecture seule : `scripts/backup-old-subscription.ps1`. Il utilise des GET REST avec le jeton de
+l'utilisateur et écrit les octets bruts, sans corruption des accents sous PowerShell 5.1. Il saute les
+transcriptions audio/vidéo et ne lit pas les enregistrements bruts (données personnelles). Il a été testé
+sous PowerShell 7.4 avec des appels Azure simulés ; il n'a pas encore été lancé contre Azure.
+
+```powershell
+cd C:\V9\knowledgeengine-rag-platform
+az login --tenant a50d938b-4d51-449f-bfb7-ddd94df25268      # ajouter --allow-no-subscriptions si az ne trouve aucun abonnement
+.\scripts\backup-old-subscription.ps1 -ProbeOnly             # le stockage répond-il encore ?
+.\scripts\backup-old-subscription.ps1                        # sauvegarde dans C:\ke-backup\<date-heure>
+```
+
+`AuthorizationPermissionMismatch` au test : l'utilisateur n'a pas de rôle « Storage Blob/Table Data » sur le
+compte, et aucun rôle ne peut être ajouté tant que l'abonnement est désactivé. La sortie contient des données
+personnelles : la garder hors de tout dépôt git, sur un disque chiffré, jusqu'à la restauration vérifiée dans
+le nouveau tenant.
