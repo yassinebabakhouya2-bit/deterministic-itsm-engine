@@ -3679,3 +3679,7 @@ az login --tenant a50d938b-4d51-449f-bfb7-ddd94df25268      # ajouter --allow-no
 compte, et aucun rôle ne peut être ajouté tant que l'abonnement est désactivé. La sortie contient des données
 personnelles : la garder hors de tout dépôt git, sur un disque chiffré, jusqu'à la restauration vérifiée dans
 le nouveau tenant.
+
+**Décision (2026-10-20) : pas de sauvegarde.** Le script ci-dessus n'a pas été lancé. La nouvelle plateforme
+repart de zéro : les documents KB et l'export des tickets sont rechargés depuis leurs sources ; les
+étiquettes, les questions de référence et les décisions du dictionnaire sont refaites dans le nouveau tenant.
