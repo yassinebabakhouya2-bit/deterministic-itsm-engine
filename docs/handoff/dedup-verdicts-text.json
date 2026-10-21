@@ -1,0 +1,261 @@
+[
+ {
+  "id": "fn-canonical-json-sha256",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) RecordingLLM.key must still leave temperature/seed out of the request dict when they are None. Only the separators change. 2) The three compact helpers (routing._sha, assign._sha256, taxonomy._sha256) map onto canonical_sha256 with exactly sort_keys=True, ensure_ascii=False, separators=(',',':'), UTF-8. taxonomy.json is checked against taxonomy_sha256 on every read (routing_service.frozen_taxonomy), and the routing tables' content_sha256/sha256/kb_sha256 and the gate file names depend on these bytes. 3) Keep the hashes that do a different job out of the merge: semantic.fingerprint, fsm.guide_sha256 (its literal is pinned in tests/test_guide_fsm.py:339), calibrate exam_sha and enrichment _cache_key. 4) record_path is a naming helper only. The two record bodies use different encodings today (LLM: indent=1, ensure_ascii=False; embeddings: compact, ensure_ascii=True), and nothing requires unifying them.",
+  "corrections": "Missed impact: find-cache/ also changes. function_app.find_llm and intent_llm wrap RecordingLLM with prefix='find-cache/' for live /find interpretation, the L2 mapping and the scoreboard, so its blob names change along with llm-cache/ and embed-cache/. That is acceptable, since records are void in the new tenant. The finder is right that nothing reads pass A provenance.request_sha256: grep finds no reader, and the tests only compare it for equality or inequality. No committed record fixtures exist (no xx/<64hex>.json in the tracked files), so the replay tests stay green.",
+  "evidence": "routing.py:156-158, assign.py:76-78 and taxonomy.py:82-84 are byte-identical (compact form). enrich.py:166-168 and llm.py:246 and :315 use json.dumps default separators. llm.py:239-245 adds temperature/seed only when not None. llm.py:251 and :317-319 both build f'{key[:2]}/{key}.json'. function_app.py:501, 520 and 565 use prefix='find-cache/'. No test pins a record key; the only 64-hex literal in the tests is guide_sha256."
+ },
+ {
+  "id": "fn-fiche-key",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "Missed use: routing_service.validate_carry_request (line 336) calls _KEY_RE.fullmatch inline, so deleting _KEY_RE means this site must switch to FICHE_KEY_RE. Several tests do `from kefind.review import fiche_key` (kecore_func/tests/test_routing_end_to_end.py:51, test_routing_service.py:25, kefind/tests/test_review.py:6). Either keep the name re-exported from kefind.review or update those imports.",
+  "evidence": "review.py:57-60, tickets_service.py:106-108 and review_tab.py:105-108 all compute hashlib.sha256(fiche_id.encode('utf-8')).hexdigest()[:32]. The 32-hex shape is checked with fullmatch everywhere (routing_service 92/158-160, review_tab 50). Other sha256[:32] keys hash different inputs and are not members (decision_row_key, kefindpending row key, entry row key, the kefind_ports observe key). kefind already imports kecore, and both ship in the same Function package."
+ },
+ {
+  "id": "fn-json-blob-codecs",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) read_jsonl keeps splitting on '\\n' only, with its U+2028 comment. 2) jsonl_bytes accepts any iterable (callers pass generators) and stays byte-identical, i.e. json.dumps(item, ensure_ascii=False) + '\\n' with no sort. The scoreboard dataset_sha256 (scoreboard_service.py:237) is computed over those raw bytes. 3) json_bytes = json.dumps(sort_keys=True, ensure_ascii=False, indent=1) + '\\n'. 4) Keep pipeline.read_jsonl and pipeline._json importable, or update the tests. 5) Migrating the variants is optional and changes only bytes. If done, note that pipeline._json also writes funnel-config.json, scoreboard summary.json/latest.json and semantic built.json (scoreboard_service 720/721/844, semantic_service 120). routing_service._keep_history and scoreboard apply copy previous blobs verbatim, so history files keep the old style.",
+  "corrections": "Missed variant writers: semantic_service.py:115-116 writes variant index.json through to_blobs (indent=1, unsorted), and pipeline._json is also used by scoreboard_service (summary, latest, funnel-config.json) and semantic_service (built). Every reader parses JSON, and no blob checksum is taken over these files' bytes: RoutingTables.verify and SemanticIndex.fingerprint recompute from parsed data. The finder's no-impact claim holds.",
+  "evidence": "enrichment_service.py:37-38, routing_service.py:116-118, scoreboard_service.py:609-611, semantic_service.py:144 and routing.py:277-278 are identical apart from kwarg order. kecore_pipeline.py:194-195 matches scoreboard_service.py:230, 323, 715 and 718 byte for byte. kecore_pipeline.py:198-202 is the read_jsonl split on '\\n'. The only hash over raw bytes is scoreboard_service._sha256(data) of dataset.jsonl."
+ },
+ {
+  "id": "fn-utc-time",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) function_app keeps _now and _new_id as module attributes: test_function_app.py:916, 935, 1275 and test_routing_end_to_end.py:208-209 patch fa._now and fa._new_id, and routing_service receives now= from function_app. 2) utc_stamp(at) must accept an injected ISO string, including a trailing 'Z' and naive values treated as UTC (routing_service._parse_time/_stamp, used for history names and the lease TTL). 3) prepared_at keeps timespec='microseconds' (gates are ordered by string comparison). 4) The compact stamp stays '%Y%m%dT%H%M%SZ', plus '-'+6 hex for run ids.",
+  "corrections": "Missed members: kecore/report.py:71 and scoreboard/report.py:140 each build the human-readable report header '%Y-%m-%d %H:%M UTC' (a third format, duplicated twice). scoreboard/cli.py:176/195 goes away with the CLIs. routing_service._parse_time also parses stored heartbeat_at/started_at for the 4 h lease, not just the stamp.",
+  "evidence": "dictionary_service.py:56-57, function_app.py:235-237, routing_service.py:172-173, tickets_service.py:158, llm.py:263/333 and runner.py:107 are all isoformat(timespec='seconds'). scoreboard_service.py:234 uses microseconds, and :800 and function_app.py:232 use strftime('%Y%m%dT%H%M%SZ')."
+ },
+ {
+  "id": "fn-request-validation",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) Keep every error string exactly, including the ones that differ: tickets_service 'limit: an integer between 1 and N' (bounded, defaulted) vs kecore_pipeline 'limit must be a positive integer' (optional, unbounded). bounded_int therefore needs an optional/None mode and a caller-supplied message. 2) Route-level checks return None and the route answers 400 (function_app _client_param/_body_client); the service validators raise ValueError. Provide both shapes or convert the routes carefully. 3) Moving kecore_pipeline's ^...$ .match patterns to fullmatch tightens behaviour, and _PREFIX_RE is live: today source_prefix='Kbs/\\n' passes, because $ matches before a final newline. Accept this as a fix. 4) The module must stay free of azure.functions imports if the Web App parity test is to import it.",
+  "corrections": "Missed members: kecore_pipeline._PREFIX_RE (line 58, ^...$ with .match on the user-supplied source_prefix, so the trailing-newline gap is live and not only on the server-side run id); routing_service.freeze_taxonomy's source_build check against _ID_RE (line 1368) with French messages; scoreboard max_wrong; kefind_service._ANSWER_RE. validate_fiche_request takes run_id from query params with `or None` and no isinstance check. Several routes (function_app 674, 864) test `client not in set(allowed_clients())` without isinstance, which is equivalent for query-string values.",
+  "evidence": "kecore_pipeline.py:58-59, 101-150; routing_service.py:253-341; kefind_service.py:39-70, 133-145; tickets_service.py:42-60; scoreboard_service.py:75, 80-105, 780-790; dictionary_service.py:43, 173-197; function_app.py:963-970 plus the inline checks. Running the check: re.compile(r'^[\\w\\-. /]{0,200}$').match('docs/abc\\n') is truthy. Messages asserted in test_kecore_pipeline.py:95 and others."
+ },
+ {
+  "id": "fn-author-by",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) Keep French for messages the review tab shows to the reviewer. review_tab.py:623 shows exc.error from POST kecore/review/taxonomy verbatim, so freeze_taxonomy's 'auteur manquant' / 'auteur trop long' reach a person. kefind/review.validate_decision's docstring also says its refusals are French. Either keep those strings French or map them in the Web App. 2) by_id in kefind/review is only strip()ped today, not whitespace-collapsed, and decided_by_id is persisted in kefindreview (human data). Do not collapse it, or confirm Entra oids never contain inner spaces. 3) The dictionary 'by' currently uses `body.get('by') or ''`, which accepts falsy non-strings and checks length before any strip. author(required=False) would reject False/0 and collapse spaces, a small change for new kefindpending rows only.",
+  "corrections": "Missed member: routing_service.freeze_taxonomy (lines 1361-1367) has its own by check, French, where a non-str counts as missing ('auteur manquant') rather than 'a text is expected'. Wrong claim: 'the Web App maps every 4xx to its own French message code, so these texts never reach a user' is false for the taxonomy freeze (review_tab.py:615-626 shows getattr(exc,'error')). Also wrong: review's by_id is not collapsed (review.py:218, _string only strips). The Web App truncates by to 120 itself (review_tab._by) and never sends by_id on carry.",
+  "evidence": "review.py:169-175 _string strips; 214-221 by is collapsed and required, by_id only stripped. routing_service.py:260-272 _by collapses; 337-340 by_id goes through _by and then the 64 limit; 1361-1367 is the freeze check. dictionary_service.py:193-195. review_tab.py:416-417 and 615-626."
+ },
+ {
+  "id": "fn-contact-detail-check",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None for the six sites. kefind/semantic.query_text (line 67) uses EMAIL_RE.sub / PHONE_RE.sub for masking, not the boolean guard, so it is rightly left out. This merge is independent of, but changes together with, fn-email-phone-regexes.",
+  "evidence": "interpret.py:86, enrich.py:189, cards.py:121, calibrate.py:160 and review.py:273 are `EMAIL_RE.search(x) or PHONE_RE.search(x)`. routing_service.py:1094 is the negated `not EMAIL_RE.search(t) and not PHONE_RE.search(t)`, which is equal to `not has_contact_detail(t)`."
+ },
+ {
+  "id": "fn-email-phone-regexes",
+  "verdict": "merge_with_conditions",
+  "conditions": "Accept, or fix, the cases where the hardened e-mail pattern masks LESS than kecore.text.EMAIL_RE. That pattern now runs on KB fiches in decompose (Scrubber) and in the contact-detail guards. (a) An address whose local part is longer than 64 characters is not masked at all: the lookbehind forbids a partial match. (b) Domains with more than 8 labels, or labels over 63 characters, are masked only partly and the tail is left visible. One fix is to keep the linear-time bound but mask the whole run, e.g. by a second pass on long runs. PHONE_RE now carries a named group (?P<dsep>). That is harmless today: no pattern is built from PHONE_RE.pattern.",
+  "corrections": "The date guard matters only for a date followed by a further 2-digit group (e.g. '01.10.2026 12', '01-10-2026-15'). '01.10.2026' alone never matched PHONE_RE. Test impact is wrong: kecore/tests/test_tickets.py does not import TICKET_EMAIL_RE/TICKET_PHONE_RE (grep finds them only in kecore/tickets.py). The source_sha256 review key is safe: routing_service.source_hashes hashes fiches.jsonl text, which is extracted before decompose's Scrubber.",
+  "evidence": "Tested: 'x'*70+'@ex.com' -> EMAIL_RE masks it, TICKET_EMAIL_RE finds nothing. 'a@b.c.d.e.f.g.h.i.j.k' -> TICKET_EMAIL_RE matches 'a@b.c.d.e.f.g.h.i.j'. '01.10.2026 12' -> PHONE_RE matches, TICKET_PHONE_RE does not. '01.10.2026' -> neither. text.py:23-31; tickets.py:136-148, 224; decompose.py:171-174."
+ },
+ {
+  "id": "fn-ascii-fold",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None of substance. segment.plain is imported nowhere outside segment.py; entities._plain only inside entities.py.",
+  "evidence": "Checked 50,000 random strings drawn from ASCII, Latin-1/Extended, U+2019, U+0085, U+2028, \\x1c-\\x1f, NBSP, U+202F, ligatures and fullwidth. entities._plain(x) == ' '.join(segment.plain(x).replace(\"'\",' ').split()) held in every case (0 mismatches). segment's .replace('’',\"'\") runs after the ASCII encode and is a no-op. tickets.slug, tokenize and normalize_header share the identical NFKD+ascii-ignore core."
+ },
+ {
+  "id": "fn-strip-accents-padded-words",
+  "verdict": "merge_with_conditions",
+  "conditions": "padded_words must apply exclusion.normalize's case step, upper(), BEFORE the [A-Z0-9] filter. Lower-casing the final padded string afterwards is fine. A lower() or casefold() before the filter changes exclusion matches against human-written exclusion-config.json patterns: 'Straße' gives ' STRASSE ' today but ' stra e ' with lower-first, so a pattern 'STRASSE' would stop matching. ExclusionRules.from_dict's `normalize(p).strip()` filter must use the same function. strip_accents for canonical_intent and calibrate.noise must stay NFKD with combining marks dropped and nothing else (calibrate.noise is seeded and pinned by the calibration tests).",
+  "corrections": "The finder's own wording 'lowering both sides keeps every match' only holds if the lowering happens after the ASCII-uppercase filter. enrich._fold then follows the exclusion form: casefold-first vs upper-after differs on 'ı' and on compatibility capitals such as 'ᴼ', as the finder said. That affects only pass-A keyword filtering, which is model output and void.",
+  "evidence": "exclusion.py:52-56, 90, 125-127; enrich.py:125-134, 300, 311; calibrate.py:118. Tested: normalize('Straße').lower() == ' strasse ' == enrich._fold('Straße'), while a lower-first variant gives ' stra e '. 'ı' -> ' i ' (exclusion) vs '  ' (enrich). 'ᴼ' -> ' o ' vs '  '."
+ },
+ {
+  "id": "fn-caseless-key",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None. tickets._TICKET_ID, _DROPPED and _KEPT are built with the same function as the header side, and the fixed names ('N° de ticket', 'Bénéficiaire', …) contain no character on which NFC-then-casefold and NFD-casefold-NFC differ.",
+  "evidence": "tickets.py:70-71 and 106-108, 290-292; exclusion.py:59-68, 149, 161. Both handle None via `or ''`. The only difference is NFC recomposition after casefold (e.g. 'ǰ'), which is exotic and absent from the fixed column names."
+ },
+ {
+  "id": "fn-tokenizers-stopwords",
+  "verdict": "not_a_duplicate",
+  "conditions": "",
+  "corrections": "Agree with the finder: do not merge. If tokenize moves to kefind/tokens.py, note that kefind/search.py imports `.understand` at module level (line 32), and the old 5-step pipeline removal deletes that module, so search.py (or tokens.py) must drop that import. funnel, graph and calibrate import tokenize/SEARCHABLE_STATUSES from .search.",
+  "evidence": "search.py:33-47 ASCII-drop + its own stop list; routing.py:38-117 ligature-aware with NORMALIZATION_VERSION; semantic.py:51-57 NFKC+casefold; text.py:112-140 index-mapped NFKC. Different outputs by contract."
+ },
+ {
+  "id": "fn-fiche-id-derivation",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None of substance. fiches.py:237 (fiche_id_for on table rows) goes away with the tables.py import path. No test references extract_fiche_id/strip_document_path/fiche_id_for, and no test depends on .wav/.mp3/.mp4/.vtt in DOC_EXTENSIONS: the only '.wav' in the tests is a blob outside the prefix, never read.",
+  "evidence": "ids.py:13-54; fiches.py:26, 152-158, 198; scoreboard/ids.py is a pure re-export; kecore_pipeline.py:236 lists only DOCUMENT_EXTENSIONS names. strip_document_path strips one extension of the last path segment, so removing media extensions changes no id derived from a .md/.txt/.html/.htm/.docx/.pdf name."
+ },
+ {
+  "id": "fn-dictionary-entry-slug",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None.",
+  "evidence": "profile.py:207-208 `re.sub(r'[^a-z0-9]+','-',text.lower()).strip('-')`; kecore_pipeline.py:278 applies the same expression to the whitespace-collapsed spelling. pending.py:102 slugs the key without lower() but is dead."
+ },
+ {
+  "id": "fn-operator-json-readers",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) dictionary_service.review (lines 151 and 169) also calls pipeline.dictionary_rejected and dictionary_accepted, so the combined (rejected, accepted) reader must serve it too. 2) Read dictionary-decisions.json only when with_dictionary is true, as today: a run with with_dictionary=False never reads it, so a malformed file does not fail that run. 3) Keep the shape semantics: 'rejected' is strict (ValueError with the 'must look like' message), while 'accepted' is filtered tolerantly (non-dict items and empty spellings dropped, a non-dict file gives []). 4) Keep the exclusion messages byte for byte: test_kecore_pipeline.py:267 pins 'kecore-clienta/exclusion-config.json is UTF-16: save it as UTF-8', and :284-291 pins 'is UTF-32…' / 'is not UTF-8' / '…save it as UTF-8'.",
+  "corrections": "Missed caller: kecore_func/dictionary_service.py:151/169. UTF-16/32 refusal changes only the message for dictionary-decisions.json: a UTF-16 file already fails today, through UnicodeDecodeError or JSONDecodeError, both ValueError subclasses. Edge case: today an 'accepted' that is an int raises TypeError in dictionary_accepted.",
+  "evidence": "kecore_pipeline.py:245-268 (two reads, different error handling), 288-298 (both called only when with_dictionary), 363-400; dictionary_service.py:146-170; test_kecore_pipeline.py:163, 238, 257, 267, 284-297."
+ },
+ {
+  "id": "fn-text-decoding",
+  "verdict": "merge_with_conditions",
+  "conditions": "Keep the last-resort fallback per caller: decode_bytes(data, fallback=...) with utf-8 errors='replace' for EasyVista tickets and latin-1 for documents. Otherwise accept the regression below explicitly.",
+  "corrections": "The finder understates the difference. The last fallback is reached when a file is neither valid UTF-8 nor cp1252, i.e. it contains 0x81/0x8D/0x8F/0x90/0x9D. That is typically a UTF-8 export with one stray byte, since those bytes occur as UTF-8 continuation bytes, e.g. Á=C3 81, Í=C3 8D, Ł=C5 81. In that case the whole file decodes differently. latin-1 turns every multibyte character into mojibake ('N° de ticket' -> 'NÂ° de ticket'), so tickets.scrub no longer finds the ticket-id header and skips every row. Accented kept columns are lost, and person columns ('Bénéficiaire', …) are no longer recognised, though they still drop as unknown columns. utf-8 errors='replace' loses only the stray byte.",
+  "evidence": "tables.py:24-32 (latin-1 last resort, used by fiches.read_document_bytes line 125); tickets.py:271-277 (utf-8 replace), 285, 290-292; TICKET_ID_COLUMN = 'N° de ticket' (tickets.py:77); DROPPED_COLUMNS and KEPT_COLUMNS carry accents (80-98)."
+ },
+ {
+  "id": "fn-markdown-report-helpers",
+  "verdict": "merge_with_conditions",
+  "conditions": "_pct(part, whole) is not byte-identical to pct(part / whole), because 100*part/whole and (part/whole)*100 round differently. Keep a pct_of(part, whole) that computes 100 * part / whole, with '–' when whole is 0, or accept that kecore report.md changes. cell and short merge as described, with callers passing their own limits (70, 90, 50, 60, 120).",
+  "corrections": "Wrong claim: '_pct(p, w) == pct(p / w)' and 'report.md is byte-identical'. Example: p=23, w=80 gives '28.8%' from _pct and '28.7%' from pct(p/w). 363 of the (p, w) pairs with w < 3000 differ.",
+  "evidence": "kecore/report.py:14-24; scoreboard/report.py:29-30, 47-53; kecore_pipeline.py:420-422; scoreboard_service.py:527. Brute-force comparison of f'{100*p/w:.1f}%' vs f'{p/w*100:.1f}%' over w=1..2999."
+ },
+ {
+  "id": "fn-json-list-cells",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "Minor: dictionary_service._keys raises TypeError when the cell is a non-empty non-string (json.loads of a list or int), while json_list returns [] or the list itself, so the merge is strictly more tolerant. Table SDK values are strings, so live behaviour is unchanged.",
+  "evidence": "review.py:79-89; dictionary_service.py:79-84, 99. The proposed `[k for k in json_list(row.get('keys')) if isinstance(k, str)]` gives the same result for every string input, including '' and invalid JSON."
+ },
+ {
+  "id": "fn-stable-hash-split",
+  "verdict": "not_a_duplicate",
+  "conditions": "",
+  "corrections": "Agree: keep all three. They read different bits: the low bit of the last byte (int(full hex) % 2), the low bit of the 4th byte (hex[:8]) and the low bit of the first byte (digest()[0]).",
+  "evidence": "calibrate.py:103-106; scoreboard_service.py:114-116; profile.py:121-122."
+ },
+ {
+  "id": "fn-scoreboard-record-helpers",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None. _shown(None) and _shown({}) both give None, and so does a None-safe metrics.shown.",
+  "evidence": "dataset.py:45-47 and metrics.py:89-90 both produce f'{client}/{ticket_id}'. metrics.py:93-96 and scoreboard_service.py:462-463 have the same logic; only the None guard differs."
+ },
+ {
+  "id": "fn-service-microhelpers",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "Missed members: enrichment_service.py:52 holds a fourth inline counts expression (same as semantic's), and scoreboard_service.py:552 calls finder.load_map(..., with_semantic=False) inline. The _map signatures differ, (storage, payload) vs (storage, client, run_id), so callers adapt. kecore_pipeline._llm_counts raises AttributeError on an object without .calls/.hits, which the defensive version tolerates.",
+  "evidence": "enrichment_service.py:33-34, 52; routing_service.py:202-209; semantic_service.py:55-60; kecore_pipeline.py:226-229; scoreboard_service.py:552."
+ },
+ {
+  "id": "fn-phrase-occurrence-regex",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None.",
+  "evidence": "profile.py:178-179 and 224-226 build the identical pattern with re.IGNORECASE. entities.py:147-154 differs (an alternation, and only '\\ ' is turned into \\s+), so it is rightly left out."
+ },
+ {
+  "id": "fn-kb-number-regexes",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None. When building from a shared fragment, keep the leading (?i) on each composite so the compiled patterns are string-identical.",
+  "evidence": "graph.py:33, 37-40 repeat \\bKB\\s?[-_]?0*(\\d{1,7})\\b three times. The other patterns carry separate contracts (routing L0 hashed into content_sha256, fiche ids, entity canonicals)."
+ },
+ {
+  "id": "fn-compat-aliases",
+  "verdict": "merge_with_conditions",
+  "conditions": "Define dictionary_service.MIN_OBSERVATIONS = 3 before deleting kecore/pending.py. Before removing the DatasetError alias, update scoreboard/tests/test_dataset.py (lines 4, 34-42, 71, 82) and scoreboard/tests/test_labeling.py (lines 4, 84, 88), or delete them with their modules. Rename the in-module raises in scoreboard/dataset.py (lines 90-122).",
+  "corrections": "Missed tests: scoreboard/tests/test_dataset.py and test_labeling.py import DatasetError. Only kecore/tests/test_pending.py was listed. The other aliases have no external users: _slug has no caller, the enrich aliases are used only inside enrich.py, routing_service._container has 26 internal uses and no test patch, and RUN_ID_RE is used by tickets_service.py:54 and scoreboard_service.py:87, which the validation merge replaces.",
+  "evidence": "tickets.py:67; enrich.py:176, 196, 324; kefind_service.py:41, 205; routing_service.py:112-113; dictionary_service.py:34-37; scoreboard/dataset.py:32; the grep of the test folders listed above."
+ },
+ {
+  "id": "web-utc-time",
+  "verdict": "merge_with_conditions",
+  "conditions": "labeled_at must stay isoformat(timespec='seconds'). It is the optimistic 'seen' token, compared as a string with the posted form value (labels.py:375, 504), and the re-imported ticketlabels and refquestions rows carry it. itsm may pass timespec='microseconds' if the owner wants the current format kept. Otherwise the seconds form is fine: reviewedAtUtc and secretRevealedAtUtc are only displayed [:16] and concatenated into the work note (itsm/execute/workflow-definition.json 1193/1226/1259), never compared.",
+  "corrections": "Note: itsm's isoformat() without timespec already omits microseconds when they are 0, so its format is variable today. orchestration/guide/writeback.py's '%Y-%m-%dT%H:%M:%SZ' is rightly excluded (logic-diag-writeback compares validatedAtUtc as a string).",
+  "evidence": "labels.py:95-96, 375, 399, 462, 504; itsm.py:112-113, 276, 305, 328, 488, 501; repo-wide grep for reviewedAtUtc/secretRevealedAtUtc (app/itsm.py, itsm/execute/*, runbook only)."
+ },
+ {
+  "id": "web-yaml-config",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) Do not make orchestration/ import an app/ module. Today orchestration never imports from app/. tests/test_writeback.py, tests/test_guide_fsm.py and eval/evaluate_rag.py put only orchestration/ on sys.path, so answer.py importing app/config.py would break them, and eval if it is kept. Put the shared loader in orchestration/, which app already imports from, or keep load_engine_config in orchestration and re-export it from the app module. 2) Do not name it config.py. The repo root has a config/ data folder, which becomes a namespace package whenever app/ is not on sys.path (python -m pytest puts the cwd first), giving confusing AttributeErrors. Use e.g. settings.py. 3) Keep per-file semantics. itsm.yaml is required at import and ITSM_CONFIG['clientCode'] is read at import. labels.yaml is required but `or {}`. labels' access block falls back to itsm.yaml's (`LABELS_CONFIG.get('access') or _ITSM_ACCESS`). diag-writeback.yaml missing gives {}, and rules with a bad regex are dropped. reference-questions.yaml missing gives {}. CONFIG_DIRS keeps config/ before clients-local/, and load_engine_config still raises FileNotFoundError naming the searched dirs. 4) Keep diag_tab.WRITEBACK_CONFIG and labels.LABELS_CONFIG as module attributes.",
+  "corrections": "Wrong claim: 'orchestration already reaches app modules through the sys.path setup in app.py'. app.py:135 and auth.py:35 put orchestration/ on sys.path for app; no orchestration module imports an app module (grep).",
+  "evidence": "answer.py:109-113, 619-628; auth.py:35-36, 69-78; diag_tab.py:88-104, 119; itsm.py:49-53; labels.py:51-62, 152-168; tests/test_writeback.py:6 and test_guide_fsm.py:7 (orchestration only); eval/evaluate_rag.py:52-53; deploy-webapp.ps1:61 ships app, orchestration and config."
+ },
+ {
+  "id": "web-claims-access",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) Keep the three local-dev switches separate: LOCAL_DEV_CLIENTS (app.py:167), LOCAL_DEV_ITSM (itsm.py:56) and LOCAL_DEV_LABELS (labels.py:63). 'One local-dev rule' would open /itsm, which executes real Entra/ServiceNow actions, on any dev machine that sets LOCAL_DEV_CLIENTS just to use the chat. group_gate(access_block, local_dev) must take the tab's own flag. 2) With LOCAL_DEV_ITSM=1 and no LOCAL_DEV_CLIENTS, itsm._reviewer returns ('local-dev','Démo locale') today, while app.py's resolvers return None. Keep that, or reviewedById/Name become None in itsmtickets. 3) Keep the 'unknown-user' and 'Utilisateur' fallbacks. 4) A present but empty or malformed header gives [] claims and must be denied, not treated as local dev. Only header None is local dev.",
+  "corrections": "The local-dev differences the finder noted are a security boundary, not just a fallback. Each gate is opt-in per tab.",
+  "evidence": "app.py:1029-1060; itsm.py:116-133, 169-171; labels.py:99-109; auth.py:144-159 (parse returns [] on a malformed header)."
+ },
+ {
+  "id": "web-request-guards",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None. Keep each route's call order (review._post_guard: guard -> same_origin -> engine None -> 503), since the status codes depend on it.",
+  "evidence": "diag_tab.py:122-124, dictionary_tab.py:27-29, itsm.py:136-138, labels.py:112-114 and review_tab.py:100-102 are character-identical. The _guard closures in dictionary_tab.py:37-43, labels.py:257-263 and review_tab.py:401-407 are identical over deps['label_access'] and deps['allowed_clients']. No test patches a module-level _same_origin."
+ },
+ {
+  "id": "web-id-regexes-and-engine-mirrors",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) Placement. kefind_ports.py, service.py and contracts.py live in orchestration/guide. tests/test_writeback.py (guide.writeback -> .kefind_ports) and tests/test_guide_fsm.py (guide.fsm -> .contracts) put only orchestration/ on sys.path; tests/test_review_app.py and test_dictionary_app.py put only app/. A module in app/ breaks the first pair and one in orchestration/ breaks the second. Put it in orchestration/ (app.py adds it to sys.path in production) and add orchestration/ to the two app-only tests, or let orchestration keep its own copies. 2) contracts.OcrFinding uses pydantic Field(pattern=<str>), so expose pattern strings, not only compiled regexes. 3) review_tab._collapse (str(value or '') then collapse) is not kefind/taxonomy._collapse (non-str gives ''). Keep the Web App's semantics, and the parity test must not assert equality on non-str input. 4) The parity test needs kecore_func/ on sys.path (flat imports) and validation.py free of azure.functions. 5) labels' stricter REF_ID_RE (ref-<24 hex>) is safe for rows written by labels.ref_id (the only writer, labels.py:512/556), but check it on the re-imported refquestions rows. 6) Switching SESSION_ID_RE to fullmatch tightens diag_tab 338/355/436 and service 158 (a trailing '\\n' passes today). Session ids are generated server-side.",
+  "corrections": "SESSION_ID_RE and labels._ID_RE share a shape but not a contract: session ids vs ticket ids and ref ids (labels.py:339, 361, 471, 499, 534). Sharing the regex is cosmetic.",
+  "evidence": "dictionary_tab.py:24; review_tab.py:50-58, 105-127; kefind_ports.py:76, 92, 185; service.py:19, 158; diag_tab.py:61, 338, 355, 385, 436; labels.py:61-64, 146-149; contracts.py:47; enrich.py:60; review.py:92-96; routing_service.py:154-155; taxonomy.py:87-88; tests sys.path lines in tests/*.py."
+ },
+ {
+  "id": "web-json-field-cells",
+  "verdict": "merge_with_conditions",
+  "conditions": "json_cell must keep the 'absent' value distinct from an empty container where templates test it. In itsm ticket(), approvedParamsJson must give None when the cell is empty (template `approved`). For the labels ticket view, `current` must be None when there is no label or expected=='' (a skipped label), and [] means 'aucune fiche' (template `current is not none`, labels.py:739). The ticketlabels.expected format is unchanged (human data).",
+  "corrections": "Missed members: labels.py:347 (unguarded json.loads(label['expected']), so a malformed cell gives a 500) and labels.py:476 (unguarded expected_list on edit). Also itsm._proposal returns non-dict JSON as-is today, so p.get gives AttributeError (500); json_cell(dict) fixes that. app.py:488-492 goes away with /classic.",
+  "evidence": "labels.py:170-175, 347, 395, 415-418, 476, 739; itsm.py:147-158, 208-211."
+ },
+ {
+  "id": "web-chat-json-call",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None. Each caller keeps its own exception handling: select_primaries catches everything and falls back, while _generate_diagnostic lets errors propagate. chat_json just raises.",
+  "evidence": "ports.py:44-48, 92-98; answer.py:1174-1194 and 1820-1845 pass the same kwargs (model, temperature=0, seed, messages, response_format json_schema strict) and json.loads the first choice."
+ },
+ {
+  "id": "web-secret-redaction",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) Preserve None: _redact_visible_password returns None or '' unchanged, while textutil.redact(None) returns ''. screen_reading is stored in diagsessions turns and returned by make_open_answer. 2) The placeholder text changes ('\\1 : [valeur masquee]' becomes '\\1: [valeur masquée]' or similar). That is display-only, but say so; no test pins it. 3) Putting 'mot de passe temporaire' into textutil's label set also changes the guide's ticket redaction: today 'mot de passe temporaire : X' is NOT redacted by textutil, because the [:=] must follow 'mot de passe' directly, so extraction and prompts will mask more. ports.py:74 tests for the literal '[REDACTED]', so the default placeholder must stay.",
+  "corrections": "The \\S+ value is a superset of the [A-Za-z0-9_@#.\\-]{6,} span, so masking only grows. Example: 'mdp : Abc!2345' is not masked at all by answer.py today.",
+  "evidence": "textutil.py:11, 26-27; answer.py:433-449, 1622, 1846; ports.py:62, 74, 105, 149, 189."
+ },
+ {
+  "id": "web-error-code-shapes",
+  "verdict": "not_a_duplicate",
+  "conditions": "",
+  "corrections": "Agree with the finder's hedge and go further: not a duplicate. One list validates a value, the other extracts codes from free text. detected_error_codes also feeds the next turn's state block (answer.py:1774), so unifying them changes model prompts, not just stored values. At most co-locate them with a comment.",
+  "evidence": "ports.py:51-57 (fullmatch-style validators); answer.py:417-419 (findall), 1623-1624, 1847-1848, 1774."
+ },
+ {
+  "id": "web-search-doc-key-client-filter",
+  "verdict": "merge_safe",
+  "conditions": "",
+  "corrections": "None. The modality filter next to answer.py:805 is audio/video (decision c) and goes away.",
+  "evidence": "answer.py:709, 805, 890 are the identical f\"clientId eq '{client_id.replace(chr(39), chr(39)*2)}'\". answer.py:1094 and 1981-1982 and ports.py:128 are the identical d.get('parent_id') or d.get('title')."
+ },
+ {
+  "id": "cross-entity-norm",
+  "verdict": "not_a_duplicate",
+  "conditions": "",
+  "corrections": "No merge. The bodies are byte-identical but sit in two deployment packages and are not coupled: the Web App normalizes both the facet values and the query with its own copy. Deleting enrichment._client_vocabulary is decision (c), not a merge. Its only caller is _process_call, reached only for sourceType audio/video (function_app.py:497-498) and from enrich_call. Fix answer.py's misleading 'mirrors enrichment' docstring.",
+  "evidence": "enrichment/function_app.py:105-111, 163-200, 420-430, 497-498, 512-531; answer.py:685-724, 734."
+ },
+ {
+  "id": "itsm-wfgen-helpers",
+  "verdict": "merge_with_conditions",
+  "conditions": "1) The unified http() must emit keys in the current insertion order: type, inputs{method, uri, authentication, then queries, headers, body when present}, runAfter, then runtimeConfiguration. json.dump writes insertion order, so any change in order changes the committed workflow-definition.json. 2) TABLE_HEADERS stays per generator (propose nometadata, execute/writeback minimalmetadata). done (Succeeded|Failed) and any_end (four statuses) stay distinct. execute's row_uri takes the PartitionKey from parameters('clientCode') and writeback's ROW_URI from the item, so both forms are needed. 3) The shared writer should open with newline='\\n'. The operator runs the generators on Windows (PS C:\\...), where text mode writes CRLF while the committed files are LF, so the regeneration test must compare against LF.",
+  "corrections": "Confirmed the finder's byte-for-byte claim. itsm/poll has no generator (hand-written JSON) and is rightly not a member.",
+  "evidence": "Ran copies of the three generators with python -I in a scratch dir: cmp against itsm/{propose,execute,writeback}/workflow-definition.json is identical for all three. propose 61-68, execute 21-49, writeback 47-65; all write json.dump(wf, f, indent=2, ensure_ascii=True) through open(out, 'w')."
+ },
+ {
+  "id": "resolved-by-removal",
+  "verdict": "merge_with_conditions",
+  "conditions": "Delete in an order that keeps the survivors importable. 1) kefind/funnel_engine.py, used by scoreboard_service, imports `from .io import load_decomposed_jsonl` at module level, and its fiches_path/profile_path/from_config/factory local-file mode uses it. Remove that mode with kefind/io.py, or the scoreboard Function breaks. 2) kefind/search.py, which survives for tokenize and SEARCHABLE_STATUSES, imports .understand at module level (line 32), so drop that import before deleting understand.py. 3) FileRecordStore is needed: kecore/tests/test_llm.py builds RecordingLLM and RecordingEmbeddings with cache_dir in 10 places, and both constructors fall back to FileRecordStore. Keep it, or switch the tests to an in-memory store. 4) dictionary_service imports kecore.pending.DEFAULT_MIN_OBSERVATIONS (see fn-compat-aliases).",
+  "corrections": "Missed survivor dependencies: kefind/funnel_engine.py:17 and 55 on kefind.io, kefind/search.py:32 on kefind.understand, and kecore/llm.py constructors plus test_llm.py on FileRecordStore. The finder's note that test_funnel.py needs load_decomposed_jsonl is correct (test_funnel.py:8, 48, 271). The /classic claims hold: _clean_excerpt, _confidence and _truncate are used only by the classic templates, conversation sidebar and _handle; '/' redirects to /diag.",
+  "evidence": "funnel_engine.py:17, 28-57, 87-96; search.py:30-32; kecore/llm.py:225-228 and the RecordingEmbeddings ctor; kecore/tests/test_llm.py:253-375; app/app.py:321-362, 403, 846, 871, 1140, 1196-1213."
+ }
+]
